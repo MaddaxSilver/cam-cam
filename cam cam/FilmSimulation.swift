@@ -11,7 +11,7 @@ import Foundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
-struct CameraSettings {
+struct CameraSettings: Sendable {
     var isHighlightRolloffEnabled: Bool = false
     var rolloffThreshold: Float = 0.9
 
@@ -24,7 +24,7 @@ struct CameraSettings {
     var isAutoGrainEnabled: Bool = false
 }
 
-enum FilmSim: String, CaseIterable, Identifiable {
+enum FilmSim: String, CaseIterable, Identifiable, Sendable {
     case none = "None"
     case fujiClassicChrome = "Fuji Classic Chrome"
     case fujiVelvia = "Fuji Velvia"
@@ -32,9 +32,19 @@ enum FilmSim: String, CaseIterable, Identifiable {
     case leicaWarm = "Leica Warm"
 
     var id: String { rawValue }
+
+    var chipLabel: String {
+        switch self {
+        case .none: return "None"
+        case .leicaMonochrom: return "Leica M"
+        case .fujiClassicChrome: return "Provia"
+        case .fujiVelvia: return "Velvia"
+        case .leicaWarm: return "Fuji 200"
+        }
+    }
 }
 
-struct FilmSimulator {
+nonisolated struct FilmSimulator: @unchecked Sendable {
     private let context = CIContext()
     var settings: CameraSettings?
 

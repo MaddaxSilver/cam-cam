@@ -8,7 +8,7 @@
 import AVFoundation
 import CoreImage
 import SwiftUI
-internal import Combine
+import Combine
 
 #if os(iOS)
 
@@ -20,7 +20,7 @@ private final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuff
     nonisolated(unsafe) var onFrame: ((CGImage) -> Void)?
 
     // CIContext is thread-safe; keeping one instance avoids per-frame allocation.
-    nonisolated(unsafe) private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     nonisolated func captureOutput(
         _ output: AVCaptureOutput,
@@ -38,8 +38,6 @@ private final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuff
 
 @MainActor
 final class CameraManager: ObservableObject {
-    var objectWillChange: ObservableObjectPublisher
-    
     @Published var filteredFrame: CGImage?
     @Published var isAuthorized = false
     @Published var isDenied = false
@@ -104,7 +102,13 @@ final class CameraManager: ObservableObject {
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         output.alwaysDiscardsLateVideoFrames = true
         output.setSampleBufferDelegate(processor, queue: outputQueue)
-        if session.canAddOutput(output) { session.addOutput(output) }
+        if session.canAddOutput(output) {
+            session.addOutput(output)
+            if let connection = output.connection(with: .video),
+               connection.isVideoRotationAngleSupported(90) {
+                connection.videoRotationAngle = 90
+            }
+        }
 
         session.commitConfiguration()
     }
