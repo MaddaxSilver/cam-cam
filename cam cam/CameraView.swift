@@ -240,19 +240,40 @@ final class CameraManager: NSObject, ObservableObject {
         sessionQueue.async { [self] in
             guard let device = bestDevice(for: preset) else { return }
             session.beginConfiguration()
-            for input in session.inputs {
-                session.removeInput(input)
-            }
-            guard let newInput = try? AVCaptureDeviceInput(device: device) else {
+            session.inputs.forEach { session.removeInput($0) }
+
+            guard let newInput = try? AVCaptureDeviceInput(device: device),
+                  session.canAddInput(newInput) else {
                 session.commitConfiguration()
                 return
             }
-            if session.canAddInput(newInput) {
-                session.addInput(newInput)
-            }
-            session.commitConfiguration()
+            session.addInput(newInput)
             currentDevice = device
+
+            // Update max photo dimensions for new device
+            if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+                photoOutput.maxPhotoDimensions = maxDim
+            }
+
+            // Re-enable ProRAW if supported
+            if photoOutput.isAppleProRAWSupported {
+                photoOutput.isAppleProRAWEnabled = true
+            }
+
+            session.commitConfiguration()
+
+            // Must re-apply rotation AFTER commitConfiguration — connection resets on input swap
+            if let conn = videoDataOutput.connection(with: .video),
+               conn.isVideoRotationAngleSupported(90) {
+                conn.videoRotationAngle = 90
+            }
+            if let conn = photoOutput.connection(with: .video),
+               conn.isVideoRotationAngleSupported(90) {
+                conn.videoRotationAngle = 90
+            }
+
             applyZoom(factor: preset.zoomFactor, on: device)
+            startEVObservation()
         }
     }
 
@@ -886,46 +907,12 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-
-        // Collect frames for frame stacking if active
-        if isCollectingFrames {
-            frameStack.append(ciImage)
-        }
-
-        // Apply live preview sim
-        let sim = DispatchQueue.main.sync { self.selectedSim }
-        pendingSim = sim
-        let grainOn = DispatchQueue.main.sync { self.grainEnabled }
-        let grain = DispatchQueue.main.sync { self.grainAmount }
-        pendingGrainEnabled = grainOn
-        pendingGrain = grain
-        pendingCrosstalkEnabled = DispatchQueue.main.sync { self.crosstalkEnabled }
-        pendingCrosstalk = DispatchQueue.main.sync { self.crosstalkAmount }
-        pendingHalationEnabled = DispatchQueue.main.sync { self.halationEnabled }
-        pendingHalation = DispatchQueue.main.sync { self.halationAmount }
-        pendingRolloffEnabled = DispatchQueue.main.sync { self.rolloffEnabled }
-        pendingRolloff = DispatchQueue.main.sync { self.rolloffThreshold }
-
-        ciImage = applyFilmSim(to: ciImage)
-
-        if pendingCrosstalkEnabled {
-            ciImage = applyColorCrosstalk(input: ciImage, amount: pendingCrosstalk)
-        }
-        if pendingHalationEnabled {
-            ciImage = applyHalation(input: ciImage, amount: pendingHalation)
-        }
-        if pendingRolloffEnabled {
-            ciImage = applyHighlightRolloff(input: ciImage, threshold: pendingRolloff)
-        }
-        if pendingGrainEnabled && pendingGrain > 0 {
-            ciImage = addGrain(input: ciImage, amount: pendingGrain)
-        }
-
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return }
-        DispatchQueue.main.async {
-            self.filteredFrame = cgImage
+        // Only collect frames for long exposure frame stacking
+        guard isCollectingFrames,
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // Throttle to ~10fps to keep memory reasonable
+        if frameStack.count < Int(longExposureDuration * 10) {
+            frameStack.append(CIImage(cvPixelBuffer: pixelBuffer))
         }
     }
 }
@@ -959,21 +946,31 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
 
 // MARK: - PreviewUIView
 
-@MainActor
-class PreviewUIView: UIView {
-    var previewLayer: AVCaptureVideoPreviewLayer?
+final class PreviewUIView: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
-    func setSession(_ session: AVCaptureSession) {
-        let layer = AVCaptureVideoPreviewLayer(session: session)
-        layer.videoGravity = .resizeAspectFill
-        self.layer.addSublayer(layer)
-        previewLayer = layer
+    private var observation: NSKeyValueObservation?
+
+    func configure(session: AVCaptureSession) {
+        previewLayer.session = session
+        previewLayer.videoGravity = .resizeAspectFill
+        applyRotation()
+
+        // Re-apply rotation whenever the session's inputs change (i.e. lens swap)
+        observation = session.observe(\.inputs, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.applyRotation() }
+        }
     }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        previewLayer?.frame = bounds
+    func applyRotation() {
+        if let conn = previewLayer.connection,
+           conn.isVideoRotationAngleSupported(90) {
+            conn.videoRotationAngle = 90
+        }
     }
+
+    deinit { observation?.invalidate() }
 }
 
 // MARK: - CameraPreviewView
@@ -983,11 +980,13 @@ struct CameraPreviewView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PreviewUIView {
         let view = PreviewUIView()
-        view.setSession(session)
+        view.configure(session: session)
         return view
     }
 
-    func updateUIView(_ uiView: PreviewUIView, context: Context) {}
+    func updateUIView(_ uiView: PreviewUIView, context: Context) {
+        uiView.applyRotation()
+    }
 }
 
 // MARK: - ExposureMeterBar
@@ -996,102 +995,73 @@ struct ExposureMeterBar: View {
     let evValue: Float
     let bias: Float
 
+    private let range: Float = 3.0
+    private let dialSize: CGFloat = 64
+
     var body: some View {
-        GeometryReader { geo in
-            let width = geo.size.width
-            let height = geo.size.height
-            let centerX = width / 2.0
-            let centerY = height / 2.0
-            let radius = min(width, height) * 0.4
+        ZStack {
+            // Frosted background
+            Circle()
+                .fill(Color.black.opacity(0.5))
+                .frame(width: dialSize, height: dialSize)
 
-            ZStack {
-                // Arc background
-                Path { path in
-                    path.addArc(center: CGPoint(x: centerX, y: centerY),
-                                radius: radius,
-                                startAngle: .degrees(200),
-                                endAngle: .degrees(340),
-                                clockwise: false)
-                }
-                .stroke(Color.gray.opacity(0.3), lineWidth: 3)
+            // Outer ring
+            Circle()
+                .stroke(Color.white.opacity(0.15), lineWidth: 1.5)
+                .frame(width: dialSize, height: dialSize)
 
-                // Colored arc sections
-                let arcStart: Double = 200
-                let arcEnd: Double = 340
-                let arcRange = arcEnd - arcStart
+            // Coloured arc — sweeps from centre based on EV
+            Circle()
+                .trim(from: 0.5 - arcFraction(for: evValue) / 2,
+                      to:   0.5 + arcFraction(for: evValue) / 2)
+                .stroke(meterColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .frame(width: dialSize - 8, height: dialSize - 8)
+                .rotationEffect(.degrees(90))
+                .animation(.easeOut(duration: 0.12), value: evValue)
 
-                // Under-exposed (blue), center (green), over-exposed (yellow/red)
-                Path { path in
-                    path.addArc(center: CGPoint(x: centerX, y: centerY),
-                                radius: radius,
-                                startAngle: .degrees(arcStart),
-                                endAngle: .degrees(arcStart + arcRange * 0.33),
-                                clockwise: false)
-                }
-                .stroke(Color.blue.opacity(0.5), lineWidth: 3)
+            // Bias marker dot on the ring
+            Circle()
+                .fill(Color.yellow)
+                .frame(width: 5, height: 5)
+                .offset(y: -(dialSize / 2 - 4))
+                .rotationEffect(.degrees(Double(bias / range) * 90))
 
-                Path { path in
-                    path.addArc(center: CGPoint(x: centerX, y: centerY),
-                                radius: radius,
-                                startAngle: .degrees(arcStart + arcRange * 0.33),
-                                endAngle: .degrees(arcStart + arcRange * 0.66),
-                                clockwise: false)
-                }
-                .stroke(Color.green.opacity(0.5), lineWidth: 3)
+            // Centre: EV number
+            VStack(spacing: 0) {
+                Image(systemName: "sun.max")
+                    .font(.system(size: 8))
+                    .foregroundStyle(meterColor)
+                Text(evLabel)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+            }
 
-                Path { path in
-                    path.addArc(center: CGPoint(x: centerX, y: centerY),
-                                radius: radius,
-                                startAngle: .degrees(arcStart + arcRange * 0.66),
-                                endAngle: .degrees(arcEnd),
-                                clockwise: false)
-                }
-                .stroke(Color.red.opacity(0.5), lineWidth: 3)
-
-                // Tick marks
-                ForEach(-3..<4, id: \.self) { tick in
-                    let fraction = (Double(tick) + 3.0) / 6.0
-                    let angle = Angle.degrees(arcStart + arcRange * fraction)
-                    let tickStart = radius - 6
-                    let tickEnd = radius + 6
-                    Path { path in
-                        path.move(to: CGPoint(
-                            x: centerX + tickStart * cos(CGFloat(angle.radians)),
-                            y: centerY + tickStart * sin(CGFloat(angle.radians))
-                        ))
-                        path.addLine(to: CGPoint(
-                            x: centerX + tickEnd * cos(CGFloat(angle.radians)),
-                            y: centerY + tickEnd * sin(CGFloat(angle.radians))
-                        ))
-                    }
-                    .stroke(Color.white.opacity(0.6), lineWidth: 1)
-                }
-
-                // EV marker (current metered value)
-                let evClamped = max(-3, min(3, evValue))
-                let evFraction = (Double(evClamped) + 3.0) / 6.0
-                let evAngle = Angle.degrees(arcStart + arcRange * evFraction)
-                Circle()
-                    .fill(Color.white)
-                    .frame(width: 8, height: 8)
-                    .position(
-                        x: centerX + (radius) * cos(CGFloat(evAngle.radians)),
-                        y: centerY + (radius) * sin(CGFloat(evAngle.radians))
-                    )
-
-                // Bias marker (user-set compensation)
-                let biasClamped = max(-3, min(3, bias))
-                let biasFraction = (Double(biasClamped) + 3.0) / 6.0
-                let biasAngle = Angle.degrees(arcStart + arcRange * biasFraction)
-                Triangle()
-                    .fill(Color.yellow)
-                    .frame(width: 10, height: 8)
-                    .position(
-                        x: centerX + (radius + 14) * cos(CGFloat(biasAngle.radians)),
-                        y: centerY + (radius + 14) * sin(CGFloat(biasAngle.radians))
-                    )
+            // Scale ticks at -3, -1, 0, +1, +3
+            ForEach([-3, -1, 0, 1, 3], id: \.self) { stop in
+                Rectangle()
+                    .fill(Color.white.opacity(stop == 0 ? 0.8 : 0.3))
+                    .frame(width: 1, height: stop == 0 ? 6 : 4)
+                    .offset(y: -(dialSize / 2 - 2))
+                    .rotationEffect(.degrees(Double(stop) / Double(range) * 90))
             }
         }
+        .frame(width: dialSize, height: dialSize)
+    }
+
+    private func arcFraction(for value: Float) -> CGFloat {
+        let clamped = Swift.max(-range, Swift.min(value, range))
+        return CGFloat(abs(clamped) / range) * 0.5
+    }
+
+    private var evLabel: String {
+        String(format: "%+.1f", evValue + bias)
+    }
+
+    private var meterColor: Color {
+        let total = abs(evValue)
+        if total < 0.5 { return .green }
+        if total < 1.5 { return .yellow }
+        return .red
     }
 }
 
@@ -1508,29 +1478,21 @@ struct CameraContentView: View {
 
     @ViewBuilder
     private var cameraLayer: some View {
-        if let frame = camera.filteredFrame {
-            Image(decorative: frame, scale: 1.0)
-                .resizable()
-                .scaledToFill()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
-        } else {
+        if camera.isDenied {
             Color.black.overlay {
-                if camera.isDenied {
-                    VStack(spacing: 10) {
-                        Image(systemName: "camera.slash")
-                            .font(.system(size: 40))
-                            .foregroundStyle(.secondary)
-                        Text("Camera access denied")
-                            .foregroundStyle(.secondary)
-                        Text("Enable in Settings > cam cam")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                } else {
-                    ProgressView().tint(.white)
+                VStack(spacing: 10) {
+                    Image(systemName: "camera.slash")
+                        .font(.system(size: 40))
+                        .foregroundStyle(.secondary)
+                    Text("Camera access denied")
+                        .foregroundStyle(.secondary)
+                    Text("Enable in Settings > cam cam")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
             }
+        } else {
+            CameraPreviewView(session: camera.session)
         }
     }
 
