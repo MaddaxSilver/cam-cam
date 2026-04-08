@@ -1467,15 +1467,11 @@ struct CameraContentView: View {
                         .allowsHitTesting(false)
                 }
 
-                // Exposure meter — floating top left
-                VStack {
-                    ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
-                        .padding(.leading, 16)
-                        .padding(.top, 60)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .allowsHitTesting(false)
+                // Exposure meter — floating top left, fixed size
+                ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
+                    .frame(width: 80, height: 80)
+                    .position(x: 56, y: 100)
+                    .allowsHitTesting(false)
 
                 // Focus indicator
                 if showFocusIndicator, let pt = focusPoint {
@@ -1483,18 +1479,18 @@ struct CameraContentView: View {
                         .allowsHitTesting(false)
                 }
 
-                // Controls overlay
-                VStack(alignment: .trailing, spacing: 6) {
-                    // Top bar
+                // Controls overlay — full width
+                VStack(spacing: 0) {
+                    // Top bar — right-aligned content
                     topBar
                         .padding(.top, 60)
 
                     Spacer()
 
-                    // Bottom controls
+                    // Bottom controls — full width
                     bottomSection
                 }
-                .ignoresSafeArea(edges: .bottom)
+                .frame(maxWidth: .infinity)
             }
         }
         .ignoresSafeArea()
