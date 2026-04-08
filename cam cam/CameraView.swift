@@ -5,12 +5,13 @@
 //  Complete camera implementation: types, CameraManager, and all UI views.
 
 import SwiftUI
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import Photos
 import Combine
 import CoreMotion
+import MediaPlayer
 
 // MARK: - Film Simulation Enum
 
@@ -209,10 +210,9 @@ final class CameraManager: NSObject, ObservableObject {
         // Photo output
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
-            photoOutput.maxPhotoDimensions = device.activeFormat.supportedMaxPhotoDimensions.last ?? CMVideoDimensions(width: 4032, height: 3024)
         }
 
-        // Video data output for live preview processing
+        // Video data output for long exposure frame collection
         videoDataOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
@@ -220,20 +220,18 @@ final class CameraManager: NSObject, ObservableObject {
         videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
         if session.canAddOutput(videoDataOutput) {
             session.addOutput(videoDataOutput)
-            if let connection = videoDataOutput.connection(with: .video),
-               connection.isVideoRotationAngleSupported(90) {
-                connection.videoRotationAngle = 90
-            }
         }
 
         session.commitConfiguration()
 
-        // Set rotation on photo output connection
-        if let conn = photoOutput.connection(with: .video),
-           conn.isVideoRotationAngleSupported(90) {
-            conn.videoRotationAngle = 90
+        // Set these AFTER commitConfiguration — format descriptions aren't valid during config
+        if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+            photoOutput.maxPhotoDimensions = maxDim
         }
-
+        if let connection = videoDataOutput.connection(with: .video),
+           connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
         session.startRunning()
         startEVObservation()
     }
@@ -257,26 +255,21 @@ final class CameraManager: NSObject, ObservableObject {
             session.addInput(newInput)
             currentDevice = device
 
-            // Update max photo dimensions for new device
+            session.commitConfiguration()
+
+            // Must be AFTER commitConfiguration — format descriptions reset during config
             if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
                 photoOutput.maxPhotoDimensions = maxDim
             }
-
-            // Re-enable ProRAW if supported
             if photoOutput.isAppleProRAWSupported {
                 photoOutput.isAppleProRAWEnabled = true
             }
-
-            session.commitConfiguration()
-
-            // Must re-apply rotation AFTER commitConfiguration — connection resets on input swap
-            if let conn = videoDataOutput.connection(with: .video),
-               conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
-            }
-            if let conn = photoOutput.connection(with: .video),
-               conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
+            // Re-apply rotation on ALL video connections after input swap
+            for output in session.outputs {
+                if let conn = output.connection(with: .video),
+                   conn.isVideoRotationAngleSupported(90) {
+                    conn.videoRotationAngle = 90
+                }
             }
 
             applyZoom(factor: preset.zoomFactor, on: device)
@@ -307,15 +300,21 @@ final class CameraManager: NSObject, ObservableObject {
 
     nonisolated func startEVObservation() {
         guard let device = currentDevice else { return }
-        evObservation = device.observe(\.iso, options: [.new]) { [weak self] dev, _ in
-            let iso = dev.iso
-            let duration = dev.exposureDuration.seconds
+        evObservation?.invalidate()
+        evTimer?.invalidate()
+
+        // Poll ISO + shutter speed to compute scene EV
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let iso = device.iso
+            let duration = device.exposureDuration.seconds
             guard duration > 0 else { return }
+            // EV = log2(100/ISO) + log2(1/duration) — maps to roughly -3..+3 for typical scenes
             let ev = log2(100.0 / Float(iso)) + log2(Float(1.0 / duration))
-            DispatchQueue.main.async {
-                self?.evReading = ev
-            }
+            DispatchQueue.main.async { self.evReading = ev }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        evTimer = timer
     }
 
     // MARK: Focus and Exposure
@@ -413,12 +412,6 @@ final class CameraManager: NSObject, ObservableObject {
         let flash = flashMode
         let useRAW = rawEnabled
         sessionQueue.async { [self] in
-            // Ensure photo output rotation is correct
-            if let conn = photoOutput.connection(with: .video),
-               conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
-            }
-
             let settings: AVCapturePhotoSettings
             if useRAW, let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
                 settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
@@ -511,10 +504,13 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: Film Processing & Save
 
     nonisolated func processAndSaveJPEG(imageData: Data) {
-        guard let ciImage = CIImage(data: imageData) else {
+        guard var ciImage = CIImage(data: imageData) else {
             DispatchQueue.main.async { self.isCapturing = false }
             return
         }
+
+        // Apply EXIF orientation so the image is upright before processing
+        ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
 
         let processed = applySimAndGrain(to: ciImage)
         renderAndSave(ciImage: processed)
@@ -818,20 +814,30 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func addGrain(input: CIImage, amount: Float) -> CIImage {
+        // Generate monochrome noise
         let noise = CIFilter.randomGenerator().outputImage!
-        let scaled = noise.cropped(to: input.extent)
+        let cropped = noise.cropped(to: input.extent)
         let mono = CIFilter.colorControls()
-        mono.inputImage = scaled
+        mono.inputImage = cropped
         mono.saturation = 0.0
-        mono.brightness = 0.0
+        mono.brightness = -0.5  // Centre noise around mid-grey so it darkens AND lightens
         mono.contrast = 1.0
-        let blend = CIFilter.overlayBlendMode()
-        blend.inputImage = mono.outputImage
+        guard let grainImage = mono.outputImage else { return input }
+
+        // Blend: mix original with (original + grain) using amount as weight
+        // dissolve = original * (1 - amount) + grained * amount
+        let blend = CIFilter.softLightBlendMode()
+        blend.inputImage = grainImage
         blend.backgroundImage = input
-        let opacity = CIFilter.colorMatrix()
-        opacity.inputImage = blend.outputImage
-        opacity.aVector = CIVector(x: 0, y: 0, z: 0, w: CGFloat(amount))
-        return opacity.outputImage ?? input
+        guard let grained = blend.outputImage else { return input }
+
+        // Mix original and grained result by amount (0 = no grain, 0.5 = max grain)
+        let mix = CIFilter(name: "CIDissolveTransition", parameters: [
+            kCIInputImageKey: grained,
+            kCIInputTargetImageKey: input,
+            "inputTime": NSNumber(value: 1.0 - amount * 2.0)  // amount 0..0.5 → time 1..0
+        ])
+        return mix?.outputImage ?? grained
     }
 
     nonisolated func applyColorCrosstalk(input: CIImage, amount: Float) -> CIImage {
@@ -903,8 +909,19 @@ final class CameraManager: NSObject, ObservableObject {
 
     func selectFocalPreset(_ index: Int) {
         guard index >= 0, index < focalPresets.count else { return }
+        let preset = focalPresets[index]
+        let needsLensSwap = currentDevice?.deviceType != preset.deviceType
         selectedFocalIndex = index
-        swapInputDevice(to: focalPresets[index])
+
+        if needsLensSwap {
+            swapInputDevice(to: preset)
+        } else {
+            // Same physical lens — just change zoom factor instantly
+            sessionQueue.async { [self] in
+                guard let device = currentDevice else { return }
+                applyZoom(factor: preset.zoomFactor, on: device)
+            }
+        }
     }
 
     func captureDoubleExposureFirst() {
@@ -927,8 +944,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         // Only collect frames for long exposure frame stacking
         guard isCollectingFrames,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        // Throttle to ~10fps to keep memory reasonable
-        if frameStack.count < Int(longExposureDuration * 10) {
+        // Throttle to ~10fps, cap at 300 frames
+        if frameStack.count < 300 {
             frameStack.append(CIImage(cvPixelBuffer: pixelBuffer))
         }
     }
@@ -1012,73 +1029,93 @@ struct ExposureMeterBar: View {
     let evValue: Float
     let bias: Float
 
-    private let range: Float = 3.0
-    private let dialSize: CGFloat = 64
+    private let arcStart: Double = 200
+    private let arcEnd: Double = 340
 
     var body: some View {
+        let arcRange = arcEnd - arcStart
+
         ZStack {
-            // Frosted background
-            Circle()
-                .fill(Color.black.opacity(0.5))
-                .frame(width: dialSize, height: dialSize)
+            // Arc background
+            Path { path in
+                path.addArc(center: CGPoint(x: 40, y: 40),
+                            radius: 16,
+                            startAngle: .degrees(arcStart),
+                            endAngle: .degrees(arcEnd),
+                            clockwise: false)
+            }
+            .stroke(Color.gray.opacity(0.3), lineWidth: 3)
 
-            // Outer ring
-            Circle()
-                .stroke(Color.white.opacity(0.15), lineWidth: 1.5)
-                .frame(width: dialSize, height: dialSize)
+            // Under-exposed (blue), center (green), over-exposed (red)
+            Path { path in
+                path.addArc(center: CGPoint(x: 40, y: 40),
+                            radius: 16,
+                            startAngle: .degrees(arcStart),
+                            endAngle: .degrees(arcStart + arcRange * 0.33),
+                            clockwise: false)
+            }
+            .stroke(Color.blue.opacity(0.5), lineWidth: 3)
 
-            // Coloured arc — sweeps from centre based on EV
-            Circle()
-                .trim(from: 0.5 - arcFraction(for: evValue) / 2,
-                      to:   0.5 + arcFraction(for: evValue) / 2)
-                .stroke(meterColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                .frame(width: dialSize - 8, height: dialSize - 8)
-                .rotationEffect(.degrees(90))
-                .animation(.easeOut(duration: 0.12), value: evValue)
+            Path { path in
+                path.addArc(center: CGPoint(x: 40, y: 40),
+                            radius: 16,
+                            startAngle: .degrees(arcStart + arcRange * 0.33),
+                            endAngle: .degrees(arcStart + arcRange * 0.66),
+                            clockwise: false)
+            }
+            .stroke(Color.green.opacity(0.5), lineWidth: 3)
 
-            // Bias marker dot on the ring
+            Path { path in
+                path.addArc(center: CGPoint(x: 40, y: 40),
+                            radius: 16,
+                            startAngle: .degrees(arcStart + arcRange * 0.66),
+                            endAngle: .degrees(arcEnd),
+                            clockwise: false)
+            }
+            .stroke(Color.red.opacity(0.5), lineWidth: 3)
+
+            // Tick marks
+            ForEach(-3..<4, id: \.self) { tick in
+                let fraction = (Double(tick) + 3.0) / 6.0
+                let angle = Angle.degrees(arcStart + arcRange * fraction)
+                Path { path in
+                    path.move(to: CGPoint(
+                        x: 40 + 10 * cos(CGFloat(angle.radians)),
+                        y: 40 + 10 * sin(CGFloat(angle.radians))
+                    ))
+                    path.addLine(to: CGPoint(
+                        x: 40 + 22 * cos(CGFloat(angle.radians)),
+                        y: 40 + 22 * sin(CGFloat(angle.radians))
+                    ))
+                }
+                .stroke(Color.white.opacity(0.6), lineWidth: 1)
+            }
+
+            // EV marker (current metered value)
+            let evClamped = max(-3, min(3, evValue))
+            let evFraction = (Double(evClamped) + 3.0) / 6.0
+            let evAngle = Angle.degrees(arcStart + arcRange * evFraction)
             Circle()
+                .fill(Color.white)
+                .frame(width: 8, height: 8)
+                .position(
+                    x: 40 + 16 * cos(CGFloat(evAngle.radians)),
+                    y: 40 + 16 * sin(CGFloat(evAngle.radians))
+                )
+
+            // Bias marker
+            let biasClamped = max(-3, min(3, bias))
+            let biasFraction = (Double(biasClamped) + 3.0) / 6.0
+            let biasAngle = Angle.degrees(arcStart + arcRange * biasFraction)
+            Triangle()
                 .fill(Color.yellow)
-                .frame(width: 5, height: 5)
-                .offset(y: -(dialSize / 2 - 4))
-                .rotationEffect(.degrees(Double(bias / range) * 90))
-
-            // Centre: EV number
-            VStack(spacing: 0) {
-                Image(systemName: "sun.max")
-                    .font(.system(size: 8))
-                    .foregroundStyle(meterColor)
-                Text(evLabel)
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white)
-            }
-
-            // Scale ticks at -3, -1, 0, +1, +3
-            ForEach([-3, -1, 0, 1, 3], id: \.self) { stop in
-                Rectangle()
-                    .fill(Color.white.opacity(stop == 0 ? 0.8 : 0.3))
-                    .frame(width: 1, height: stop == 0 ? 6 : 4)
-                    .offset(y: -(dialSize / 2 - 2))
-                    .rotationEffect(.degrees(Double(stop) / Double(range) * 90))
-            }
+                .frame(width: 10, height: 8)
+                .position(
+                    x: 40 + 28 * cos(CGFloat(biasAngle.radians)),
+                    y: 40 + 28 * sin(CGFloat(biasAngle.radians))
+                )
         }
-        .frame(width: dialSize, height: dialSize)
-    }
-
-    private func arcFraction(for value: Float) -> CGFloat {
-        let clamped = Swift.max(-range, Swift.min(value, range))
-        return CGFloat(abs(clamped) / range) * 0.5
-    }
-
-    private var evLabel: String {
-        String(format: "%+.1f", evValue + bias)
-    }
-
-    private var meterColor: Color {
-        let total = abs(evValue)
-        if total < 0.5 { return .green }
-        if total < 1.5 { return .yellow }
-        return .red
+        .frame(width: 80, height: 80)
     }
 }
 
@@ -1397,11 +1434,56 @@ class PeakingUIView: UIView, AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 }
 
+// MARK: - Volume Button EV Observer
+
+final class VolumeButtonObserver: ObservableObject {
+    private var volumeObservation: NSKeyValueObservation?
+    private var lastVolume: Float = -1
+    private let session = AVAudioSession.sharedInstance()
+    var onVolumeUp: (() -> Void)?
+    var onVolumeDown: (() -> Void)?
+
+    init() {
+        try? session.setActive(true)
+        lastVolume = session.outputVolume
+
+        volumeObservation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
+            guard let self, let newVolume = change.newValue else { return }
+            let prev = self.lastVolume
+            self.lastVolume = newVolume
+            guard prev >= 0 else { return }
+            DispatchQueue.main.async {
+                if newVolume > prev {
+                    self.onVolumeUp?()
+                } else if newVolume < prev {
+                    self.onVolumeDown?()
+                }
+            }
+        }
+    }
+
+    deinit {
+        volumeObservation?.invalidate()
+    }
+}
+
+// MARK: - Hidden Volume Slider (prevents system HUD)
+
+struct HiddenVolumeSlider: UIViewRepresentable {
+    func makeUIView(context: Context) -> MPVolumeView {
+        let v = MPVolumeView(frame: .zero)
+        v.alpha = 0.001
+        return v
+    }
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
+}
+
 // MARK: - CameraContentView
 
 struct CameraContentView: View {
     @StateObject private var camera = CameraManager()
     @StateObject private var motion = MotionManager()
+    @StateObject private var volumeObserver = VolumeButtonObserver()
     @State private var focusPoint: CGPoint?
     @State private var showFocusIndicator = false
     @State private var showViewMenu = false
@@ -1483,8 +1565,18 @@ struct CameraContentView: View {
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
+        .background { HiddenVolumeSlider().frame(width: 0, height: 0) }
         .onAppear {
             motion.startUpdates()
+            let step: Float = 0.33
+            volumeObserver.onVolumeUp = {
+                let newBias = min(camera.exposureBias + step, 3.0)
+                camera.setExposureBias(newBias)
+            }
+            volumeObserver.onVolumeDown = {
+                let newBias = max(camera.exposureBias - step, -3.0)
+                camera.setExposureBias(newBias)
+            }
         }
         .onDisappear {
             motion.stopUpdates()
@@ -1737,20 +1829,27 @@ struct CameraContentView: View {
             }
             .padding(.horizontal, -32)
 
-            // Grain slider (when grain is on and a sim is active)
-            if camera.selectedSim != .none && camera.grainEnabled {
+            // Grain toggle + slider (when a sim is active)
+            if camera.selectedSim != .none {
                 HStack(spacing: 10) {
-                    Image(systemName: "circle.grid.3x3")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.6))
-                    Slider(value: $camera.grainAmount, in: 0...0.5)
-                        .tint(.white)
-                    Image(systemName: "circle.grid.3x3.fill")
-                        .font(.system(size: 14))
-                        .foregroundStyle(.white.opacity(0.6))
+                    Button {
+                        camera.grainEnabled.toggle()
+                    } label: {
+                        Image(systemName: camera.grainEnabled ? "circle.grid.3x3.fill" : "circle.grid.3x3")
+                            .font(.system(size: 16))
+                            .foregroundStyle(camera.grainEnabled ? .yellow : .white.opacity(0.6))
+                    }
+                    .buttonStyle(.plain)
+
+                    if camera.grainEnabled {
+                        Slider(value: $camera.grainAmount, in: 0...0.5)
+                            .tint(.white)
+                        Image(systemName: "circle.grid.3x3.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
                 }
                 .padding(.horizontal, 8)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
             // Long exposure controls
