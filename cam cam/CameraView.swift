@@ -227,6 +227,13 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         session.commitConfiguration()
+
+        // Set rotation on photo output connection
+        if let conn = photoOutput.connection(with: .video),
+           conn.isVideoRotationAngleSupported(90) {
+            conn.videoRotationAngle = 90
+        }
+
         session.startRunning()
         startEVObservation()
     }
@@ -403,18 +410,28 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
 
-        let settings: AVCapturePhotoSettings
-        if rawEnabled, let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
-            settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
-        } else {
-            settings = AVCapturePhotoSettings(format: [
-                AVVideoCodecKey: AVVideoCodecType.jpeg
-            ])
+        let flash = flashMode
+        let useRAW = rawEnabled
+        sessionQueue.async { [self] in
+            // Ensure photo output rotation is correct
+            if let conn = photoOutput.connection(with: .video),
+               conn.isVideoRotationAngleSupported(90) {
+                conn.videoRotationAngle = 90
+            }
+
+            let settings: AVCapturePhotoSettings
+            if useRAW, let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
+                settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+            } else {
+                settings = AVCapturePhotoSettings(format: [
+                    AVVideoCodecKey: AVVideoCodecType.jpeg
+                ])
+            }
+            if photoOutput.supportedFlashModes.contains(flash) {
+                settings.flashMode = flash
+            }
+            photoOutput.capturePhoto(with: settings, delegate: self)
         }
-        if photoOutput.supportedFlashModes.contains(flashMode) {
-            settings.flashMode = flashMode
-        }
-        photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
     // MARK: Long Exposure - Frame Stack
