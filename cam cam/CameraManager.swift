@@ -8,6 +8,7 @@
 import AVFoundation
 import CoreImage
 import SwiftUI
+internal import Combine
 
 #if os(iOS)
 
@@ -37,6 +38,8 @@ private final class FrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuff
 
 @MainActor
 final class CameraManager: ObservableObject {
+    var objectWillChange: ObservableObjectPublisher
+    
     @Published var filteredFrame: CGImage?
     @Published var isAuthorized = false
     @Published var isDenied = false
