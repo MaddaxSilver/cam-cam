@@ -1417,55 +1417,87 @@ struct CameraContentView: View {
     @StateObject private var motion = MotionManager()
     @State private var focusPoint: CGPoint?
     @State private var showFocusIndicator = false
-    @State private var showAspectMenu = false
-    @State private var showSettings = false
+    @State private var showViewMenu = false
 
     var body: some View {
-        ZStack {
-            // Camera layer
-            cameraLayer
-                .ignoresSafeArea()
+        GeometryReader { geo in
+            ZStack {
+                // Camera layer
+                cameraLayer
+                    .ignoresSafeArea()
+                    .onTapGesture { location in
+                        guard !camera.manualFocusEnabled else { return }
+                        focusPoint = location
+                        showFocusIndicator = true
+                        // Convert to camera coordinates (0...1)
+                        let camPoint = CGPoint(
+                            x: location.y / geo.size.height,
+                            y: 1.0 - location.x / geo.size.width
+                        )
+                        camera.tapToFocus(at: camPoint)
+                        // Auto-hide after 1.8s
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                            showFocusIndicator = false
+                        }
+                    }
 
-            GeometryReader { geo in
                 // Aspect ratio overlay
                 AspectRatioOverlay(aspectRatio: camera.selectedAspectRatio, geoSize: geo.size)
-                    .allowsHitTesting(false)
-            }
-            .ignoresSafeArea()
-
-            // Grid
-            if camera.showGrid {
-                GridOverlay()
-                    .ignoresSafeArea()
-            }
-
-            // Level
-            if camera.showLevel {
-                LevelOverlay(roll: motion.roll)
-                    .ignoresSafeArea()
-            }
-
-            // Focus peaking
-            if camera.showPeaking {
-                FocusPeakingView(session: camera.session)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
-            }
 
-            // Focus indicator
-            if showFocusIndicator, let pt = focusPoint {
-                FocusIndicator(position: pt)
-                    .allowsHitTesting(false)
-            }
+                // Grid
+                if camera.showGrid {
+                    GridOverlay()
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
 
-            // Main UI overlay
-            VStack(spacing: 0) {
-                topBar
-                    .padding(.top, 4)
-                Spacer()
-                bottomSection
+                // Level
+                if camera.showLevel {
+                    LevelOverlay(roll: motion.roll)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
+
+                // Focus peaking
+                if camera.showPeaking {
+                    FocusPeakingView(session: camera.session)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
+
+                // Exposure meter — floating top left
+                VStack {
+                    ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
+                        .padding(.leading, 16)
+                        .padding(.top, 60)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .allowsHitTesting(false)
+
+                // Focus indicator
+                if showFocusIndicator, let pt = focusPoint {
+                    FocusIndicator(position: pt)
+                        .allowsHitTesting(false)
+                }
+
+                // Controls overlay
+                VStack(alignment: .trailing, spacing: 6) {
+                    // Top bar
+                    topBar
+                        .padding(.top, 60)
+
+                    Spacer()
+
+                    // Bottom controls
+                    bottomSection
+                }
+                .ignoresSafeArea(edges: .bottom)
             }
         }
+        .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
         .onAppear {
@@ -1473,32 +1505,6 @@ struct CameraContentView: View {
         }
         .onDisappear {
             motion.stopUpdates()
-        }
-        .overlay {
-            GeometryReader { geo in
-                Color.clear
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 0, coordinateSpace: .local)
-                            .onEnded { value in
-                                let point = value.location
-                                focusPoint = point
-                                showFocusIndicator = false
-                                showFocusIndicator = true
-
-                                // Convert to camera coordinates (0...1)
-                                let camPoint = CGPoint(
-                                    x: point.y / geo.size.height,
-                                    y: 1.0 - point.x / geo.size.width
-                                )
-                                camera.tapToFocus(at: camPoint)
-                            }
-                    )
-            }
-            .allowsHitTesting(true)
-        }
-        .sheet(isPresented: $showSettings) {
-            settingsSheet
         }
     }
 
@@ -1535,8 +1541,296 @@ struct CameraContentView: View {
     // MARK: - Top Bar
 
     private var topBar: some View {
-        HStack(alignment: .top) {
-            // Exposure dial
+        VStack(alignment: .trailing, spacing: 8) {
+            // Top pill row — right-aligned
+            HStack(spacing: 8) {
+                Spacer()
+
+                TopPill(
+                    icon: "square.stack",
+                    text: camera.doubleExposureEnabled ? "2X" : "1X"
+                )
+                .onTapGesture {
+                    camera.doubleExposureEnabled.toggle()
+                }
+
+                TopPill(text: camera.rawEnabled ? "RAW" : "JPEG")
+                    .onTapGesture {
+                        camera.rawEnabled.toggle()
+                    }
+
+                TopPill(
+                    icon: "timer",
+                    text: camera.isLongExposure ? String(format: "%.0fs", camera.longExposureDuration) : "BULB"
+                )
+                .onTapGesture {
+                    camera.isLongExposure.toggle()
+                }
+
+                TopPill(
+                    icon: "viewfinder",
+                    text: camera.manualFocusEnabled ? "MF" : "AF"
+                )
+                .onTapGesture {
+                    camera.manualFocusEnabled.toggle()
+                }
+            }
+
+            // View options button + dropdown
+            HStack {
+                Spacer()
+                Button {
+                    withAnimation(.spring(duration: 0.25)) { showViewMenu.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "aspectratio").font(.system(size: 11))
+                        Text(camera.selectedAspectRatio.label).font(.system(size: 12, weight: .semibold))
+                        Image(systemName: showViewMenu ? "chevron.up" : "chevron.down").font(.system(size: 9))
+                    }
+                    .foregroundStyle(showViewMenu ? .yellow : .white)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(
+                        Capsule()
+                            .fill(showViewMenu ? Color.yellow.opacity(0.2) : Color.black.opacity(0.4))
+                            .overlay(Capsule().stroke(showViewMenu ? .yellow : Color.white.opacity(0.3), lineWidth: 1))
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+
+            // Dropdown menu
+            if showViewMenu {
+                VStack(spacing: 0) {
+                    // Aspect ratios
+                    HStack(spacing: 6) {
+                        ForEach(AspectRatio.allCases) { ratio in
+                            let sel = camera.selectedAspectRatio == ratio
+                            Button {
+                                camera.selectedAspectRatio = ratio
+                            } label: {
+                                Text(ratio.label)
+                                    .font(.system(size: 12, weight: sel ? .bold : .regular))
+                                    .foregroundStyle(sel ? .black : .white)
+                                    .padding(.horizontal, 9).padding(.vertical, 6)
+                                    .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 10)
+
+                    Divider().background(Color.white.opacity(0.2))
+
+                    // Grid + Level + Peaking
+                    HStack(spacing: 10) {
+                        viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
+                        viewMenuToggle(icon: "level", title: "Level", isOn: $camera.showLevel)
+                        viewMenuToggle(icon: "eye", title: "Peaking", isOn: $camera.showPeaking)
+                    }
+                    .padding(.vertical, 8)
+
+                    Divider().background(Color.white.opacity(0.2))
+
+                    // Film effects
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("FILM EFFECTS")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .padding(.top, 4)
+
+                        HStack(spacing: 8) {
+                            viewMenuToggle(icon: "drop.fill", title: "Halation", isOn: $camera.halationEnabled)
+                            viewMenuToggle(icon: "paintpalette", title: "Crosstalk", isOn: $camera.crosstalkEnabled)
+                            viewMenuToggle(icon: "waveform", title: "Rolloff", isOn: $camera.rolloffEnabled)
+                        }
+                    }
+                    .padding(.bottom, 8)
+                }
+                .padding(.horizontal, 12)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.75)))
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(.trailing, 20)
+    }
+
+    @ViewBuilder
+    private func viewMenuToggle(icon: String, title: String, isOn: Binding<Bool>) -> some View {
+        Button {
+            isOn.wrappedValue.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 12))
+                Text(title).font(.system(size: 12, weight: isOn.wrappedValue ? .bold : .regular))
+            }
+            .foregroundStyle(isOn.wrappedValue ? .yellow : .white)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Capsule().fill(isOn.wrappedValue ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Bottom Section
+
+    private var bottomSection: some View {
+        VStack(spacing: 16) {
+            // MF toggle + slider row
+            HStack(spacing: 12) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        camera.manualFocusEnabled.toggle()
+                    }
+                } label: {
+                    Text("MF")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(camera.manualFocusEnabled ? .black : .white)
+                        .frame(width: 38, height: 30)
+                        .background(Capsule().fill(camera.manualFocusEnabled ? Color.yellow : Color.white.opacity(0.18)))
+                }
+                .buttonStyle(.plain)
+
+                if camera.manualFocusEnabled {
+                    HStack(spacing: 6) {
+                        Text("Near")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                        Slider(
+                            value: Binding(
+                                get: { camera.manualFocusValue },
+                                set: { camera.setManualFocus($0) }
+                            ),
+                            in: 0...1
+                        )
+                        .tint(.yellow)
+                        Text("Far")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+                }
+            }
+            .padding(.horizontal, 8)
+
+            // Focal length presets
+            HStack(spacing: 18) {
+                ForEach(Array(focalPresets.enumerated()), id: \.offset) { index, preset in
+                    Button {
+                        camera.selectFocalPreset(index)
+                    } label: {
+                        VStack(spacing: 2) {
+                            Text("\(preset.mm)")
+                                .font(.system(size: 15, weight: camera.selectedFocalIndex == index ? .bold : .semibold, design: .rounded))
+                            Text("mm")
+                                .font(.system(size: 9))
+                        }
+                        .foregroundStyle(camera.selectedFocalIndex == index ? .yellow : .white)
+                        .frame(width: 54, height: 54)
+                        .background(
+                            Circle()
+                                .fill(Color.black.opacity(0.5))
+                                .overlay(
+                                    Circle().stroke(
+                                        camera.selectedFocalIndex == index ? Color.yellow : Color.white.opacity(0.3),
+                                        lineWidth: camera.selectedFocalIndex == index ? 1.5 : 0.5
+                                    )
+                                )
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Film simulation scroll
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(FilmSimulation.allCases) { sim in
+                        let isSelected = camera.selectedSim == sim
+                        Button {
+                            camera.selectedSim = sim
+                        } label: {
+                            Text(sim.label)
+                                .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                                .foregroundStyle(isSelected ? .black : .white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Capsule().fill(isSelected ? Color.yellow : Color.white.opacity(0.18)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 32)
+            }
+            .padding(.horizontal, -32)
+
+            // Grain slider (when grain is on and a sim is active)
+            if camera.selectedSim != .none && camera.grainEnabled {
+                HStack(spacing: 10) {
+                    Image(systemName: "circle.grid.3x3")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.6))
+                    Slider(value: $camera.grainAmount, in: 0...0.5)
+                        .tint(.white)
+                    Image(systemName: "circle.grid.3x3.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.horizontal, 8)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            // Long exposure controls
+            if camera.isLongExposure {
+                VStack(spacing: 10) {
+                    // Mode toggle + duration label
+                    HStack(spacing: 8) {
+                        ForEach(LongExposureMode.allCases) { mode in
+                            let selected = camera.longExposureMode == mode
+                            Button {
+                                camera.longExposureMode = mode
+                            } label: {
+                                Text(mode.label)
+                                    .font(.system(size: 12, weight: selected ? .bold : .regular))
+                                    .foregroundStyle(selected ? .black : .white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(Capsule().fill(selected ? Color.cyan : Color.white.opacity(0.15)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Spacer()
+                        Text(String(format: "%.1fs", camera.longExposureDuration))
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.cyan)
+                    }
+
+                    // Duration slider
+                    HStack(spacing: 8) {
+                        Text("1s")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                        Slider(value: $camera.longExposureDuration, in: 1...30, step: 0.5)
+                            .tint(.cyan)
+                        Text("30s")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                }
+                .padding(.horizontal, 8)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            // Shutter row: [EV dial] [flash] | shutter | [opacity dial or spacer]
+            shutterRow
+                .padding(.bottom, 30)
+        }
+        .padding(.horizontal, 8)
+    }
+
+    // MARK: - Shutter Row
+
+    private var shutterRow: some View {
+        HStack(alignment: .center, spacing: 0) {
+            // Exposure dial — left side
             ExposureDial(
                 value: Binding(
                     get: { camera.exposureBias },
@@ -1544,292 +1838,32 @@ struct CameraContentView: View {
                 ),
                 range: -3.0...3.0
             )
+            .frame(width: 72, height: 72)
+
+            // Flash button — next to dial
+            Button {
+                camera.toggleFlash()
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
+                        .font(.system(size: 16))
+                    Text(camera.flashLabel)
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
+                .frame(width: 44, height: 38)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(0.45))
+                        .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                )
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, 8)
 
             Spacer()
 
-            VStack(alignment: .trailing, spacing: 8) {
-                HStack(spacing: 8) {
-                    // Double exposure toggle
-                    TopPill(
-                        icon: "square.stack",
-                        text: camera.doubleExposureEnabled ? "2X" : "1X"
-                    )
-                    .onTapGesture {
-                        camera.doubleExposureEnabled.toggle()
-                    }
-
-                    // RAW / JPEG toggle
-                    TopPill(text: camera.rawEnabled ? "RAW" : "JPEG")
-                        .onTapGesture {
-                            camera.rawEnabled.toggle()
-                        }
-
-                    // Long exposure
-                    TopPill(
-                        icon: "timer",
-                        text: camera.isLongExposure ? String(format: "%.0fs", camera.longExposureDuration) : "BULB"
-                    )
-                    .onTapGesture {
-                        camera.isLongExposure.toggle()
-                    }
-
-                    // AF/MF toggle
-                    TopPill(
-                        icon: "viewfinder",
-                        text: camera.manualFocusEnabled ? "MF" : "AF"
-                    )
-                    .onTapGesture {
-                        camera.manualFocusEnabled.toggle()
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    // Aspect ratio selector
-                    TopPill(
-                        icon: "rectangle.split.2x1",
-                        text: camera.selectedAspectRatio.label,
-                        showChevron: true
-                    )
-                    .onTapGesture {
-                        showAspectMenu.toggle()
-                    }
-
-                    // Settings gear
-                    TopPill(icon: "gearshape", text: "")
-                        .onTapGesture {
-                            showSettings = true
-                        }
-                }
-
-                // Aspect ratio popup
-                if showAspectMenu {
-                    VStack(spacing: 4) {
-                        ForEach(AspectRatio.allCases) { ratio in
-                            Button {
-                                camera.selectedAspectRatio = ratio
-                                showAspectMenu = false
-                            } label: {
-                                Text(ratio.label)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(camera.selectedAspectRatio == ratio ? .black : .white)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 6)
-                                    .frame(maxWidth: .infinity)
-                                    .background(camera.selectedAspectRatio == ratio ? Color.yellow : Color.gray.opacity(0.4))
-                                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(8)
-                    .background(Color.black.opacity(0.8))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    .frame(width: 100)
-                }
-            }
-        }
-        .padding(.horizontal, 12)
-    }
-
-    // MARK: - Bottom Section
-
-    private var bottomSection: some View {
-        VStack(spacing: 14) {
-            // EV meter bar
-            ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
-                .frame(height: 40)
-                .padding(.horizontal, 40)
-
-            // MF Slider (only when manual focus is on)
-            if camera.manualFocusEnabled {
-                VStack(spacing: 4) {
-                    Text("MF")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.7))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 3)
-                        .background(Color.gray.opacity(0.5))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-
-                    Slider(
-                        value: Binding(
-                            get: { camera.manualFocusValue },
-                            set: { camera.setManualFocus($0) }
-                        ),
-                        in: 0...1
-                    )
-                    .tint(.yellow)
-                    .padding(.horizontal, 30)
-                }
-            }
-
-            // Long exposure controls
-            if camera.isLongExposure {
-                VStack(spacing: 8) {
-                    // Duration slider
-                    HStack {
-                        Text("Duration")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.gray)
-                        Slider(
-                            value: $camera.longExposureDuration,
-                            in: 0.5...30.0,
-                            step: 0.5
-                        )
-                        .tint(.yellow)
-                        Text(String(format: "%.1fs", camera.longExposureDuration))
-                            .font(.system(size: 12, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white)
-                            .frame(width: 45, alignment: .trailing)
-                    }
-                    .padding(.horizontal, 20)
-
-                    // Mode picker
-                    HStack(spacing: 10) {
-                        ForEach(LongExposureMode.allCases) { mode in
-                            Button {
-                                camera.longExposureMode = mode
-                            } label: {
-                                Text(mode.label)
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(camera.longExposureMode == mode ? .black : .white)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 6)
-                                    .background(camera.longExposureMode == mode ? Color.yellow : Color.gray.opacity(0.35))
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-            }
-
-            // Focal lengths
-            HStack(spacing: 14) {
-                ForEach(Array(focalPresets.enumerated()), id: \.offset) { index, preset in
-                    Button {
-                        camera.selectFocalPreset(index)
-                    } label: {
-                        VStack(spacing: 1) {
-                            Text("\(preset.mm)")
-                                .font(.system(size: 20, weight: .semibold))
-                            Text("mm")
-                                .font(.system(size: 11, weight: .medium))
-                        }
-                        .foregroundStyle(camera.selectedFocalIndex == index ? Color.yellow : .white)
-                        .frame(width: 54, height: 54)
-                        .overlay(
-                            Circle().stroke(
-                                camera.selectedFocalIndex == index ? Color.yellow : .gray.opacity(0.5),
-                                lineWidth: camera.selectedFocalIndex == index ? 2 : 1
-                            )
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
-            // Film sims
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    ForEach(FilmSimulation.allCases) { sim in
-                        Button {
-                            camera.selectedSim = sim
-                        } label: {
-                            Text(sim.label)
-                                .font(.system(size: 14, weight: .semibold))
-                                .lineLimit(1)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 8)
-                                .background(camera.selectedSim == sim ? Color.yellow : .gray.opacity(0.35))
-                                .foregroundStyle(camera.selectedSim == sim ? .black : .white)
-                                .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 16)
-            }
-
-            // Grain slider (when a sim is selected)
-            if camera.selectedSim != .none {
-                HStack(spacing: 10) {
-                    Button {
-                        camera.grainEnabled.toggle()
-                    } label: {
-                        Image(systemName: camera.grainEnabled ? "circle.grid.3x3.fill" : "circle.grid.3x3")
-                            .font(.system(size: 16))
-                            .foregroundStyle(camera.grainEnabled ? .yellow : .gray)
-                    }
-                    .buttonStyle(.plain)
-
-                    if camera.grainEnabled {
-                        Slider(
-                            value: $camera.grainAmount,
-                            in: 0...0.5
-                        )
-                        .tint(.yellow)
-
-                        Text(String(format: "%.0f%%", camera.grainAmount * 200))
-                            .font(.system(size: 12, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white)
-                            .frame(width: 40, alignment: .trailing)
-                    }
-                }
-                .padding(.horizontal, 20)
-            }
-
-            // Shutter row
-            shutterRow
-                .padding(.bottom, 24)
-        }
-    }
-
-    // MARK: - Shutter Row
-
-    private var shutterRow: some View {
-        HStack {
-            HStack(spacing: 14) {
-                // EV display button
-                ZStack(alignment: .top) {
-                    Circle()
-                        .stroke(Color.gray.opacity(0.5), lineWidth: 1)
-                        .frame(width: 50, height: 50)
-                    VStack(spacing: -1) {
-                        Image(systemName: "plusminus")
-                            .font(.system(size: 7))
-                        Text(String(format: "%+.1f", camera.exposureBias))
-                            .font(.system(size: 18, weight: .medium, design: .monospaced))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(width: 50, height: 50)
-                    Circle()
-                        .fill(Color.white)
-                        .frame(width: 5, height: 5)
-                        .offset(y: -2)
-                }
-
-                // Flash button
-                ZStack {
-                    Circle()
-                        .stroke(Color.gray.opacity(0.5), lineWidth: 1)
-                        .frame(width: 50, height: 50)
-                    VStack(spacing: -2) {
-                        Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : "bolt.fill")
-                            .font(.system(size: 14))
-                        Text(camera.flashLabel)
-                            .font(.system(size: 7, weight: .bold))
-                    }
-                    .foregroundStyle(camera.flashMode == .on ? .yellow : .white)
-                }
-                .onTapGesture {
-                    camera.toggleFlash()
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 16)
-
-            // Shutter button
+            // Shutter button — centre
             Button {
                 if camera.doubleExposureEnabled && camera.firstExposureCIImage == nil {
                     camera.captureDoubleExposureFirst()
@@ -1839,11 +1873,11 @@ struct CameraContentView: View {
             } label: {
                 ZStack {
                     Circle()
-                        .stroke(Color.gray.opacity(0.35), lineWidth: 3)
-                        .frame(width: 76, height: 76)
+                        .stroke(Color.white.opacity(0.5), lineWidth: 3)
+                        .frame(width: 84, height: 84)
                     Circle()
                         .fill(camera.isCapturing ? Color.gray : Color.white)
-                        .frame(width: 66, height: 66)
+                        .frame(width: 70, height: 70)
 
                     if camera.isCapturing {
                         ProgressView()
@@ -1859,7 +1893,8 @@ struct CameraContentView: View {
             }
             .buttonStyle(.plain)
             .disabled(camera.isCapturing)
-            .frame(maxWidth: .infinity)
+
+            Spacer()
 
             // Double exposure opacity dial or empty space
             if camera.doubleExposureEnabled {
@@ -1867,57 +1902,14 @@ struct CameraContentView: View {
                     value: $camera.doubleExposureOpacity,
                     label: "BLEND"
                 )
-                .frame(maxWidth: .infinity)
+                .frame(width: 72, height: 72)
             } else {
                 Color.clear
-                    .frame(maxWidth: .infinity)
+                    .frame(width: 72, height: 72)
             }
         }
     }
 
-    // MARK: - Settings Sheet
-
-    private var settingsSheet: some View {
-        NavigationStack {
-            List {
-                Section("Overlays") {
-                    Toggle("Grid", isOn: $camera.showGrid)
-                    Toggle("Level", isOn: $camera.showLevel)
-                    Toggle("Focus Peaking", isOn: $camera.showPeaking)
-                }
-
-                Section("Film Effects") {
-                    Toggle("Color Crosstalk", isOn: $camera.crosstalkEnabled)
-                    if camera.crosstalkEnabled {
-                        Slider(value: $camera.crosstalkAmount, in: 0...0.2) {
-                            Text("Amount")
-                        }
-                    }
-
-                    Toggle("Halation", isOn: $camera.halationEnabled)
-                    if camera.halationEnabled {
-                        Slider(value: $camera.halationAmount, in: 0...1.0) {
-                            Text("Amount")
-                        }
-                    }
-
-                    Toggle("Highlight Rolloff", isOn: $camera.rolloffEnabled)
-                    if camera.rolloffEnabled {
-                        Slider(value: $camera.rolloffThreshold, in: 0.5...0.98) {
-                            Text("Threshold")
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { showSettings = false }
-                }
-            }
-        }
-    }
 }
 
 // MARK: - Top Pill
