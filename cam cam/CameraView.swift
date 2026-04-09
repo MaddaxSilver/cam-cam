@@ -18,8 +18,12 @@ import MediaPlayer
 nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
     case none
     case leica
-    case fujiProvia, fujiVelvia, fujiColor200, fujiPro400H
+    case fujiProvia, fujiVelvia, fujiColor200, fujiPro400H, fujiSuperia
     case kodakPortra, kodakGold, kodakUltramax, kodakColorplus, kodakEktar
+    case cinestill800T, kodakVision3
+    case agfaVista
+    case ilfordHP5
+    case lomography
     case digiCam
     case nightShot
 
@@ -32,11 +36,17 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
         case .fujiVelvia:     return "Velvia"
         case .fujiColor200:   return "Fuji 200"
         case .fujiPro400H:    return "Pro 400H"
+        case .fujiSuperia:    return "Superia"
         case .kodakPortra:    return "Portra"
         case .kodakGold:      return "Gold"
         case .kodakUltramax:  return "Ultramax"
         case .kodakColorplus: return "ColorPlus"
         case .kodakEktar:     return "Ektar"
+        case .cinestill800T:  return "800T"
+        case .kodakVision3:   return "Vision3"
+        case .agfaVista:      return "Vista"
+        case .ilfordHP5:      return "HP5"
+        case .lomography:     return "Lomo"
         case .digiCam:        return "DigiCam"
         case .nightShot:      return "Night"
         }
@@ -134,11 +144,21 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var rolloffThreshold: Float = 0.9
     @Published var rawEnabled: Bool = false
     @Published var doubleExposureOpacity: Double = 0.5
+    @Published var firstExposurePreview: CGImage?
+    @Published var burstMode: Bool = false
+    @Published var isBursting: Bool = false
+    @Published var burstCount: Int = 0
+    @Published var currentZoomFactor: CGFloat = 1.0
+    @Published var currentMM: Int = 28
 
     // MARK: nonisolated(unsafe) stored properties
     nonisolated(unsafe) let session = AVCaptureSession()
     nonisolated(unsafe) var sessionQueue = DispatchQueue(label: "cam.session", qos: .userInitiated)
-    nonisolated(unsafe) var ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    nonisolated(unsafe) var ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
+        .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!
+    ])
     nonisolated(unsafe) var photoOutput = AVCapturePhotoOutput()
     nonisolated(unsafe) var videoDataOutput = AVCaptureVideoDataOutput()
     nonisolated(unsafe) var frameStack: [CIImage] = []
@@ -158,6 +178,8 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var evObservation: NSKeyValueObservation?
     nonisolated(unsafe) var evTimer: Timer?
     nonisolated(unsafe) var firstExposureCIImage: CIImage?
+    nonisolated(unsafe) var capturingFirstExposure: Bool = false
+    nonisolated(unsafe) var burstActive: Bool = false
     nonisolated(unsafe) var currentDevice: AVCaptureDevice?
 
     // MARK: Init
@@ -189,12 +211,14 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    nonisolated(unsafe) var videoOutputAdded = false
+
     nonisolated func configureSession() {
         session.beginConfiguration()
         session.sessionPreset = .photo
 
-        // Default device (wide angle)
-        guard let device = bestDevice(for: focalPresets[1]) else {
+        // Default device (wide angle) — use direct lookup for speed
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
             session.commitConfiguration()
             return
         }
@@ -207,12 +231,37 @@ final class CameraManager: NSObject, ObservableObject {
             session.addInput(input)
         }
 
-        // Photo output
+        // Photo output only — get preview running ASAP
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
         }
 
-        // Video data output for long exposure frame collection
+        session.commitConfiguration()
+
+        // Set max photo dimensions AFTER commit
+        if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+            photoOutput.maxPhotoDimensions = maxDim
+        }
+        // Enable max quality and wide color
+        photoOutput.maxPhotoQualityPrioritization = .quality
+        if photoOutput.isAppleProRAWSupported {
+            photoOutput.isAppleProRAWEnabled = true
+        }
+
+        // Start running immediately — don't wait for video data output
+        session.startRunning()
+        startEVObservation()
+
+        // Defer video data output (only needed for long exposure) to avoid blocking startup
+        sessionQueue.async { [self] in
+            addVideoDataOutputIfNeeded()
+        }
+    }
+
+    nonisolated func addVideoDataOutputIfNeeded() {
+        guard !videoOutputAdded else { return }
+        videoOutputAdded = true
+        session.beginConfiguration()
         videoDataOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
@@ -221,19 +270,11 @@ final class CameraManager: NSObject, ObservableObject {
         if session.canAddOutput(videoDataOutput) {
             session.addOutput(videoDataOutput)
         }
-
         session.commitConfiguration()
-
-        // Set these AFTER commitConfiguration — format descriptions aren't valid during config
-        if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
-            photoOutput.maxPhotoDimensions = maxDim
-        }
         if let connection = videoDataOutput.connection(with: .video),
            connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
         }
-        session.startRunning()
-        startEVObservation()
     }
 
     nonisolated func bestDevice(for preset: FocalPreset) -> AVCaptureDevice? {
@@ -416,15 +457,182 @@ final class CameraManager: NSObject, ObservableObject {
             if useRAW, let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
                 settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
             } else {
-                settings = AVCapturePhotoSettings(format: [
-                    AVVideoCodecKey: AVVideoCodecType.jpeg
-                ])
+                // Use HEIF for 10-bit wide color when available, fall back to JPEG
+                if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+                    settings = AVCapturePhotoSettings(format: [
+                        AVVideoCodecKey: AVVideoCodecType.hevc
+                    ])
+                } else {
+                    settings = AVCapturePhotoSettings(format: [
+                        AVVideoCodecKey: AVVideoCodecType.jpeg
+                    ])
+                }
+            }
+            // Max quality — full sensor processing pipeline
+            settings.photoQualityPrioritization = .quality
+            if let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+                settings.maxPhotoDimensions = maxDim
             }
             if photoOutput.supportedFlashModes.contains(flash) {
                 settings.flashMode = flash
             }
             photoOutput.capturePhoto(with: settings, delegate: self)
         }
+    }
+
+    // MARK: Burst Capture
+
+    func startBurst() {
+        guard !isBursting else { return }
+        isBursting = true
+        burstActive = true
+        burstCount = 0
+        fireBurstShot()
+    }
+
+    func stopBurst() {
+        isBursting = false
+        burstActive = false
+    }
+
+    private nonisolated func fireBurstShot() {
+        guard burstActive else { return }
+        sessionQueue.async { [self] in
+            let settings = AVCapturePhotoSettings(format: [
+                AVVideoCodecKey: AVVideoCodecType.jpeg
+            ])
+            settings.flashMode = .off
+            settings.photoQualityPrioritization = .speed
+            photoOutput.capturePhoto(with: settings, delegate: self)
+        }
+    }
+
+    // Called from photoOutput delegate to chain the next burst shot
+    nonisolated func burstDidCapture() {
+        DispatchQueue.main.async { self.burstCount += 1 }
+        // Fire next shot immediately — no main thread bounce
+        fireBurstShot()
+    }
+
+    // MARK: Smooth Zoom
+
+    /// Fast zoom on current lens only — no device swap, safe to call rapidly from slider
+    func setZoomOnCurrentLens(_ factor: CGFloat) {
+        guard let device = currentDevice else { return }
+        let baseMM: Double = switch device.deviceType {
+        case .builtInUltraWideCamera: 13.0
+        case .builtInTelephotoCamera: 120.0
+        default: 26.0
+        }
+        let targetMM = 26.0 * Double(factor)
+        let deviceZoom = CGFloat(targetMM / baseMM)
+
+        // Deselect focal preset — manual zoom is active
+        selectedFocalIndex = -1
+
+        sessionQueue.async {
+            do {
+                try device.lockForConfiguration()
+                let clamped = max(device.minAvailableVideoZoomFactor,
+                                  min(deviceZoom, device.maxAvailableVideoZoomFactor))
+                device.videoZoomFactor = clamped
+                device.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
+    /// Full zoom with lens swap — debounced, only called when slider pauses
+    func setZoom(_ factor: CGFloat) {
+        // factor is a "global" zoom: 0.5x = ultrawide, 1x = wide, ~4.6x = telephoto native
+        // Convert to target mm
+        let targetMM = 26.0 * Double(factor)
+        let (bestPreset, deviceZoom) = bestLensForMM(targetMM)
+
+        let needsSwap = currentDevice?.deviceType != bestPreset.deviceType
+
+        if needsSwap {
+            // Swap lens then set zoom
+            sessionQueue.async { [self] in
+                guard let device = bestDevice(for: bestPreset) else { return }
+                session.beginConfiguration()
+                session.inputs.forEach { session.removeInput($0) }
+                guard let newInput = try? AVCaptureDeviceInput(device: device),
+                      session.canAddInput(newInput) else {
+                    session.commitConfiguration()
+                    return
+                }
+                session.addInput(newInput)
+                currentDevice = device
+                session.commitConfiguration()
+
+                if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+                    photoOutput.maxPhotoDimensions = maxDim
+                }
+                for output in session.outputs {
+                    if let conn = output.connection(with: .video),
+                       conn.isVideoRotationAngleSupported(90) {
+                        conn.videoRotationAngle = 90
+                    }
+                }
+
+                applyZoom(factor: CGFloat(deviceZoom), on: device)
+                startEVObservation()
+
+                DispatchQueue.main.async {
+                    self.currentZoomFactor = factor
+                    self.currentMM = Int(round(targetMM))
+                }
+            }
+        } else {
+            // Same lens, just adjust zoom
+            sessionQueue.async { [self] in
+                guard let device = currentDevice else { return }
+                applyZoom(factor: CGFloat(deviceZoom), on: device)
+                DispatchQueue.main.async {
+                    self.currentZoomFactor = factor
+                    self.currentMM = Int(round(targetMM))
+                }
+            }
+        }
+    }
+
+    /// Pick the best physical lens and compute the device-level zoom factor for a target mm.
+    private func bestLensForMM(_ mm: Double) -> (FocalPreset, Double) {
+        // Ultra wide: native ~13mm (factor 1x on ultrawide)
+        // Wide: native ~26mm (factor 1x on wide)
+        // Telephoto: native ~120mm (factor 1x on tele)
+
+        if mm < 26 {
+            // Use ultrawide — its native is ~13mm, so zoom = mm / 13
+            let zoom = max(1.0, mm / 13.0)
+            return (focalPresets[0], zoom)  // ultrawide preset
+        }
+
+        // Check if telephoto gives better quality
+        // Telephoto is native 120mm. Use it when target >= 90mm (less digital zoom needed)
+        let teleAvailable = bestDevice(for: focalPresets[4]) != nil
+        if mm >= 90 && teleAvailable {
+            let zoom = max(1.0, mm / 120.0)
+            return (focalPresets[4], zoom)  // telephoto preset
+        }
+
+        // Use wide — native 26mm, zoom = mm / 26
+        let zoom = mm / 26.0
+        return (focalPresets[1], zoom)  // wide preset
+    }
+
+    func syncZoomState() {
+        guard let device = currentDevice else { return }
+        let deviceZoom = Double(device.videoZoomFactor)
+        let baseMM: Double
+        switch device.deviceType {
+        case .builtInUltraWideCamera: baseMM = 13.0
+        case .builtInTelephotoCamera: baseMM = 120.0
+        default: baseMM = 26.0
+        }
+        let mm = baseMM * deviceZoom
+        currentMM = Int(round(mm))
+        currentZoomFactor = CGFloat(mm / 26.0)  // normalize to wide-equivalent
     }
 
     // MARK: Long Exposure - Frame Stack
@@ -561,12 +769,24 @@ final class CameraManager: NSObject, ObservableObject {
 
     nonisolated func renderAndSave(ciImage: CIImage) {
         let cropped = ciImage.cropped(to: cropRect(for: ciImage.extent))
-        guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent) else {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+
+        // Render in Display P3 for wide color gamut
+        guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent, format: .RGBA16, colorSpace: p3) else {
             DispatchQueue.main.async { self.isCapturing = false }
             return
         }
+
+        // Save as HEIF (10-bit, P3) when possible, otherwise max quality JPEG in P3
+        let imageData: Data?
         let uiImage = UIImage(cgImage: cgImage)
-        guard let jpegData = uiImage.jpegData(compressionQuality: 0.95) else {
+        if let heicData = uiImage.heicData() {
+            imageData = heicData
+        } else {
+            imageData = uiImage.jpegData(compressionQuality: 1.0)
+        }
+
+        guard let finalData = imageData else {
             DispatchQueue.main.async { self.isCapturing = false }
             return
         }
@@ -577,7 +797,7 @@ final class CameraManager: NSObject, ObservableObject {
             }
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: jpegData, options: nil)
+                request.addResource(with: .photo, data: finalData, options: nil)
             }) { _, _ in
                 DispatchQueue.main.async { self.isCapturing = false }
             }
@@ -614,6 +834,7 @@ final class CameraManager: NSObject, ObservableObject {
             let opacity = DispatchQueue.main.sync { self.doubleExposureOpacity }
             image = compositeDoubleExposure(base: first, overlay: image, opacity: Float(opacity))
             firstExposureCIImage = nil
+            DispatchQueue.main.async { self.firstExposurePreview = nil }
         }
 
         return image
@@ -789,6 +1010,99 @@ final class CameraManager: NSObject, ObservableObject {
             greenShift.bVector = CIVector(x: 0.0, y: 0.2, z: 0.7, w: 0)
             greenShift.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
             return toneCurve(input: greenShift.outputImage ?? image, shadows: 0.06, mid: 0.02, highlights: -0.08)
+
+        case .fujiSuperia:
+            // Superia 400: warm everyday film, green-shifted shadows, slightly muted
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.08
+            cc.contrast = 1.06
+            cc.brightness = 0.01
+            let warm = CIFilter.temperatureAndTint()
+            warm.inputImage = cc.outputImage
+            warm.neutral = CIVector(x: 6500, y: 0)
+            warm.targetNeutral = CIVector(x: 6000, y: -8)
+            return toneCurve(input: warm.outputImage ?? image, shadows: 0.04, mid: 0.0, highlights: -0.02)
+
+        case .cinestill800T:
+            // CineStill 800T: tungsten cinema film — teal shadows, warm highlights, halation glow
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.15
+            cc.contrast = 1.1
+            cc.brightness = 0.0
+            // Teal/orange split: cool shadows, warm highlights
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cc.outputImage
+            matrix.rVector = CIVector(x: 1.05, y: 0.0, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0, y: 0.95, z: 0.05, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.08, z: 1.1, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.05, mid: 0.0, highlights: -0.04)
+            // Subtle halation on highlights (warm bloom)
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = curved
+            bloom.intensity = 0.15
+            bloom.radius = 8
+            return bloom.outputImage?.cropped(to: image.extent) ?? curved
+
+        case .kodakVision3:
+            // Kodak Vision3 500T: cinema tungsten, deep shadows, rich midtones, cool blue cast
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.05
+            cc.contrast = 1.12
+            cc.brightness = -0.01
+            let cool = CIFilter.temperatureAndTint()
+            cool.inputImage = cc.outputImage
+            cool.neutral = CIVector(x: 6500, y: 0)
+            cool.targetNeutral = CIVector(x: 7500, y: -5)
+            return toneCurve(input: cool.outputImage ?? image, shadows: 0.06, mid: 0.01, highlights: -0.05)
+
+        case .agfaVista:
+            // Agfa Vista 200: warm sunshine film, golden cast, punchy greens
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.2
+            cc.contrast = 1.08
+            cc.brightness = 0.02
+            let warm = CIFilter.temperatureAndTint()
+            warm.inputImage = cc.outputImage
+            warm.neutral = CIVector(x: 6500, y: 0)
+            warm.targetNeutral = CIVector(x: 5400, y: 8)
+            return toneCurve(input: warm.outputImage ?? image, shadows: 0.04, mid: 0.01, highlights: -0.02)
+
+        case .ilfordHP5:
+            // Ilford HP5 Plus 400: classic B&W, rich tones, visible grain character
+            let mono = CIFilter.photoEffectMono()
+            mono.inputImage = image
+            let cc = CIFilter.colorControls()
+            cc.inputImage = mono.outputImage
+            cc.contrast = 1.15
+            cc.brightness = 0.02
+            return toneCurve(input: cc.outputImage ?? image, shadows: 0.03, mid: 0.0, highlights: -0.04)
+
+        case .lomography:
+            // Lomography: high saturation, heavy vignette, cross-processed color shift
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.5
+            cc.contrast = 1.2
+            cc.brightness = 0.02
+            // Cross-process shift: boost greens/yellows, shift blues
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cc.outputImage
+            matrix.rVector = CIVector(x: 1.1, y: 0.05, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0, y: 1.15, z: 0.0, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.0, z: 0.85, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.06, mid: 0.02, highlights: -0.05)
+            // Vignette
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 1.2
+            vignette.radius = 1.5
+            return vignette.outputImage ?? curved
         }
     }
 
@@ -897,14 +1211,23 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func compositeDoubleExposure(base: CIImage, overlay: CIImage, opacity: Float) -> CIImage {
+        // Scale base to match overlay extent if they differ
+        var scaledBase = base
+        let targetExtent = overlay.extent
+        if base.extent.size != targetExtent.size {
+            let sx = targetExtent.width / base.extent.width
+            let sy = targetExtent.height / base.extent.height
+            scaledBase = base.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+        }
+
         let opacityFilter = CIFilter.colorMatrix()
         opacityFilter.inputImage = overlay
         opacityFilter.aVector = CIVector(x: 0, y: 0, z: 0, w: CGFloat(opacity))
         let adjusted = opacityFilter.outputImage ?? overlay
         let blend = CIFilter.screenBlendMode()
         blend.inputImage = adjusted
-        blend.backgroundImage = base
-        return blend.outputImage ?? base
+        blend.backgroundImage = scaledBase
+        return blend.outputImage?.cropped(to: targetExtent) ?? overlay
     }
 
     func selectFocalPreset(_ index: Int) {
@@ -916,19 +1239,40 @@ final class CameraManager: NSObject, ObservableObject {
         if needsLensSwap {
             swapInputDevice(to: preset)
         } else {
-            // Same physical lens — just change zoom factor instantly
             sessionQueue.async { [self] in
                 guard let device = currentDevice else { return }
                 applyZoom(factor: preset.zoomFactor, on: device)
             }
         }
+        // Sync mm display
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.syncZoomState()
+        }
     }
 
     func captureDoubleExposureFirst() {
-        // Store current frame as first exposure
-        if let frame = filteredFrame {
-            let ci = CIImage(cgImage: frame)
-            firstExposureCIImage = ci
+        isCapturing = true
+        capturingFirstExposure = true
+        let flash = flashMode
+        sessionQueue.async { [self] in
+            let settings: AVCapturePhotoSettings
+            if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+                settings = AVCapturePhotoSettings(format: [
+                    AVVideoCodecKey: AVVideoCodecType.hevc
+                ])
+            } else {
+                settings = AVCapturePhotoSettings(format: [
+                    AVVideoCodecKey: AVVideoCodecType.jpeg
+                ])
+            }
+            settings.photoQualityPrioritization = .quality
+            if let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+                settings.maxPhotoDimensions = maxDim
+            }
+            if photoOutput.supportedFlashModes.contains(flash) {
+                settings.flashMode = flash
+            }
+            photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
 }
@@ -960,21 +1304,67 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         error: Error?
     ) {
         guard error == nil else {
-            DispatchQueue.main.async { self.isCapturing = false }
+            DispatchQueue.main.async {
+                self.isCapturing = false
+                self.isBursting = false
+            }
             return
         }
 
         // Check if RAW
         if photo.isRawPhoto, let data = photo.fileDataRepresentation() {
             saveRAW(data: data)
+            if burstActive { burstDidCapture() }
             return
         }
 
         guard let data = photo.fileDataRepresentation() else {
-            DispatchQueue.main.async { self.isCapturing = false }
+            DispatchQueue.main.async {
+                self.isCapturing = false
+                self.isBursting = false
+            }
             return
         }
+
+        // Double exposure first shot — store CIImage, don't save
+        if capturingFirstExposure {
+            capturingFirstExposure = false
+            if let ciImage = CIImage(data: data) {
+                let oriented = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
+                firstExposureCIImage = oriented
+                // Generate preview CGImage for overlay
+                let preview = ciContext.createCGImage(oriented, from: oriented.extent)
+                DispatchQueue.main.async {
+                    self.firstExposurePreview = preview
+                    self.isCapturing = false
+                }
+            } else {
+                DispatchQueue.main.async { self.isCapturing = false }
+            }
+            return
+        }
+
+        // For burst mode, save JPEG directly without film processing for speed
+        if burstActive {
+            saveBurstJPEG(data: data)
+            burstDidCapture()
+            return
+        }
+
         processAndSaveJPEG(imageData: data)
+    }
+}
+
+extension CameraManager {
+    nonisolated func saveBurstJPEG(data: Data) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else { return }
+            PHPhotoLibrary.shared().performChanges({
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, data: data, options: nil)
+                request.creationDate = Date()
+            }) { _, _ in }
+        }
     }
 }
 
@@ -1029,93 +1419,71 @@ struct ExposureMeterBar: View {
     let evValue: Float
     let bias: Float
 
-    private let arcStart: Double = 200
-    private let arcEnd: Double = 340
+    private let range: Float = 3.0
+    private let dialSize: CGFloat = 64
 
     var body: some View {
-        let arcRange = arcEnd - arcStart
-
         ZStack {
-            // Arc background
-            Path { path in
-                path.addArc(center: CGPoint(x: 40, y: 40),
-                            radius: 16,
-                            startAngle: .degrees(arcStart),
-                            endAngle: .degrees(arcEnd),
-                            clockwise: false)
-            }
-            .stroke(Color.gray.opacity(0.3), lineWidth: 3)
-
-            // Under-exposed (blue), center (green), over-exposed (red)
-            Path { path in
-                path.addArc(center: CGPoint(x: 40, y: 40),
-                            radius: 16,
-                            startAngle: .degrees(arcStart),
-                            endAngle: .degrees(arcStart + arcRange * 0.33),
-                            clockwise: false)
-            }
-            .stroke(Color.blue.opacity(0.5), lineWidth: 3)
-
-            Path { path in
-                path.addArc(center: CGPoint(x: 40, y: 40),
-                            radius: 16,
-                            startAngle: .degrees(arcStart + arcRange * 0.33),
-                            endAngle: .degrees(arcStart + arcRange * 0.66),
-                            clockwise: false)
-            }
-            .stroke(Color.green.opacity(0.5), lineWidth: 3)
-
-            Path { path in
-                path.addArc(center: CGPoint(x: 40, y: 40),
-                            radius: 16,
-                            startAngle: .degrees(arcStart + arcRange * 0.66),
-                            endAngle: .degrees(arcEnd),
-                            clockwise: false)
-            }
-            .stroke(Color.red.opacity(0.5), lineWidth: 3)
-
-            // Tick marks
-            ForEach(-3..<4, id: \.self) { tick in
-                let fraction = (Double(tick) + 3.0) / 6.0
-                let angle = Angle.degrees(arcStart + arcRange * fraction)
-                Path { path in
-                    path.move(to: CGPoint(
-                        x: 40 + 10 * cos(CGFloat(angle.radians)),
-                        y: 40 + 10 * sin(CGFloat(angle.radians))
-                    ))
-                    path.addLine(to: CGPoint(
-                        x: 40 + 22 * cos(CGFloat(angle.radians)),
-                        y: 40 + 22 * sin(CGFloat(angle.radians))
-                    ))
-                }
-                .stroke(Color.white.opacity(0.6), lineWidth: 1)
-            }
-
-            // EV marker (current metered value)
-            let evClamped = max(-3, min(3, evValue))
-            let evFraction = (Double(evClamped) + 3.0) / 6.0
-            let evAngle = Angle.degrees(arcStart + arcRange * evFraction)
             Circle()
-                .fill(Color.white)
-                .frame(width: 8, height: 8)
-                .position(
-                    x: 40 + 16 * cos(CGFloat(evAngle.radians)),
-                    y: 40 + 16 * sin(CGFloat(evAngle.radians))
-                )
+                .fill(Color.black.opacity(0.5))
+                .frame(width: dialSize, height: dialSize)
 
-            // Bias marker
-            let biasClamped = max(-3, min(3, bias))
-            let biasFraction = (Double(biasClamped) + 3.0) / 6.0
-            let biasAngle = Angle.degrees(arcStart + arcRange * biasFraction)
-            Triangle()
+            Circle()
+                .stroke(Color.white.opacity(0.15), lineWidth: 1.5)
+                .frame(width: dialSize, height: dialSize)
+
+            // Coloured arc
+            Circle()
+                .trim(from: 0.5 - arcFraction(for: evValue) / 2,
+                      to:   0.5 + arcFraction(for: evValue) / 2)
+                .stroke(meterColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .frame(width: dialSize - 8, height: dialSize - 8)
+                .rotationEffect(.degrees(90))
+                .animation(.easeOut(duration: 0.12), value: evValue)
+
+            // Bias marker dot
+            Circle()
                 .fill(Color.yellow)
-                .frame(width: 10, height: 8)
-                .position(
-                    x: 40 + 28 * cos(CGFloat(biasAngle.radians)),
-                    y: 40 + 28 * sin(CGFloat(biasAngle.radians))
-                )
+                .frame(width: 5, height: 5)
+                .offset(y: -(dialSize / 2 - 4))
+                .rotationEffect(.degrees(Double(bias / range) * 90))
+
+            // Centre label
+            VStack(spacing: 0) {
+                Image(systemName: "sun.max")
+                    .font(.system(size: 8))
+                    .foregroundStyle(meterColor)
+                Text(evLabel)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+            }
+
+            // Scale ticks
+            ForEach([-3, -1, 0, 1, 3], id: \.self) { stop in
+                Rectangle()
+                    .fill(Color.white.opacity(stop == 0 ? 0.8 : 0.3))
+                    .frame(width: 1, height: stop == 0 ? 6 : 4)
+                    .offset(y: -(dialSize / 2 - 2))
+                    .rotationEffect(.degrees(Double(stop) / Double(range) * 90))
+            }
         }
-        .frame(width: 80, height: 80)
+        .frame(width: dialSize, height: dialSize)
+    }
+
+    private func arcFraction(for value: Float) -> CGFloat {
+        let clamped = Swift.max(-range, Swift.min(value, range))
+        return CGFloat(abs(clamped) / range) * 0.5
+    }
+
+    private var evLabel: String {
+        String(format: "%+.1f", evValue + bias)
+    }
+
+    private var meterColor: Color {
+        let total = abs(evValue)
+        if total < 0.5 { return .green }
+        if total < 1.5 { return .yellow }
+        return .red
     }
 }
 
@@ -1373,7 +1741,11 @@ struct FocusPeakingView: UIViewRepresentable {
 class PeakingUIView: UIView, AVCaptureVideoDataOutputSampleBufferDelegate {
     private var peakingOutput = AVCaptureVideoDataOutput()
     private let peakingQueue = DispatchQueue(label: "cam.peaking", qos: .userInteractive)
-    nonisolated(unsafe) var ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    nonisolated(unsafe) var ciContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
+        .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!
+    ])
     private var overlayLayer = CALayer()
 
     func setSession(_ session: AVCaptureSession) {
@@ -1440,8 +1812,11 @@ final class VolumeButtonObserver: ObservableObject {
     private var volumeObservation: NSKeyValueObservation?
     private var lastVolume: Float = -1
     private let session = AVAudioSession.sharedInstance()
+    private var isResetting = false
     var onVolumeUp: (() -> Void)?
     var onVolumeDown: (() -> Void)?
+    // Held reference to the volume slider from the actual view hierarchy
+    weak var volumeSlider: UISlider?
 
     init() {
         try? session.setActive(true)
@@ -1449,16 +1824,34 @@ final class VolumeButtonObserver: ObservableObject {
 
         volumeObservation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
             guard let self, let newVolume = change.newValue else { return }
+            // Ignore KVO callbacks from our own reset
+            guard !self.isResetting else { return }
             let prev = self.lastVolume
-            self.lastVolume = newVolume
-            guard prev >= 0 else { return }
+            guard prev >= 0 else {
+                self.lastVolume = newVolume
+                return
+            }
+            // Detect direction before resetting
+            let wentUp = newVolume > prev
+            let wentDown = newVolume < prev
             DispatchQueue.main.async {
-                if newVolume > prev {
+                if wentUp {
                     self.onVolumeUp?()
-                } else if newVolume < prev {
+                } else if wentDown {
                     self.onVolumeDown?()
                 }
+                // Reset volume to midpoint so buttons always work
+                self.resetVolumeToMidpoint()
             }
+        }
+    }
+
+    func resetVolumeToMidpoint() {
+        isResetting = true
+        volumeSlider?.value = 0.5
+        lastVolume = 0.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            self.isResetting = false
         }
     }
 
@@ -1470,9 +1863,19 @@ final class VolumeButtonObserver: ObservableObject {
 // MARK: - Hidden Volume Slider (prevents system HUD)
 
 struct HiddenVolumeSlider: UIViewRepresentable {
+    var observer: VolumeButtonObserver
+
     func makeUIView(context: Context) -> MPVolumeView {
         let v = MPVolumeView(frame: .zero)
         v.alpha = 0.001
+        // Find the UISlider inside MPVolumeView and hand it to the observer
+        DispatchQueue.main.async {
+            if let slider = v.subviews.first(where: { $0 is UISlider }) as? UISlider {
+                observer.volumeSlider = slider
+                slider.value = 0.5
+                observer.resetVolumeToMidpoint()
+            }
+        }
         return v
     }
     func updateUIView(_ uiView: MPVolumeView, context: Context) {}
@@ -1487,6 +1890,9 @@ struct CameraContentView: View {
     @State private var focusPoint: CGPoint?
     @State private var showFocusIndicator = false
     @State private var showViewMenu = false
+    @State private var showZoomSlider = false
+    @State private var zoomSliderValue: Double = 1.0
+    @State private var isDraggingZoom = false
 
     var body: some View {
         GeometryReader { geo in
@@ -1565,7 +1971,7 @@ struct CameraContentView: View {
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
-        .background { HiddenVolumeSlider().frame(width: 0, height: 0) }
+        .background { HiddenVolumeSlider(observer: volumeObserver).frame(width: 0, height: 0) }
         .onAppear {
             motion.startUpdates()
             let step: Float = 0.33
@@ -1602,6 +2008,20 @@ struct CameraContentView: View {
             }
         } else {
             CameraPreviewView(session: camera.session)
+                .overlay {
+                    // Overlay first exposure while framing second shot
+                    if camera.doubleExposureEnabled, let preview = camera.firstExposurePreview {
+                        GeometryReader { geo in
+                            Image(decorative: preview, scale: 1.0)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: geo.size.width, height: geo.size.height)
+                                .clipped()
+                                .opacity(camera.doubleExposureOpacity)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                }
         }
     }
 
@@ -1619,6 +2039,10 @@ struct CameraContentView: View {
                 )
                 .onTapGesture {
                     camera.doubleExposureEnabled.toggle()
+                    if !camera.doubleExposureEnabled {
+                        camera.firstExposureCIImage = nil
+                        camera.firstExposurePreview = nil
+                    }
                 }
 
                 TopPill(text: camera.rawEnabled ? "RAW" : "JPEG")
@@ -1641,6 +2065,7 @@ struct CameraContentView: View {
                 .onTapGesture {
                     camera.manualFocusEnabled.toggle()
                 }
+
             }
 
             // View options button + dropdown
@@ -1711,7 +2136,14 @@ struct CameraContentView: View {
                             viewMenuToggle(icon: "waveform", title: "Rolloff", isOn: $camera.rolloffEnabled)
                         }
                     }
-                    .padding(.bottom, 8)
+
+                    Divider().background(Color.white.opacity(0.2))
+
+                    // Shooting mode
+                    HStack(spacing: 10) {
+                        viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
+                    }
+                    .padding(.vertical, 8)
                 }
                 .padding(.horizontal, 12)
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.75)))
@@ -1778,7 +2210,37 @@ struct CameraContentView: View {
             }
             .padding(.horizontal, 8)
 
-            // Focal length presets
+            // Zoom slider (iPhone-style, toggleable)
+            if showZoomSlider {
+                VStack(spacing: 6) {
+                    Text("\(Int(round(26.0 * zoomSliderValue)))mm")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.yellow)
+
+                    HStack(spacing: 8) {
+                        Text("0.5x")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                        Slider(value: $zoomSliderValue, in: 0.5...10.0)
+                            .tint(.yellow)
+                            .onChange(of: zoomSliderValue) { _, newValue in
+                                // Only adjust zoom on current lens while dragging (fast)
+                                camera.setZoomOnCurrentLens(CGFloat(newValue))
+                            }
+                            .onReceive(Just(zoomSliderValue).debounce(for: .milliseconds(300), scheduler: RunLoop.main)) { value in
+                                // Swap lens if needed after user pauses
+                                camera.setZoom(CGFloat(value))
+                            }
+                        Text("10x")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                }
+                .padding(.horizontal, 8)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            // Focal length presets + zoom toggle
             HStack(spacing: 18) {
                 ForEach(Array(focalPresets.enumerated()), id: \.offset) { index, preset in
                     Button {
@@ -1805,6 +2267,27 @@ struct CameraContentView: View {
                     }
                     .buttonStyle(.plain)
                 }
+
+                // Zoom toggle button
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showZoomSlider.toggle()
+                        if showZoomSlider {
+                            camera.syncZoomState()
+                            zoomSliderValue = Double(camera.currentZoomFactor)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "infinity")
+                        .font(.system(size: 14))
+                        .foregroundStyle(showZoomSlider ? .black : .white)
+                        .frame(width: 40, height: 40)
+                        .background(
+                            Circle()
+                                .fill(showZoomSlider ? Color.yellow : Color.white.opacity(0.18))
+                        )
+                }
+                .buttonStyle(.plain)
             }
 
             // Film simulation scroll
@@ -1903,85 +2386,111 @@ struct CameraContentView: View {
     // MARK: - Shutter Row
 
     private var shutterRow: some View {
-        HStack(alignment: .center, spacing: 0) {
-            // Exposure dial — left side
-            ExposureDial(
-                value: Binding(
-                    get: { camera.exposureBias },
-                    set: { camera.setExposureBias($0) }
-                ),
-                range: -3.0...3.0
-            )
-            .frame(width: 72, height: 72)
+        ZStack {
+            // Shutter button — always centred
+            shutterButton
 
-            // Flash button — next to dial
-            Button {
-                camera.toggleFlash()
-            } label: {
-                VStack(spacing: 3) {
-                    Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
-                        .font(.system(size: 16))
-                    Text(camera.flashLabel)
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
-                .frame(width: 44, height: 38)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(0.45))
-                        .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
-                )
-            }
-            .buttonStyle(.plain)
-            .padding(.leading, 8)
-
-            Spacer()
-
-            // Shutter button — centre
-            Button {
-                if camera.doubleExposureEnabled && camera.firstExposureCIImage == nil {
-                    camera.captureDoubleExposureFirst()
-                } else {
-                    camera.capturePhoto()
-                }
-            } label: {
-                ZStack {
-                    Circle()
-                        .stroke(Color.white.opacity(0.5), lineWidth: 3)
-                        .frame(width: 84, height: 84)
-                    Circle()
-                        .fill(camera.isCapturing ? Color.gray : Color.white)
-                        .frame(width: 70, height: 70)
-
-                    if camera.isCapturing {
-                        ProgressView()
-                            .tint(.white)
-                    }
-
-                    if camera.doubleExposureEnabled && camera.firstExposureCIImage != nil {
-                        Text("2nd")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.black)
-                    }
-                }
-            }
-            .buttonStyle(.plain)
-            .disabled(camera.isCapturing)
-
-            Spacer()
-
-            // Double exposure opacity dial or empty space
-            if camera.doubleExposureEnabled {
-                OpacityDial(
-                    value: $camera.doubleExposureOpacity,
-                    label: "BLEND"
+            // Left side: EV dial + flash
+            HStack {
+                ExposureDial(
+                    value: Binding(
+                        get: { camera.exposureBias },
+                        set: { camera.setExposureBias($0) }
+                    ),
+                    range: -3.0...3.0
                 )
                 .frame(width: 72, height: 72)
-            } else {
-                Color.clear
+
+                Button {
+                    camera.toggleFlash()
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
+                            .font(.system(size: 16))
+                        Text(camera.flashLabel)
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
+                    .frame(width: 44, height: 38)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.45))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                    )
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+            }
+
+            // Right side: opacity dial or burst count
+            HStack {
+                Spacer()
+                if camera.doubleExposureEnabled {
+                    OpacityDial(
+                        value: $camera.doubleExposureOpacity,
+                        label: "BLEND"
+                    )
                     .frame(width: 72, height: 72)
+                } else if camera.isBursting {
+                    VStack(spacing: 2) {
+                        Text("\(camera.burstCount)")
+                            .font(.system(size: 20, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.yellow)
+                        Text("shots")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    .frame(width: 72, height: 72)
+                }
             }
         }
+    }
+
+    private var shutterButton: some View {
+        // Burst mode: hold to burst, tap for single
+        ZStack {
+            Circle()
+                .stroke(camera.burstMode ? Color.yellow.opacity(0.5) : Color.white.opacity(0.5), lineWidth: 3)
+                .frame(width: 84, height: 84)
+            Circle()
+                .fill(camera.isBursting ? Color.yellow : (camera.isCapturing ? Color.gray : Color.white))
+                .frame(width: 70, height: 70)
+
+            if camera.isCapturing && !camera.isBursting {
+                ProgressView()
+                    .tint(.white)
+            }
+
+            if camera.doubleExposureEnabled && camera.firstExposurePreview != nil {
+                Text("2nd")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.black)
+            }
+
+            if camera.burstMode && !camera.isBursting {
+                Image(systemName: "bolt.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.black.opacity(0.4))
+            }
+        }
+        .onTapGesture {
+            if camera.doubleExposureEnabled && camera.firstExposurePreview == nil {
+                camera.captureDoubleExposureFirst()
+            } else {
+                camera.capturePhoto()
+            }
+        }
+        .onLongPressGesture(minimumDuration: 0.3, pressing: { pressing in
+            if camera.burstMode {
+                if pressing {
+                    camera.startBurst()
+                } else {
+                    camera.stopBurst()
+                }
+            }
+        }, perform: {})
+        .disabled(camera.isCapturing && !camera.burstMode)
     }
 
 }
