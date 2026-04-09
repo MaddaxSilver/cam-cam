@@ -175,6 +175,9 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingCrosstalkEnabled: Bool = false
     nonisolated(unsafe) var pendingHalationEnabled: Bool = false
     nonisolated(unsafe) var pendingRolloffEnabled: Bool = false
+    nonisolated(unsafe) var pendingDoubleExposureOpacity: Double = 0.5
+    nonisolated(unsafe) var processQueue = DispatchQueue(label: "cam.process", qos: .userInitiated)
+    nonisolated(unsafe) var photoLibAuthorized = false
     nonisolated(unsafe) var evObservation: NSKeyValueObservation?
     nonisolated(unsafe) var evTimer: Timer?
     nonisolated(unsafe) var firstExposureCIImage: CIImage?
@@ -186,6 +189,10 @@ final class CameraManager: NSObject, ObservableObject {
 
     override nonisolated init() {
         super.init()
+        // Pre-authorize photo library so saves don't block on first capture
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            self.photoLibAuthorized = (status == .authorized || status == .limited)
+        }
         requestPermissionAndStart()
     }
 
@@ -243,7 +250,7 @@ final class CameraManager: NSObject, ObservableObject {
             photoOutput.maxPhotoDimensions = maxDim
         }
         // Enable max quality and wide color
-        photoOutput.maxPhotoQualityPrioritization = .quality
+        photoOutput.maxPhotoQualityPrioritization = .balanced
         if photoOutput.isAppleProRAWSupported {
             photoOutput.isAppleProRAWEnabled = true
         }
@@ -439,6 +446,7 @@ final class CameraManager: NSObject, ObservableObject {
         pendingCrosstalkEnabled = crosstalkEnabled
         pendingHalationEnabled = halationEnabled
         pendingRolloffEnabled = rolloffEnabled
+        pendingDoubleExposureOpacity = doubleExposureOpacity
 
         if isLongExposure {
             switch longExposureMode {
@@ -468,8 +476,8 @@ final class CameraManager: NSObject, ObservableObject {
                     ])
                 }
             }
-            // Max quality — full sensor processing pipeline
-            settings.photoQualityPrioritization = .quality
+            // Balanced — good quality without the full Deep Fusion wait
+            settings.photoQualityPrioritization = .balanced
             if let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
                 settings.maxPhotoDimensions = maxDim
             }
@@ -678,7 +686,10 @@ final class CameraManager: NSObject, ObservableObject {
         matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
         let averaged = matrix.outputImage ?? accumulated
 
-        renderAndSave(ciImage: averaged.cropped(to: extent))
+        DispatchQueue.main.async { self.isCapturing = false }
+        processQueue.async { [self] in
+            renderAndSave(ciImage: averaged.cropped(to: extent))
+        }
     }
 
     // MARK: Long Exposure - Native
@@ -700,36 +711,40 @@ final class CameraManager: NSObject, ObservableObject {
 
         // After the exposure time, take a photo
         let dispatchDuration = duration + 0.5
-        DispatchQueue.main.asyncAfter(deadline: .now() + dispatchDuration) { [weak self] in
-            guard let self = self else { return }
-            let settings = AVCapturePhotoSettings(format: [
-                AVVideoCodecKey: AVVideoCodecType.jpeg
-            ])
-            self.photoOutput.capturePhoto(with: settings, delegate: self)
+        sessionQueue.asyncAfter(deadline: .now() + dispatchDuration) { [weak self] in
+            guard let self else { return }
+            let settings: AVCapturePhotoSettings
+            if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+            } else {
+                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+            }
+            settings.photoQualityPrioritization = .balanced
+            photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
 
     // MARK: Film Processing & Save
 
     nonisolated func processAndSaveJPEG(imageData: Data) {
-        guard var ciImage = CIImage(data: imageData) else {
-            DispatchQueue.main.async { self.isCapturing = false }
-            return
+        // Unblock shutter immediately — process and save in background
+        DispatchQueue.main.async { self.isCapturing = false }
+
+        processQueue.async { [self] in
+            guard var ciImage = CIImage(data: imageData) else { return }
+
+            // Apply EXIF orientation so the image is upright before processing
+            ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
+
+            let processed = applySimAndGrain(to: ciImage)
+            renderAndSave(ciImage: processed)
         }
-
-        // Apply EXIF orientation so the image is upright before processing
-        ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
-
-        let processed = applySimAndGrain(to: ciImage)
-        renderAndSave(ciImage: processed)
     }
 
     nonisolated func saveRAW(data: Data) {
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else {
-                DispatchQueue.main.async { self.isCapturing = false }
-                return
-            }
+        DispatchQueue.main.async { self.isCapturing = false }
+        processQueue.async { [self] in
+            guard photoLibAuthorized else { return }
             let tempURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString)
                 .appendingPathExtension("dng")
@@ -738,13 +753,10 @@ final class CameraManager: NSObject, ObservableObject {
                 PHPhotoLibrary.shared().performChanges({
                     PHAssetCreationRequest.forAsset()
                         .addResource(with: .photo, fileURL: tempURL, options: nil)
-                }) { success, error in
+                }) { _, _ in
                     try? FileManager.default.removeItem(at: tempURL)
-                    DispatchQueue.main.async { self.isCapturing = false }
                 }
-            } catch {
-                DispatchQueue.main.async { self.isCapturing = false }
-            }
+            } catch {}
         }
     }
 
@@ -771,37 +783,21 @@ final class CameraManager: NSObject, ObservableObject {
         let cropped = ciImage.cropped(to: cropRect(for: ciImage.extent))
         let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
 
-        // Render in Display P3 for wide color gamut
-        guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent, format: .RGBA16, colorSpace: p3) else {
-            DispatchQueue.main.async { self.isCapturing = false }
+        // Render in Display P3 — RGBA8 is fast while preserving wide gamut
+        guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent, format: .RGBA8, colorSpace: p3) else {
             return
         }
 
-        // Save as HEIF (10-bit, P3) when possible, otherwise max quality JPEG in P3
-        let imageData: Data?
+        // Save as HEIF (P3) when possible, otherwise max quality JPEG
         let uiImage = UIImage(cgImage: cgImage)
-        if let heicData = uiImage.heicData() {
-            imageData = heicData
-        } else {
-            imageData = uiImage.jpegData(compressionQuality: 1.0)
-        }
+        let finalData = uiImage.heicData() ?? uiImage.jpegData(compressionQuality: 1.0)
+        guard let finalData else { return }
 
-        guard let finalData = imageData else {
-            DispatchQueue.main.async { self.isCapturing = false }
-            return
-        }
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else {
-                DispatchQueue.main.async { self.isCapturing = false }
-                return
-            }
-            PHPhotoLibrary.shared().performChanges({
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: finalData, options: nil)
-            }) { _, _ in
-                DispatchQueue.main.async { self.isCapturing = false }
-            }
-        }
+        guard photoLibAuthorized else { return }
+        PHPhotoLibrary.shared().performChanges({
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .photo, data: finalData, options: nil)
+        })
     }
 
     // MARK: Film Simulation Pipeline
@@ -831,8 +827,7 @@ final class CameraManager: NSObject, ObservableObject {
 
         // Double exposure compositing
         if let first = firstExposureCIImage {
-            let opacity = DispatchQueue.main.sync { self.doubleExposureOpacity }
-            image = compositeDoubleExposure(base: first, overlay: image, opacity: Float(opacity))
+            image = compositeDoubleExposure(base: first, overlay: image, opacity: Float(pendingDoubleExposureOpacity))
             firstExposureCIImage = nil
             DispatchQueue.main.async { self.firstExposurePreview = nil }
         }
@@ -1012,96 +1007,144 @@ final class CameraManager: NSObject, ObservableObject {
             return toneCurve(input: greenShift.outputImage ?? image, shadows: 0.06, mid: 0.02, highlights: -0.08)
 
         case .fujiSuperia:
-            // Superia 400: warm everyday film, green-shifted shadows, slightly muted
+            // Superia 400: warm amber shadows, faded lifted blacks, muted greens, golden cast
             let cc = CIFilter.colorControls()
             cc.inputImage = image
-            cc.saturation = 1.08
-            cc.contrast = 1.06
+            cc.saturation = 0.92
+            cc.contrast = 1.1
+            cc.brightness = 0.0
+            let warm = CIFilter.temperatureAndTint()
+            warm.inputImage = cc.outputImage
+            warm.neutral = CIVector(x: 6500, y: 0)
+            warm.targetNeutral = CIVector(x: 5200, y: -12)
+            // Push amber into shadows, mute greens
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = warm.outputImage
+            matrix.rVector = CIVector(x: 1.06, y: 0.04, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.02, y: 0.96, z: 0.0, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.0, z: 0.88, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.015, y: 0.008, z: 0.0, w: 0)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.08, mid: 0.02, highlights: -0.03)
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 0.6
+            vignette.radius = 1.2
+            return vignette.outputImage ?? curved
+
+        case .cinestill800T:
+            // CineStill 800T: strong teal-orange split, neon halation glow, deep blacks
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.2
+            cc.contrast = 1.25
+            cc.brightness = -0.02
+            // Heavy teal shadows / warm orange highlights
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cc.outputImage
+            matrix.rVector = CIVector(x: 1.15, y: 0.0, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0, y: 0.88, z: 0.08, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.12, z: 1.2, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.01, y: -0.01, z: 0.03, w: 0)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.04, mid: -0.01, highlights: -0.06)
+            // Warm halation bloom on highlights — the CineStill signature
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = curved
+            bloom.intensity = 0.3
+            bloom.radius = 12
+            let bloomed = bloom.outputImage?.cropped(to: image.extent) ?? curved
+            // Warm the bloom
+            let warmBloom = CIFilter.temperatureAndTint()
+            warmBloom.inputImage = bloomed
+            warmBloom.neutral = CIVector(x: 6500, y: 0)
+            warmBloom.targetNeutral = CIVector(x: 5000, y: 0)
+            return warmBloom.outputImage ?? bloomed
+
+        case .kodakVision3:
+            // Vision3 500T: deep crushed blacks, strong teal shadows, warm neon highlights, cinematic
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.1
+            cc.contrast = 1.35
+            cc.brightness = -0.04
+            // Teal in shadows, preserve warm highlights
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cc.outputImage
+            matrix.rVector = CIVector(x: 1.0, y: 0.0, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0, y: 0.92, z: 0.06, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.1, z: 1.18, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.0, y: 0.0, z: 0.02, w: 0)
+            // Crush blacks hard, soft rolloff on highlights
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.02, mid: -0.02, highlights: -0.06)
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 1.0
+            vignette.radius = 1.5
+            return vignette.outputImage ?? curved
+
+        case .agfaVista:
+            // Agfa Vista: intense golden hour amber, punchy warm contrast, deep rich shadows
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.3
+            cc.contrast = 1.18
             cc.brightness = 0.01
             let warm = CIFilter.temperatureAndTint()
             warm.inputImage = cc.outputImage
             warm.neutral = CIVector(x: 6500, y: 0)
-            warm.targetNeutral = CIVector(x: 6000, y: -8)
-            return toneCurve(input: warm.outputImage ?? image, shadows: 0.04, mid: 0.0, highlights: -0.02)
-
-        case .cinestill800T:
-            // CineStill 800T: tungsten cinema film — teal shadows, warm highlights, halation glow
-            let cc = CIFilter.colorControls()
-            cc.inputImage = image
-            cc.saturation = 1.15
-            cc.contrast = 1.1
-            cc.brightness = 0.0
-            // Teal/orange split: cool shadows, warm highlights
+            warm.targetNeutral = CIVector(x: 4800, y: 12)
+            // Boost reds/oranges, warm shadows
             let matrix = CIFilter.colorMatrix()
-            matrix.inputImage = cc.outputImage
-            matrix.rVector = CIVector(x: 1.05, y: 0.0, z: 0.0, w: 0)
-            matrix.gVector = CIVector(x: 0.0, y: 0.95, z: 0.05, w: 0)
-            matrix.bVector = CIVector(x: 0.0, y: 0.08, z: 1.1, w: 0)
+            matrix.inputImage = warm.outputImage
+            matrix.rVector = CIVector(x: 1.1, y: 0.03, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0, y: 1.0, z: 0.0, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.0, z: 0.82, w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.05, mid: 0.0, highlights: -0.04)
-            // Subtle halation on highlights (warm bloom)
-            let bloom = CIFilter.bloom()
-            bloom.inputImage = curved
-            bloom.intensity = 0.15
-            bloom.radius = 8
-            return bloom.outputImage?.cropped(to: image.extent) ?? curved
-
-        case .kodakVision3:
-            // Kodak Vision3 500T: cinema tungsten, deep shadows, rich midtones, cool blue cast
-            let cc = CIFilter.colorControls()
-            cc.inputImage = image
-            cc.saturation = 1.05
-            cc.contrast = 1.12
-            cc.brightness = -0.01
-            let cool = CIFilter.temperatureAndTint()
-            cool.inputImage = cc.outputImage
-            cool.neutral = CIVector(x: 6500, y: 0)
-            cool.targetNeutral = CIVector(x: 7500, y: -5)
-            return toneCurve(input: cool.outputImage ?? image, shadows: 0.06, mid: 0.01, highlights: -0.05)
-
-        case .agfaVista:
-            // Agfa Vista 200: warm sunshine film, golden cast, punchy greens
-            let cc = CIFilter.colorControls()
-            cc.inputImage = image
-            cc.saturation = 1.2
-            cc.contrast = 1.08
-            cc.brightness = 0.02
-            let warm = CIFilter.temperatureAndTint()
-            warm.inputImage = cc.outputImage
-            warm.neutral = CIVector(x: 6500, y: 0)
-            warm.targetNeutral = CIVector(x: 5400, y: 8)
-            return toneCurve(input: warm.outputImage ?? image, shadows: 0.04, mid: 0.01, highlights: -0.02)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.05, mid: 0.02, highlights: -0.04)
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 0.5
+            vignette.radius = 1.0
+            return vignette.outputImage ?? curved
 
         case .ilfordHP5:
-            // Ilford HP5 Plus 400: classic B&W, rich tones, visible grain character
+            // Ilford HP5: high contrast B&W, deep crushed blacks, bright silver highlights
             let mono = CIFilter.photoEffectMono()
             mono.inputImage = image
             let cc = CIFilter.colorControls()
             cc.inputImage = mono.outputImage
-            cc.contrast = 1.15
-            cc.brightness = 0.02
-            return toneCurve(input: cc.outputImage ?? image, shadows: 0.03, mid: 0.0, highlights: -0.04)
-
-        case .lomography:
-            // Lomography: high saturation, heavy vignette, cross-processed color shift
-            let cc = CIFilter.colorControls()
-            cc.inputImage = image
-            cc.saturation = 1.5
-            cc.contrast = 1.2
-            cc.brightness = 0.02
-            // Cross-process shift: boost greens/yellows, shift blues
-            let matrix = CIFilter.colorMatrix()
-            matrix.inputImage = cc.outputImage
-            matrix.rVector = CIVector(x: 1.1, y: 0.05, z: 0.0, w: 0)
-            matrix.gVector = CIVector(x: 0.0, y: 1.15, z: 0.0, w: 0)
-            matrix.bVector = CIVector(x: 0.0, y: 0.0, z: 0.85, w: 0)
-            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.06, mid: 0.02, highlights: -0.05)
-            // Vignette
+            cc.contrast = 1.3
+            cc.brightness = -0.01
+            let curved = toneCurve(input: cc.outputImage ?? image, shadows: 0.02, mid: -0.02, highlights: -0.06)
             let vignette = CIFilter.vignette()
             vignette.inputImage = curved
-            vignette.intensity = 1.2
-            vignette.radius = 1.5
+            vignette.intensity = 0.8
+            vignette.radius = 1.3
+            return vignette.outputImage ?? curved
+
+        case .lomography:
+            // Lomography: heavy cross-process, oversaturated, strong green/yellow shift, dark vignette
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.6
+            cc.contrast = 1.3
+            cc.brightness = 0.0
+            // Strong cross-process: greens go electric, blues turn teal, reds go amber
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cc.outputImage
+            matrix.rVector = CIVector(x: 1.15, y: 0.08, z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0, y: 1.2, z: 0.05, w: 0)
+            matrix.bVector = CIVector(x: 0.0, y: 0.05, z: 0.75, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.02, y: 0.01, z: -0.02, w: 0)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.06, mid: 0.0, highlights: -0.08)
+            // Heavy dark vignette
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 1.8
+            vignette.radius = 1.8
             return vignette.outputImage ?? curved
         }
     }
@@ -1265,7 +1308,7 @@ final class CameraManager: NSObject, ObservableObject {
                     AVVideoCodecKey: AVVideoCodecType.jpeg
                 ])
             }
-            settings.photoQualityPrioritization = .quality
+            settings.photoQualityPrioritization = .balanced
             if let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
                 settings.maxPhotoDimensions = maxDim
             }
@@ -1810,49 +1853,50 @@ class PeakingUIView: UIView, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 final class VolumeButtonObserver: ObservableObject {
     private var volumeObservation: NSKeyValueObservation?
-    private var lastVolume: Float = -1
     private let session = AVAudioSession.sharedInstance()
-    private var isResetting = false
+    private var ignoreNextChange = false
     var onVolumeUp: (() -> Void)?
     var onVolumeDown: (() -> Void)?
-    // Held reference to the volume slider from the actual view hierarchy
-    weak var volumeSlider: UISlider?
+
+    // The actual system volume slider from the MPVolumeView in the hierarchy
+    weak var systemSlider: UISlider? {
+        didSet {
+            guard let slider = systemSlider else { return }
+            // Set to midpoint so both directions always work
+            setSystemVolume(0.5, on: slider)
+        }
+    }
 
     init() {
         try? session.setActive(true)
-        lastVolume = session.outputVolume
+        try? session.setCategory(.playback, options: .mixWithOthers)
 
-        volumeObservation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
-            guard let self, let newVolume = change.newValue else { return }
-            // Ignore KVO callbacks from our own reset
-            guard !self.isResetting else { return }
-            let prev = self.lastVolume
-            guard prev >= 0 else {
-                self.lastVolume = newVolume
+        volumeObservation = session.observe(\.outputVolume, options: [.old, .new]) { [weak self] _, change in
+            guard let self else { return }
+            if self.ignoreNextChange {
+                self.ignoreNextChange = false
                 return
             }
-            // Detect direction before resetting
-            let wentUp = newVolume > prev
-            let wentDown = newVolume < prev
+            guard let oldVal = change.oldValue, let newVal = change.newValue, oldVal != newVal else { return }
+            let wentUp = newVal > oldVal
             DispatchQueue.main.async {
                 if wentUp {
                     self.onVolumeUp?()
-                } else if wentDown {
+                } else {
                     self.onVolumeDown?()
                 }
-                // Reset volume to midpoint so buttons always work
-                self.resetVolumeToMidpoint()
+                // Reset to midpoint so the next press always has room
+                if let slider = self.systemSlider {
+                    self.ignoreNextChange = true
+                    self.setSystemVolume(0.5, on: slider)
+                }
             }
         }
     }
 
-    func resetVolumeToMidpoint() {
-        isResetting = true
-        volumeSlider?.value = 0.5
-        lastVolume = 0.5
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            self.isResetting = false
-        }
+    private func setSystemVolume(_ value: Float, on slider: UISlider) {
+        slider.setValue(value, animated: false)
+        slider.sendActions(for: .valueChanged)
     }
 
     deinit {
@@ -1866,19 +1910,18 @@ struct HiddenVolumeSlider: UIViewRepresentable {
     var observer: VolumeButtonObserver
 
     func makeUIView(context: Context) -> MPVolumeView {
-        let v = MPVolumeView(frame: .zero)
+        let v = MPVolumeView(frame: CGRect(x: -1000, y: -1000, width: 1, height: 1))
         v.alpha = 0.001
-        // Find the UISlider inside MPVolumeView and hand it to the observer
-        DispatchQueue.main.async {
-            if let slider = v.subviews.first(where: { $0 is UISlider }) as? UISlider {
-                observer.volumeSlider = slider
-                slider.value = 0.5
-                observer.resetVolumeToMidpoint()
-            }
-        }
         return v
     }
-    func updateUIView(_ uiView: MPVolumeView, context: Context) {}
+
+    func updateUIView(_ uiView: MPVolumeView, context: Context) {
+        // Slider may not exist on first layout — check each update
+        if observer.systemSlider == nil,
+           let slider = uiView.subviews.first(where: { $0 is UISlider }) as? UISlider {
+            observer.systemSlider = slider
+        }
+    }
 }
 
 // MARK: - CameraContentView
