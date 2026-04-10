@@ -13,6 +13,109 @@ import Combine
 import CoreMotion
 import MediaPlayer
 
+// MARK: - Orientation-Aware Icon/Text Rotation
+
+private struct IconRotation: ViewModifier {
+    let angle: Double
+    func body(content: Content) -> some View {
+        content.rotationEffect(.degrees(angle))
+    }
+}
+
+extension View {
+    func iconRotation(_ angle: Double) -> some View {
+        modifier(IconRotation(angle: angle))
+    }
+}
+
+// MARK: - Custom Film Simulation Model
+
+struct CustomSimulation: Codable, Identifiable, Equatable {
+    var id: UUID = UUID()
+    var name: String = "My Film"
+
+    // Exposure
+    var brightness: Float = 0.0       // -0.1 ... 0.1
+    var contrast: Float = 1.0         // 0.7 ... 1.5
+    var saturation: Float = 1.0       // 0.0 ... 2.0
+
+    // Temperature
+    var temperature: Float = 6500     // 3000 ... 10000
+    var tint: Float = 0               // -50 ... 50
+
+    // Tone curve
+    var shadowLift: Float = 0.0       // 0 ... 0.15
+    var midShift: Float = 0.0         // -0.1 ... 0.1
+    var highlightRolloff: Float = 0.0 // -0.1 ... 0.0
+
+    // Color channels
+    var redMult: Float = 1.0          // 0.7 ... 1.3
+    var greenMult: Float = 1.0        // 0.7 ... 1.3
+    var blueMult: Float = 1.0         // 0.7 ... 1.3
+
+    // Red bias (adds warmth to shadows)
+    var redBias: Float = 0.0          // -0.05 ... 0.05
+    var greenBias: Float = 0.0
+    var blueBias: Float = 0.0
+
+    // Quality: 0 = speed, 1 = balanced, 2 = quality (Deep Fusion)
+    var quality: Int = 2
+
+    // Effects
+    var vignetteIntensity: Float = 0.0 // 0 ... 2.0
+    var fadeAmount: Float = 0.0        // 0 ... 0.15 (lifts black point)
+    var bloomIntensity: Float = 0.0    // 0 ... 0.5
+    var bloomRadius: Float = 8.0       // 2 ... 20
+}
+
+// MARK: - Custom Sim Store
+
+final class CustomSimStore: ObservableObject {
+    @Published var simulations: [CustomSimulation] = []
+    @Published var activeCustomSimID: UUID?
+
+    private let key = "cam_cam_custom_sims"
+
+    init() { load() }
+
+    func load() {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([CustomSimulation].self, from: data) else { return }
+        simulations = decoded
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(simulations) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    func addNew() -> CustomSimulation {
+        var sim = CustomSimulation()
+        sim.name = "Custom \(simulations.count + 1)"
+        simulations.append(sim)
+        save()
+        return sim
+    }
+
+    func update(_ sim: CustomSimulation) {
+        if let idx = simulations.firstIndex(where: { $0.id == sim.id }) {
+            simulations[idx] = sim
+            save()
+        }
+    }
+
+    func delete(_ sim: CustomSimulation) {
+        simulations.removeAll { $0.id == sim.id }
+        if activeCustomSimID == sim.id { activeCustomSimID = nil }
+        save()
+    }
+
+    var activeSim: CustomSimulation? {
+        guard let id = activeCustomSimID else { return nil }
+        return simulations.first { $0.id == id }
+    }
+}
+
 // MARK: - Film Simulation Enum
 
 nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
@@ -26,6 +129,7 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
     case lomography
     case digiCam
     case nightShot
+    case urbanJade
 
     var id: String { rawValue }
     var label: String {
@@ -49,6 +153,7 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
         case .lomography:     return "Lomo"
         case .digiCam:        return "DigiCam"
         case .nightShot:      return "Night"
+        case .urbanJade:      return "Urban Jade"
         }
     }
 }
@@ -115,7 +220,9 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var filteredFrame: CGImage?
     @Published var isAuthorized = false
     @Published var isDenied = false
-    @Published var selectedSim: FilmSimulation = .none
+    @Published var selectedSim: FilmSimulation = .none {
+        didSet { cachedSim = selectedSim }
+    }
     @Published var selectedAspectRatio: AspectRatio = .full
     @Published var grainAmount: Float = 0.0
     @Published var grainEnabled: Bool = false
@@ -150,6 +257,12 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var burstCount: Int = 0
     @Published var currentZoomFactor: CGFloat = 1.0
     @Published var currentMM: Int = 28
+    @Published var isFrontCamera: Bool = false
+    @Published var photoQuality: Int = 2 // 0 speed, 1 balanced, 2 quality
+    nonisolated(unsafe) var liveFilteredFrame: CGImage?
+    nonisolated(unsafe) var activeCustomSim: CustomSimulation?
+    nonisolated(unsafe) var lastFilterFrameTime: CFAbsoluteTime = 0
+    nonisolated(unsafe) var liveFilterContext = CIContext(options: [.useSoftwareRenderer: false])
 
     // MARK: nonisolated(unsafe) stored properties
     nonisolated(unsafe) let session = AVCaptureSession()
@@ -176,6 +289,9 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingHalationEnabled: Bool = false
     nonisolated(unsafe) var pendingRolloffEnabled: Bool = false
     nonisolated(unsafe) var pendingDoubleExposureOpacity: Double = 0.5
+    nonisolated(unsafe) var pendingCustomSim: CustomSimulation?
+    nonisolated(unsafe) var pendingQuality: AVCapturePhotoOutput.QualityPrioritization = .quality
+    nonisolated(unsafe) var cachedSim: FilmSimulation = .none
     nonisolated(unsafe) var processQueue = DispatchQueue(label: "cam.process", qos: .userInitiated)
     nonisolated(unsafe) var photoLibAuthorized = false
     nonisolated(unsafe) var evObservation: NSKeyValueObservation?
@@ -184,6 +300,7 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var capturingFirstExposure: Bool = false
     nonisolated(unsafe) var burstActive: Bool = false
     nonisolated(unsafe) var currentDevice: AVCaptureDevice?
+    nonisolated(unsafe) weak var editorPreviewRenderer: FilteredPreviewRenderer?
 
     // MARK: Init
 
@@ -220,9 +337,34 @@ final class CameraManager: NSObject, ObservableObject {
 
     nonisolated(unsafe) var videoOutputAdded = false
 
+    /// Select the best device format: highest photo resolution while keeping video preview >= 1080p
+    /// Must be called while device is locked for configuration
+    nonisolated func selectBestFormat(for device: AVCaptureDevice) {
+        // Filter to formats with decent video preview (at least 1080p width)
+        // then pick the one with the highest photo resolution
+        let candidates = device.formats.filter { f in
+            let mediaType = CMFormatDescriptionGetMediaType(f.formatDescription)
+            guard mediaType == kCMMediaType_Video else { return false }
+            let videoDims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            return videoDims.width >= 1920
+        }
+        // Among candidates with good preview, pick highest photo res
+        let best = (candidates.isEmpty ? device.formats : candidates)
+            .max { a, b in
+                let aMax = a.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height })
+                let bMax = b.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height })
+                let aPixels = Int(aMax?.width ?? 0) * Int(aMax?.height ?? 0)
+                let bPixels = Int(bMax?.width ?? 0) * Int(bMax?.height ?? 0)
+                return aPixels < bPixels
+            }
+        guard let best else { return }
+        device.activeFormat = best
+    }
+
     nonisolated func configureSession() {
         session.beginConfiguration()
-        session.sessionPreset = .photo
+        // Use inputPriority so we can manually select formats (needed for 48MP)
+        session.sessionPreset = .inputPriority
 
         // Default device (wide angle) — use direct lookup for speed
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
@@ -243,14 +385,21 @@ final class CameraManager: NSObject, ObservableObject {
             session.addOutput(photoOutput)
         }
 
+        // Select best format inside config block for smooth startup
+        do {
+            try device.lockForConfiguration()
+            selectBestFormat(for: device)
+            device.unlockForConfiguration()
+        } catch {}
+
         session.commitConfiguration()
 
         // Set max photo dimensions AFTER commit
-        if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+        if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
             photoOutput.maxPhotoDimensions = maxDim
         }
         // Enable max quality and wide color
-        photoOutput.maxPhotoQualityPrioritization = .balanced
+        photoOutput.maxPhotoQualityPrioritization = .quality
         if photoOutput.isAppleProRAWSupported {
             photoOutput.isAppleProRAWEnabled = true
         }
@@ -289,30 +438,36 @@ final class CameraManager: NSObject, ObservableObject {
             ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
     }
 
-    nonisolated func swapInputDevice(to preset: FocalPreset) {
+    nonisolated func swapInputDevice(to preset: FocalPreset, animateFromZoom: CGFloat? = nil) {
         sessionQueue.async { [self] in
             guard let device = bestDevice(for: preset) else { return }
+            // Suspend video output delegate to avoid FigCaptureSourceRemote errors during reconfig
+            videoDataOutput.setSampleBufferDelegate(nil, queue: nil)
             session.beginConfiguration()
             session.inputs.forEach { session.removeInput($0) }
 
             guard let newInput = try? AVCaptureDeviceInput(device: device),
                   session.canAddInput(newInput) else {
                 session.commitConfiguration()
+                videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
                 return
             }
             session.addInput(newInput)
             currentDevice = device
 
-            session.commitConfiguration()
+            // Select best format inside config block
+            do {
+                try device.lockForConfiguration()
+                selectBestFormat(for: device)
+                device.unlockForConfiguration()
+            } catch {}
 
-            // Must be AFTER commitConfiguration — format descriptions reset during config
-            if let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
-                photoOutput.maxPhotoDimensions = maxDim
+            // If animating, start at the bridge zoom so first frame matches previous FOV
+            if let startZoom = animateFromZoom {
+                applyZoom(factor: startZoom, on: device)
             }
-            if photoOutput.isAppleProRAWSupported {
-                photoOutput.isAppleProRAWEnabled = true
-            }
-            // Re-apply rotation on ALL video connections after input swap
+
+            // Apply rotation INSIDE config block so it's atomic with the input swap
             for output in session.outputs {
                 if let conn = output.connection(with: .video),
                    conn.isVideoRotationAngleSupported(90) {
@@ -320,9 +475,38 @@ final class CameraManager: NSObject, ObservableObject {
                 }
             }
 
-            applyZoom(factor: preset.zoomFactor, on: device)
+            session.commitConfiguration()
+            // Re-enable video delegate after session settles
+            videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+
+            // Set max photo dims after commit
+            let dims = device.activeFormat.supportedMaxPhotoDimensions
+            if let maxDim = dims.max(by: { $0.width * $0.height < $1.width * $1.height }), maxDim.width > 0 {
+                photoOutput.maxPhotoDimensions = maxDim
+            }
+            if photoOutput.isAppleProRAWSupported {
+                photoOutput.isAppleProRAWEnabled = true
+            }
+
+            // Animate zoom to target (or set immediately if no animation)
+            if animateFromZoom != nil {
+                animateZoom(to: preset.zoomFactor, on: device, duration: 0.35)
+            } else {
+                applyZoom(factor: preset.zoomFactor, on: device)
+            }
             startEVObservation()
         }
+    }
+
+    /// Smoothly animate zoom using AVCaptureDevice's ramp API
+    nonisolated func animateZoom(to factor: CGFloat, on device: AVCaptureDevice, duration: TimeInterval) {
+        do {
+            try device.lockForConfiguration()
+            let clamped = max(device.minAvailableVideoZoomFactor,
+                              min(factor, device.maxAvailableVideoZoomFactor))
+            device.ramp(toVideoZoomFactor: clamped, withRate: Float(abs(device.videoZoomFactor - clamped) / CGFloat(duration)))
+            device.unlockForConfiguration()
+        } catch {}
     }
 
     nonisolated func applyZoom(factor: CGFloat, on device: AVCaptureDevice) {
@@ -344,6 +528,57 @@ final class CameraManager: NSObject, ObservableObject {
 
     nonisolated var isRAWSupported: Bool {
         !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
+    }
+
+    // MARK: Flip Camera (front/back)
+
+    func flipCamera() {
+        let goingFront = !isFrontCamera
+        isFrontCamera = goingFront
+        sessionQueue.async { [self] in
+            let position: AVCaptureDevice.Position = goingFront ? .front : .back
+            let deviceType: AVCaptureDevice.DeviceType = goingFront ? .builtInWideAngleCamera : (currentDevice?.deviceType ?? .builtInWideAngleCamera)
+            guard let device = AVCaptureDevice.default(deviceType, for: .video, position: position)
+                    ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) else { return }
+
+            videoDataOutput.setSampleBufferDelegate(nil, queue: nil)
+            session.beginConfiguration()
+            session.inputs.forEach { session.removeInput($0) }
+            guard let newInput = try? AVCaptureDeviceInput(device: device),
+                  session.canAddInput(newInput) else {
+                session.commitConfiguration()
+                videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+                return
+            }
+            session.addInput(newInput)
+            currentDevice = device
+
+            do {
+                try device.lockForConfiguration()
+                selectBestFormat(for: device)
+                device.unlockForConfiguration()
+            } catch {}
+
+            // Apply rotation and mirror INSIDE config block — no rotation glitch
+            for output in session.outputs {
+                if let conn = output.connection(with: .video),
+                   conn.isVideoRotationAngleSupported(90) {
+                    conn.videoRotationAngle = 90
+                }
+            }
+            if let conn = photoOutput.connection(with: .video) {
+                conn.isVideoMirrored = goingFront
+            }
+
+            session.commitConfiguration()
+            videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+
+            let dims = device.activeFormat.supportedMaxPhotoDimensions
+            if let maxDim = dims.max(by: { $0.width * $0.height < $1.width * $1.height }), maxDim.width > 0 {
+                photoOutput.maxPhotoDimensions = maxDim
+            }
+            startEVObservation()
+        }
     }
 
     nonisolated func startEVObservation() {
@@ -431,6 +666,22 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    var effectiveQualityPrioritization: AVCapturePhotoOutput.QualityPrioritization {
+        // If a custom sim is active and has its own quality, use that
+        if let customSim = activeCustomSim {
+            switch customSim.quality {
+            case 0: return .speed
+            case 1: return .balanced
+            default: return .quality
+            }
+        }
+        switch photoQuality {
+        case 0: return .speed
+        case 1: return .balanced
+        default: return .quality
+        }
+    }
+
     // MARK: Capture
 
     func capturePhoto() {
@@ -447,6 +698,8 @@ final class CameraManager: NSObject, ObservableObject {
         pendingHalationEnabled = halationEnabled
         pendingRolloffEnabled = rolloffEnabled
         pendingDoubleExposureOpacity = doubleExposureOpacity
+        pendingCustomSim = activeCustomSim
+        pendingQuality = effectiveQualityPrioritization
 
         if isLongExposure {
             switch longExposureMode {
@@ -476,9 +729,10 @@ final class CameraManager: NSObject, ObservableObject {
                     ])
                 }
             }
-            // Balanced — good quality without the full Deep Fusion wait
-            settings.photoQualityPrioritization = .balanced
-            if let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+            settings.photoQualityPrioritization = pendingQuality
+            // Max quality → full sensor resolution (48MP on Pro), otherwise use default binned
+            if pendingQuality == .quality,
+               let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
                 settings.maxPhotoDimensions = maxDim
             }
             if photoOutput.supportedFlashModes.contains(flash) {
@@ -506,11 +760,15 @@ final class CameraManager: NSObject, ObservableObject {
     private nonisolated func fireBurstShot() {
         guard burstActive else { return }
         sessionQueue.async { [self] in
-            let settings = AVCapturePhotoSettings(format: [
-                AVVideoCodecKey: AVVideoCodecType.jpeg
-            ])
+            let settings: AVCapturePhotoSettings
+            if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+            } else {
+                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+            }
             settings.flashMode = .off
             settings.photoQualityPrioritization = .speed
+            // Burst uses default binned resolution for max speed
             photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
@@ -719,7 +977,11 @@ final class CameraManager: NSObject, ObservableObject {
             } else {
                 settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
             }
-            settings.photoQualityPrioritization = .balanced
+            settings.photoQualityPrioritization = pendingQuality
+            if pendingQuality == .quality,
+               let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+                settings.maxPhotoDimensions = maxDim
+            }
             photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
@@ -783,13 +1045,25 @@ final class CameraManager: NSObject, ObservableObject {
         let cropped = ciImage.cropped(to: cropRect(for: ciImage.extent))
         let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
 
-        // Render in Display P3 — RGBA8 is fast while preserving wide gamut
+        // Render in Display P3 — use RGBx (no alpha) to halve memory and avoid alpha warning
         guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent, format: .RGBA8, colorSpace: p3) else {
             return
         }
 
         // Save as HEIF (P3) when possible, otherwise max quality JPEG
-        let uiImage = UIImage(cgImage: cgImage)
+        // Force noneSkipLast alpha info so encoder knows image is opaque
+        let w = cgImage.width, h = cgImage.height
+        let opaqueImage: CGImage
+        if let ctx = CGContext(data: nil, width: w, height: h,
+                               bitsPerComponent: 8, bytesPerRow: w * 4,
+                               space: p3,
+                               bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+            opaqueImage = ctx.makeImage() ?? cgImage
+        } else {
+            opaqueImage = cgImage
+        }
+        let uiImage = UIImage(cgImage: opaqueImage)
         let finalData = uiImage.heicData() ?? uiImage.jpegData(compressionQuality: 1.0)
         guard let finalData else { return }
 
@@ -803,7 +1077,12 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: Film Simulation Pipeline
 
     nonisolated func applySimAndGrain(to input: CIImage) -> CIImage {
-        var image = applyFilmSim(to: input)
+        var image: CIImage
+        if let customSim = pendingCustomSim {
+            image = applyCustomSim(to: input, sim: customSim)
+        } else {
+            image = applyFilmSim(to: input)
+        }
 
         // Crosstalk
         if pendingCrosstalkEnabled {
@@ -1006,6 +1285,40 @@ final class CameraManager: NSObject, ObservableObject {
             greenShift.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
             return toneCurve(input: greenShift.outputImage ?? image, shadows: 0.06, mid: 0.02, highlights: -0.08)
 
+        case .urbanJade:
+            // Urban Jade: lush saturated greens, warm golden sunlight, teal shadows,
+            // punchy reds, rich contrast — subtropical city courtyard look
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.25        // rich color without oversaturating
+            cc.contrast = 1.15          // good punch
+            cc.brightness = 0.01
+
+            // Slight warm shift — golden sunlight tone
+            let temp = CIFilter.temperatureAndTint()
+            temp.inputImage = cc.outputImage
+            temp.neutral = CIVector(x: 6500, y: 0)
+            temp.targetNeutral = CIVector(x: 5800, y: 8)  // warm with slight green tint
+
+            // Color matrix: boost greens, push teal into shadows, keep reds vivid
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = temp.outputImage
+            matrix.rVector = CIVector(x: 1.05, y: 0.0,  z: 0.0,  w: 0)  // reds stay punchy
+            matrix.gVector = CIVector(x: 0.0,  y: 1.12, z: 0.03, w: 0)  // boost green, teal hint
+            matrix.bVector = CIVector(x: 0.0,  y: 0.06, z: 0.92, w: 0)  // blue pulled toward teal
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.0, y: 0.008, z: 0.012, w: 0) // teal shadow bias
+
+            // Tone curve: deep shadows, lifted midtones, smooth highlight rolloff
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.02, mid: 0.03, highlights: -0.04)
+
+            // Subtle vignette to frame the scene
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 0.4
+            vignette.radius = 1.5
+            return vignette.outputImage ?? curved
+
         case .fujiSuperia:
             // Superia 400: warm amber shadows, faded lifted blacks, muted greens, golden cast
             let cc = CIFilter.colorControls()
@@ -1149,6 +1462,72 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: Custom Sim Processing
+
+    nonisolated func applyCustomSim(to image: CIImage, sim: CustomSimulation) -> CIImage {
+        var result = image
+
+        // 1. Brightness / Contrast / Saturation
+        let cc = CIFilter.colorControls()
+        cc.inputImage = result
+        cc.brightness = sim.brightness
+        cc.contrast = sim.contrast
+        cc.saturation = sim.saturation
+        result = cc.outputImage ?? result
+
+        // 2. Temperature & Tint
+        let temp = CIFilter.temperatureAndTint()
+        temp.inputImage = result
+        temp.neutral = CIVector(x: 6500, y: 0)
+        temp.targetNeutral = CIVector(x: CGFloat(sim.temperature), y: CGFloat(sim.tint))
+        result = temp.outputImage ?? result
+
+        // 3. Color matrix (channel multipliers + bias)
+        let matrix = CIFilter.colorMatrix()
+        matrix.inputImage = result
+        matrix.rVector = CIVector(x: CGFloat(sim.redMult), y: 0, z: 0, w: 0)
+        matrix.gVector = CIVector(x: 0, y: CGFloat(sim.greenMult), z: 0, w: 0)
+        matrix.bVector = CIVector(x: 0, y: 0, z: CGFloat(sim.blueMult), w: 0)
+        matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+        matrix.biasVector = CIVector(x: CGFloat(sim.redBias), y: CGFloat(sim.greenBias), z: CGFloat(sim.blueBias), w: 0)
+        result = matrix.outputImage ?? result
+
+        // 4. Tone curve (shadow lift, mid shift, highlight rolloff)
+        result = toneCurve(input: result, shadows: sim.shadowLift + sim.fadeAmount, mid: sim.midShift, highlights: sim.highlightRolloff)
+
+        // 5. Fade (lift the black point)
+        if sim.fadeAmount > 0 {
+            let fade = CIFilter.colorMatrix()
+            fade.inputImage = result
+            fade.rVector = CIVector(x: CGFloat(1.0 - sim.fadeAmount), y: 0, z: 0, w: 0)
+            fade.gVector = CIVector(x: 0, y: CGFloat(1.0 - sim.fadeAmount), z: 0, w: 0)
+            fade.bVector = CIVector(x: 0, y: 0, z: CGFloat(1.0 - sim.fadeAmount), w: 0)
+            fade.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            fade.biasVector = CIVector(x: CGFloat(sim.fadeAmount), y: CGFloat(sim.fadeAmount), z: CGFloat(sim.fadeAmount), w: 0)
+            result = fade.outputImage ?? result
+        }
+
+        // 6. Bloom / halation
+        if sim.bloomIntensity > 0 {
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = result
+            bloom.intensity = sim.bloomIntensity
+            bloom.radius = sim.bloomRadius
+            result = bloom.outputImage?.cropped(to: image.extent) ?? result
+        }
+
+        // 7. Vignette
+        if sim.vignetteIntensity > 0 {
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = result
+            vignette.intensity = sim.vignetteIntensity
+            vignette.radius = 1.5
+            result = vignette.outputImage ?? result
+        }
+
+        return result
+    }
+
     // MARK: Filter Building Blocks
 
     nonisolated func toneCurve(input: CIImage, shadows: Float, mid: Float, highlights: Float) -> CIImage {
@@ -1276,15 +1655,22 @@ final class CameraManager: NSObject, ObservableObject {
     func selectFocalPreset(_ index: Int) {
         guard index >= 0, index < focalPresets.count else { return }
         let preset = focalPresets[index]
-        let needsLensSwap = currentDevice?.deviceType != preset.deviceType
+        let previousDevice = currentDevice
+        let needsLensSwap = previousDevice?.deviceType != preset.deviceType
         selectedFocalIndex = index
 
         if needsLensSwap {
-            swapInputDevice(to: preset)
+            // Calculate a starting zoom that matches the previous FOV for a smooth transition
+            let previousPresetIndex = focalPresets.firstIndex(where: { $0.deviceType == previousDevice?.deviceType }) ?? 1
+            let previousMM = focalPresets[previousPresetIndex].mm
+            let targetMM = preset.mm
+            // Start zoomed to approximate the previous FOV, then animate to target
+            let startZoom = max(1.0, CGFloat(previousMM) / CGFloat(targetMM)) * preset.zoomFactor
+            swapInputDevice(to: preset, animateFromZoom: startZoom)
         } else {
             sessionQueue.async { [self] in
                 guard let device = currentDevice else { return }
-                applyZoom(factor: preset.zoomFactor, on: device)
+                self.animateZoom(to: preset.zoomFactor, on: device, duration: 0.3)
             }
         }
         // Sync mm display
@@ -1296,6 +1682,7 @@ final class CameraManager: NSObject, ObservableObject {
     func captureDoubleExposureFirst() {
         isCapturing = true
         capturingFirstExposure = true
+        pendingQuality = effectiveQualityPrioritization
         let flash = flashMode
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
@@ -1308,8 +1695,9 @@ final class CameraManager: NSObject, ObservableObject {
                     AVVideoCodecKey: AVVideoCodecType.jpeg
                 ])
             }
-            settings.photoQualityPrioritization = .balanced
-            if let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width < $1.width }) {
+            settings.photoQualityPrioritization = pendingQuality
+            if pendingQuality == .quality,
+               let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
                 settings.maxPhotoDimensions = maxDim
             }
             if photoOutput.supportedFlashModes.contains(flash) {
@@ -1328,13 +1716,55 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // Only collect frames for long exposure frame stacking
-        guard isCollectingFrames,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        // Throttle to ~10fps, cap at 300 frames
-        if frameStack.count < 300 {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Long exposure frame stacking
+        if isCollectingFrames, frameStack.count < 300 {
             frameStack.append(CIImage(cvPixelBuffer: pixelBuffer))
         }
+
+        // Forward frames to editor preview renderer if active
+        if let renderer = editorPreviewRenderer {
+            renderer.processFrame(pixelBuffer: pixelBuffer)
+        }
+
+        // Live filtered preview — throttle to ~20fps
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastFilterFrameTime > 0.05 else { return }
+        lastFilterFrameTime = now
+
+        // Check if any sim is active (use cached values to avoid main.sync deadlock)
+        let sim = cachedSim
+        let customSim = activeCustomSim
+        guard sim != .none || customSim != nil else {
+            // No sim active — clear filtered frame so raw preview shows
+            if liveFilteredFrame != nil {
+                DispatchQueue.main.async { self.objectWillChange.send(); self.liveFilteredFrame = nil }
+            }
+            return
+        }
+
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        // Downsample for performance (half resolution)
+        let scale = 0.5
+        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+
+        // Apply sim
+        let filtered: CIImage
+        if let customSim {
+            filtered = applyCustomSim(to: scaled, sim: customSim)
+        } else {
+            // Use the built-in sim — temporarily set pendingSim for applyFilmSim
+            // Safe: captureOutput runs on sessionQueue, photo processing on processQueue
+            let prevPending = pendingSim
+            pendingSim = cachedSim
+            filtered = applyFilmSim(to: scaled)
+            pendingSim = prevPending
+        }
+
+        guard let cgImage = liveFilterContext.createCGImage(filtered, from: filtered.extent) else { return }
+        DispatchQueue.main.async { self.objectWillChange.send(); self.liveFilteredFrame = cgImage }
     }
 }
 
@@ -1612,15 +2042,36 @@ struct LevelOverlay: View {
 final class MotionManager: ObservableObject {
     @Published var roll: Double = 0.0
     @Published var pitch: Double = 0.0
+    /// Snapped rotation angle for UI elements: 0, 90, -90, or 180
+    @Published var iconAngle: Double = 0.0
     nonisolated(unsafe) var motionManager = CMMotionManager()
 
     func startUpdates() {
         guard motionManager.isDeviceMotionAvailable else { return }
         motionManager.deviceMotionUpdateInterval = 1.0 / 30.0
         motionManager.startDeviceMotionUpdates(to: .main) { [weak self] motion, _ in
-            guard let motion = motion else { return }
-            self?.roll = motion.attitude.roll * 180.0 / .pi
-            self?.pitch = motion.attitude.pitch * 180.0 / .pi
+            guard let self, let motion = motion else { return }
+            self.roll = motion.attitude.roll * 180.0 / .pi
+            self.pitch = motion.attitude.pitch * 180.0 / .pi
+
+            // Determine device orientation from gravity
+            let g = motion.gravity
+            let newAngle: Double
+            if abs(g.x) > abs(g.y) {
+                // Landscape — negate to counter the tilt so text stays upright
+                newAngle = g.x > 0 ? -90 : 90
+            } else if g.y > 0.8 {
+                // Upside down
+                newAngle = 180
+            } else {
+                // Portrait (normal)
+                newAngle = 0
+            }
+            if newAngle != self.iconAngle {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    self.iconAngle = newAngle
+                }
+            }
         }
     }
 
@@ -1853,6 +2304,7 @@ class PeakingUIView: UIView, AVCaptureVideoDataOutputSampleBufferDelegate {
 
 final class VolumeButtonObserver: ObservableObject {
     private var volumeObservation: NSKeyValueObservation?
+    private var foregroundObserver: Any?
     private let session = AVAudioSession.sharedInstance()
     private var ignoreNextChange = false
     var onVolumeUp: (() -> Void)?
@@ -1862,15 +2314,42 @@ final class VolumeButtonObserver: ObservableObject {
     weak var systemSlider: UISlider? {
         didSet {
             guard let slider = systemSlider else { return }
-            // Set to midpoint so both directions always work
             setSystemVolume(0.5, on: slider)
         }
     }
 
     init() {
-        try? session.setActive(true)
-        try? session.setCategory(.playback, options: .mixWithOthers)
+        activateSession()
+        startObserving()
 
+        // Re-activate audio session when app returns to foreground
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.reactivate()
+        }
+    }
+
+    func reactivate() {
+        activateSession()
+        // Re-subscribe KVO — the old observation may be stale after background
+        volumeObservation?.invalidate()
+        ignoreNextChange = false
+        startObserving()
+        // Reset volume to midpoint so both directions work
+        if let slider = systemSlider {
+            ignoreNextChange = true
+            setSystemVolume(0.5, on: slider)
+        }
+    }
+
+    private func activateSession() {
+        try? session.setCategory(.playback, options: .mixWithOthers)
+        try? session.setActive(true, options: .notifyOthersOnDeactivation)
+    }
+
+    private func startObserving() {
         volumeObservation = session.observe(\.outputVolume, options: [.old, .new]) { [weak self] _, change in
             guard let self else { return }
             if self.ignoreNextChange {
@@ -1885,7 +2364,6 @@ final class VolumeButtonObserver: ObservableObject {
                 } else {
                     self.onVolumeDown?()
                 }
-                // Reset to midpoint so the next press always has room
                 if let slider = self.systemSlider {
                     self.ignoreNextChange = true
                     self.setSystemVolume(0.5, on: slider)
@@ -1901,6 +2379,7 @@ final class VolumeButtonObserver: ObservableObject {
 
     deinit {
         volumeObservation?.invalidate()
+        if let obs = foregroundObserver { NotificationCenter.default.removeObserver(obs) }
     }
 }
 
@@ -1930,12 +2409,15 @@ struct CameraContentView: View {
     @StateObject private var camera = CameraManager()
     @StateObject private var motion = MotionManager()
     @StateObject private var volumeObserver = VolumeButtonObserver()
+    @StateObject private var customSimStore = CustomSimStore()
     @State private var focusPoint: CGPoint?
     @State private var showFocusIndicator = false
     @State private var showViewMenu = false
     @State private var showZoomSlider = false
     @State private var zoomSliderValue: Double = 1.0
     @State private var isDraggingZoom = false
+    @State private var showCustomSimEditor = false
+    @State private var editingSim: CustomSimulation?
 
     var body: some View {
         GeometryReader { geo in
@@ -1987,6 +2469,7 @@ struct CameraContentView: View {
 
                 // Exposure meter — floating top left, fixed size
                 ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
+                    .iconRotation(motion.iconAngle)
                     .frame(width: 80, height: 80)
                     .position(x: 56, y: 100)
                     .allowsHitTesting(false)
@@ -2051,6 +2534,19 @@ struct CameraContentView: View {
             }
         } else {
             CameraPreviewView(session: camera.session)
+                .overlay {
+                    // Live filtered preview overlay
+                    if let filteredFrame = camera.liveFilteredFrame {
+                        GeometryReader { geo in
+                            Image(decorative: filteredFrame, scale: 1.0)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: geo.size.width, height: geo.size.height)
+                                .clipped()
+                                .allowsHitTesting(false)
+                        }
+                    }
+                }
                 .overlay {
                     // Overlay first exposure while framing second shot
                     if camera.doubleExposureEnabled, let preview = camera.firstExposurePreview {
@@ -2187,6 +2683,58 @@ struct CameraContentView: View {
                         viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
                     }
                     .padding(.vertical, 8)
+
+                    Divider().background(Color.white.opacity(0.2))
+
+                    // Photo quality
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("PHOTO QUALITY")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.4))
+                            .padding(.top, 4)
+
+                        HStack(spacing: 6) {
+                            ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
+                                let sel = camera.photoQuality == idx
+                                Button {
+                                    camera.photoQuality = idx
+                                } label: {
+                                    Text(label)
+                                        .font(.system(size: 12, weight: sel ? .bold : .regular))
+                                        .foregroundStyle(sel ? .black : .white)
+                                        .padding(.horizontal, 9).padding(.vertical, 6)
+                                        .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(.bottom, 8)
+
+                    Divider().background(Color.white.opacity(0.2))
+
+                    // Custom film editor
+                    Button {
+                        showCustomSimEditor = true
+                        withAnimation(.spring(duration: 0.25)) { showViewMenu = false }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "paintbrush.pointed.fill")
+                                .font(.system(size: 13))
+                            Text("Custom Films")
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            Text("\(customSimStore.simulations.count)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.4))
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.3))
+                        }
+                        .foregroundStyle(.cyan)
+                        .padding(.vertical, 10)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 12)
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.75)))
@@ -2295,6 +2843,7 @@ struct CameraContentView: View {
                             Text("mm")
                                 .font(.system(size: 9))
                         }
+                        .iconRotation(motion.iconAngle)
                         .foregroundStyle(camera.selectedFocalIndex == index ? .yellow : .white)
                         .frame(width: 54, height: 54)
                         .background(
@@ -2323,6 +2872,7 @@ struct CameraContentView: View {
                 } label: {
                     Image(systemName: "infinity")
                         .font(.system(size: 14))
+                        .iconRotation(motion.iconAngle)
                         .foregroundStyle(showZoomSlider ? .black : .white)
                         .frame(width: 40, height: 40)
                         .background(
@@ -2336,10 +2886,13 @@ struct CameraContentView: View {
             // Film simulation scroll
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
+                    // Built-in sims
                     ForEach(FilmSimulation.allCases) { sim in
-                        let isSelected = camera.selectedSim == sim
+                        let isSelected = camera.selectedSim == sim && customSimStore.activeCustomSimID == nil
                         Button {
                             camera.selectedSim = sim
+                            customSimStore.activeCustomSimID = nil
+                            camera.activeCustomSim = nil
                         } label: {
                             Text(sim.label)
                                 .font(.system(size: 13, weight: isSelected ? .bold : .regular))
@@ -2350,19 +2903,64 @@ struct CameraContentView: View {
                         }
                         .buttonStyle(.plain)
                     }
+
+                    // Divider
+                    if !customSimStore.simulations.isEmpty {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.2))
+                            .frame(width: 1, height: 24)
+                    }
+
+                    // Custom sims
+                    ForEach(customSimStore.simulations) { sim in
+                        let isSelected = customSimStore.activeCustomSimID == sim.id
+                        Button {
+                            customSimStore.activeCustomSimID = sim.id
+                            camera.activeCustomSim = sim
+                            camera.selectedSim = .none
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "paintbrush.fill")
+                                    .font(.system(size: 9))
+                                Text(sim.name)
+                                    .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                            }
+                            .foregroundStyle(isSelected ? .black : .cyan)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().fill(isSelected ? Color.cyan : Color.cyan.opacity(0.15)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Create/edit custom sims button
+                    Button {
+                        showCustomSimEditor = true
+                    } label: {
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.cyan)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 32)
             }
             .padding(.horizontal, -32)
+            .fullScreenCover(isPresented: $showCustomSimEditor) {
+                CustomSimEditorView(store: customSimStore, camera: camera)
+            }
 
             // Grain toggle + slider (when a sim is active)
-            if camera.selectedSim != .none {
+            if camera.selectedSim != .none || customSimStore.activeCustomSimID != nil {
                 HStack(spacing: 10) {
                     Button {
                         camera.grainEnabled.toggle()
                     } label: {
                         Image(systemName: camera.grainEnabled ? "circle.grid.3x3.fill" : "circle.grid.3x3")
                             .font(.system(size: 16))
+                            .iconRotation(motion.iconAngle)
                             .foregroundStyle(camera.grainEnabled ? .yellow : .white.opacity(0.6))
                     }
                     .buttonStyle(.plain)
@@ -2453,6 +3051,7 @@ struct CameraContentView: View {
                         Text(camera.flashLabel)
                             .font(.system(size: 10, weight: .semibold))
                     }
+                    .iconRotation(motion.iconAngle)
                     .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
                     .frame(width: 44, height: 38)
                     .background(
@@ -2466,7 +3065,7 @@ struct CameraContentView: View {
                 Spacer()
             }
 
-            // Right side: opacity dial or burst count
+            // Right side: flip camera + opacity dial or burst count
             HStack {
                 Spacer()
                 if camera.doubleExposureEnabled {
@@ -2484,7 +3083,26 @@ struct CameraContentView: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.white.opacity(0.6))
                     }
+                    .iconRotation(motion.iconAngle)
                     .frame(width: 72, height: 72)
+                } else {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            camera.flipCamera()
+                        }
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath.camera.fill")
+                            .font(.system(size: 22))
+                            .iconRotation(motion.iconAngle)
+                            .foregroundStyle(.white)
+                            .frame(width: 50, height: 50)
+                            .background(
+                                Circle()
+                                    .fill(Color.black.opacity(0.45))
+                                    .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                            )
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -2565,5 +3183,402 @@ private struct TopPill: View {
         .padding(.vertical, 7)
         .background(.black.opacity(0.5))
         .clipShape(Capsule())
+    }
+}
+
+// MARK: - Custom Sim Editor
+
+// MARK: - Live Filtered Preview for Editor
+
+final class FilteredPreviewRenderer: NSObject, ObservableObject {
+    @Published var previewImage: CGImage?
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    nonisolated(unsafe) var currentSim: CustomSimulation = CustomSimulation()
+    nonisolated(unsafe) var applyCustomSim: ((CIImage, CustomSimulation) -> CIImage)?
+    nonisolated(unsafe) var lastFrameTime: CFAbsoluteTime = 0
+    private weak var camera: CameraManager?
+
+    func start(session: AVCaptureSession, camera: CameraManager) {
+        self.camera = camera
+        self.applyCustomSim = { [weak camera] image, sim in
+            camera?.applyCustomSim(to: image, sim: sim) ?? image
+        }
+        // Ensure video data output is available, then register as receiver
+        camera.addVideoDataOutputIfNeeded()
+        camera.editorPreviewRenderer = self
+    }
+
+    func stop() {
+        camera?.editorPreviewRenderer = nil
+        camera = nil
+    }
+
+    /// Called from CameraManager.captureOutput on the video frame queue
+    nonisolated func processFrame(pixelBuffer: CVPixelBuffer) {
+        // Throttle to ~15fps for editor preview
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastFrameTime > 0.066 else { return }
+        lastFrameTime = now
+
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        // Downsample for performance
+        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 0.5, y: 0.5))
+        let sim = currentSim
+        let filtered = applyCustomSim?(scaled, sim) ?? scaled
+        guard let cgImage = ciContext.createCGImage(filtered, from: filtered.extent) else { return }
+        DispatchQueue.main.async { self.previewImage = cgImage }
+    }
+}
+
+struct CustomSimEditorView: View {
+    @ObservedObject var store: CustomSimStore
+    var camera: CameraManager
+    @Environment(\.dismiss) private var dismiss
+    @State private var editing: CustomSimulation?
+    @State private var showDeleteConfirm = false
+    @StateObject private var previewRenderer = FilteredPreviewRenderer()
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                if store.simulations.isEmpty && editing == nil {
+                    emptyState
+                } else if let sim = editing {
+                    VStack(spacing: 0) {
+                        // Live filtered preview
+                        livePreview
+                            .frame(height: 220)
+                            .clipped()
+
+                        SimParameterEditor(sim: Binding(
+                            get: { sim },
+                            set: {
+                                editing = $0
+                                previewRenderer.currentSim = $0
+                            }
+                        ))
+                    }
+                } else {
+                    simList
+                }
+            }
+            .navigationTitle(editing != nil ? "Edit Film" : "Custom Films")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    if editing != nil {
+                        Button("Back") {
+                            if let e = editing {
+                                store.update(e)
+                            }
+                            previewRenderer.stop()
+                            editing = nil
+                        }
+                    } else {
+                        Button("Done") { dismiss() }
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if editing != nil {
+                        Button {
+                            showDeleteConfirm = true
+                        } label: {
+                            Image(systemName: "trash")
+                                .foregroundStyle(.red)
+                        }
+                    } else {
+                        Button {
+                            let newSim = store.addNew()
+                            editing = newSim
+                            startPreview(for: newSim)
+                        } label: {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 20))
+                        }
+                    }
+                }
+            }
+            .alert("Delete this film?", isPresented: $showDeleteConfirm) {
+                Button("Delete", role: .destructive) {
+                    if let e = editing {
+                        previewRenderer.stop()
+                        store.delete(e)
+                        editing = nil
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            }
+            .onDisappear {
+                previewRenderer.stop()
+            }
+        }
+    }
+
+    private var livePreview: some View {
+        Group {
+            if let image = previewRenderer.previewImage {
+                Image(decorative: image, scale: 1.0)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.black.overlay {
+                    ProgressView()
+                        .tint(.white)
+                }
+            }
+        }
+        .cornerRadius(12)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+
+    private func startPreview(for sim: CustomSimulation) {
+        previewRenderer.currentSim = sim
+        previewRenderer.start(session: camera.session, camera: camera)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "paintpalette")
+                .font(.system(size: 48))
+                .foregroundStyle(.gray)
+            Text("No custom films yet")
+                .font(.title3)
+                .foregroundStyle(.gray)
+            Button {
+                let newSim = store.addNew()
+                editing = newSim
+            } label: {
+                Label("Create Film", systemImage: "plus")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
+                    .background(Capsule().fill(.yellow))
+            }
+        }
+    }
+
+    private var simList: some View {
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                ForEach(store.simulations) { sim in
+                    Button {
+                        editing = sim
+                        startPreview(for: sim)
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(sim.name)
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                Text(simSummary(sim))
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+                            Spacer()
+                            if store.activeCustomSimID == sim.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.yellow)
+                            }
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 13))
+                                .foregroundStyle(.white.opacity(0.3))
+                        }
+                        .padding(16)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(20)
+        }
+    }
+
+    private func simSummary(_ sim: CustomSimulation) -> String {
+        var parts: [String] = []
+        if sim.temperature < 5500 { parts.append("warm") }
+        else if sim.temperature > 7500 { parts.append("cool") }
+        if sim.contrast > 1.15 { parts.append("high contrast") }
+        if sim.saturation < 0.8 { parts.append("desaturated") }
+        else if sim.saturation > 1.3 { parts.append("vivid") }
+        if sim.vignetteIntensity > 0.5 { parts.append("vignette") }
+        if sim.fadeAmount > 0.03 { parts.append("faded") }
+        if sim.bloomIntensity > 0.1 { parts.append("bloom") }
+        return parts.isEmpty ? "Neutral" : parts.joined(separator: " \u{00b7} ")
+    }
+}
+
+// MARK: - Parameter Editor
+
+private struct SimParameterEditor: View {
+    @Binding var sim: CustomSimulation
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                // Name field
+                HStack {
+                    Text("NAME")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.4))
+                    Spacer()
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+
+                TextField("Film name", text: $sim.name)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
+
+                // Sections
+                paramSection("EXPOSURE") {
+                    paramSlider("Brightness", value: $sim.brightness, range: -0.1...0.1)
+                    paramSlider("Contrast", value: $sim.contrast, range: 0.7...1.5, neutral: 1.0)
+                    paramSlider("Saturation", value: $sim.saturation, range: 0.0...2.0, neutral: 1.0)
+                }
+
+                paramSection("WHITE BALANCE") {
+                    paramSlider("Temperature", value: $sim.temperature, range: 3000...10000, neutral: 6500)
+                    paramSlider("Tint", value: $sim.tint, range: -50...50)
+                }
+
+                paramSection("TONE CURVE") {
+                    paramSlider("Shadow Lift", value: $sim.shadowLift, range: 0...0.15)
+                    paramSlider("Midtone", value: $sim.midShift, range: -0.1...0.1)
+                    paramSlider("Highlight Roll", value: $sim.highlightRolloff, range: -0.1...0.0)
+                    paramSlider("Fade", value: $sim.fadeAmount, range: 0...0.15)
+                }
+
+                paramSection("COLOR CHANNELS") {
+                    paramSlider("Red", value: $sim.redMult, range: 0.7...1.3, neutral: 1.0, tint: .red)
+                    paramSlider("Green", value: $sim.greenMult, range: 0.7...1.3, neutral: 1.0, tint: .green)
+                    paramSlider("Blue", value: $sim.blueMult, range: 0.7...1.3, neutral: 1.0, tint: .blue)
+                }
+
+                paramSection("COLOR BIAS") {
+                    paramSlider("Red Bias", value: $sim.redBias, range: -0.05...0.05, tint: .red)
+                    paramSlider("Green Bias", value: $sim.greenBias, range: -0.05...0.05, tint: .green)
+                    paramSlider("Blue Bias", value: $sim.blueBias, range: -0.05...0.05, tint: .blue)
+                }
+
+                paramSection("EFFECTS") {
+                    paramSlider("Vignette", value: $sim.vignetteIntensity, range: 0...2.0)
+                    paramSlider("Bloom", value: $sim.bloomIntensity, range: 0...0.5)
+                    if sim.bloomIntensity > 0 {
+                        paramSlider("Bloom Size", value: $sim.bloomRadius, range: 2...20)
+                    }
+                }
+
+                // Quality picker
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("CAPTURE QUALITY")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .padding(.horizontal, 20)
+                        .padding(.top, 20)
+
+                    HStack(spacing: 6) {
+                        ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
+                            let sel = sim.quality == idx
+                            Button {
+                                sim.quality = idx
+                            } label: {
+                                Text(label)
+                                    .font(.system(size: 13, weight: sel ? .bold : .regular))
+                                    .foregroundStyle(sel ? .black : .white)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(Capsule().fill(sel ? Color.cyan : Color.white.opacity(0.1)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+
+                    Text("Speed is fastest, Max uses Deep Fusion for best detail")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.3))
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 4)
+                }
+
+                // Reset button
+                Button {
+                    let name = sim.name
+                    let id = sim.id
+                    sim = CustomSimulation()
+                    sim.name = name
+                    sim.id = id
+                } label: {
+                    Text("Reset to Default")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.red)
+                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(Color.red.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .padding(20)
+
+                Spacer(minLength: 60)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func paramSection(_ title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white.opacity(0.35))
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+
+            VStack(spacing: 0) {
+                content()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.06)))
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private func paramSlider(
+        _ label: String,
+        value: Binding<Float>,
+        range: ClosedRange<Float>,
+        neutral: Float = 0,
+        tint: Color = .yellow
+    ) -> some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(label)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.7))
+                Spacer()
+                Text(formatValue(value.wrappedValue, range: range))
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(tint.opacity(0.8))
+            }
+            Slider(value: value, in: range)
+                .tint(tint)
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func formatValue(_ val: Float, range: ClosedRange<Float>) -> String {
+        if range.upperBound > 100 {
+            return String(format: "%.0f", val)
+        } else if range.upperBound - range.lowerBound < 1 {
+            return String(format: "%.3f", val)
+        } else {
+            return String(format: "%.2f", val)
+        }
     }
 }
