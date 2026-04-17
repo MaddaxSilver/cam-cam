@@ -12,6 +12,7 @@ import Photos
 import Combine
 import CoreMotion
 import MediaPlayer
+import MetalKit
 
 // MARK: - Orientation-Aware Icon/Text Rotation
 
@@ -25,6 +26,11 @@ private struct IconRotation: ViewModifier {
 extension View {
     func iconRotation(_ angle: Double) -> some View {
         modifier(IconRotation(angle: angle))
+    }
+
+    @ViewBuilder
+    func `if`<T: View>(_ condition: Bool, transform: (Self) -> T) -> some View {
+        if condition { transform(self) } else { self }
     }
 }
 
@@ -170,6 +176,7 @@ nonisolated let focalPresets: [FocalPreset] = [
     FocalPreset(mm: 24,  deviceType: .builtInUltraWideCamera, zoomFactor: 1.0),
     FocalPreset(mm: 28,  deviceType: .builtInWideAngleCamera,  zoomFactor: 1.0),
     FocalPreset(mm: 35,  deviceType: .builtInWideAngleCamera,  zoomFactor: 1.3),
+    FocalPreset(mm: 50,  deviceType: .builtInWideAngleCamera,  zoomFactor: 1.92),
     FocalPreset(mm: 70,  deviceType: .builtInWideAngleCamera,  zoomFactor: 2.7),
     FocalPreset(mm: 120, deviceType: .builtInTelephotoCamera,  zoomFactor: 1.0),
 ]
@@ -224,6 +231,8 @@ final class CameraManager: NSObject, ObservableObject {
         didSet { cachedSim = selectedSim }
     }
     @Published var selectedAspectRatio: AspectRatio = .full
+    @Published var isLandscape: Bool = false
+    @Published var deviceAngle: Double = 0
     @Published var grainAmount: Float = 0.0
     @Published var grainEnabled: Bool = false
     @Published var exposureBias: Float = 0.0
@@ -260,18 +269,36 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var isFrontCamera: Bool = false
     @Published var photoQuality: Int = 2 // 0 speed, 1 balanced, 2 quality
     nonisolated(unsafe) var liveFilteredFrame: CGImage?
+    nonisolated(unsafe) var liveFilterActive: Bool = false
     nonisolated(unsafe) var activeCustomSim: CustomSimulation?
     nonisolated(unsafe) var lastFilterFrameTime: CFAbsoluteTime = 0
-    nonisolated(unsafe) var liveFilterContext = CIContext(options: [.useSoftwareRenderer: false])
 
     // MARK: nonisolated(unsafe) stored properties
     nonisolated(unsafe) let session = AVCaptureSession()
     nonisolated(unsafe) var sessionQueue = DispatchQueue(label: "cam.session", qos: .userInitiated)
-    nonisolated(unsafe) var ciContext = CIContext(options: [
-        .useSoftwareRenderer: false,
-        .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
-        .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!
-    ])
+    nonisolated(unsafe) var frameOutputQueue = DispatchQueue(label: "cam.frame.output", qos: .userInteractive)
+    // Single shared Metal-backed CIContext for all rendering (preview, capture, peaking)
+    nonisolated(unsafe) var ciContext: CIContext = {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return CIContext(options: [
+                .useSoftwareRenderer: false,
+                .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
+                .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!
+            ])
+        }
+        return CIContext(mtlDevice: device, options: [
+            .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
+            .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
+            .cacheIntermediates: false
+        ])
+    }()
+
+    // Reusable CIFilter instances — avoid per-frame allocation
+    nonisolated(unsafe) var reusableColorControls = CIFilter.colorControls()
+    nonisolated(unsafe) var reusableTempTint = CIFilter.temperatureAndTint()
+    nonisolated(unsafe) var reusableColorMatrix = CIFilter.colorMatrix()
+    nonisolated(unsafe) var reusableToneCurve = CIFilter.toneCurve()
+    nonisolated(unsafe) var reusableVignette = CIFilter.vignette()
     nonisolated(unsafe) var photoOutput = AVCapturePhotoOutput()
     nonisolated(unsafe) var videoDataOutput = AVCaptureVideoDataOutput()
     nonisolated(unsafe) var frameStack: [CIImage] = []
@@ -280,6 +307,8 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingSim: FilmSimulation = .none
     nonisolated(unsafe) var pendingGrain: Float = 0.0
     nonisolated(unsafe) var pendingAspectRatio: AspectRatio = .full
+    nonisolated(unsafe) var pendingIsLandscape: Bool = false
+    nonisolated(unsafe) var pendingDeviceAngle: Double = 0
     nonisolated(unsafe) var pendingGrainEnabled: Bool = false
     nonisolated(unsafe) var pendingISO: Float = 100
     nonisolated(unsafe) var pendingCrosstalk: Float = 0.1
@@ -291,6 +320,7 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingDoubleExposureOpacity: Double = 0.5
     nonisolated(unsafe) var pendingCustomSim: CustomSimulation?
     nonisolated(unsafe) var pendingQuality: AVCapturePhotoOutput.QualityPrioritization = .quality
+    nonisolated(unsafe) var pendingLongExposureDuration: Double = 2.0
     nonisolated(unsafe) var cachedSim: FilmSimulation = .none
     nonisolated(unsafe) var processQueue = DispatchQueue(label: "cam.process", qos: .userInitiated)
     nonisolated(unsafe) var photoLibAuthorized = false
@@ -301,6 +331,10 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var burstActive: Bool = false
     nonisolated(unsafe) var currentDevice: AVCaptureDevice?
     nonisolated(unsafe) weak var editorPreviewRenderer: FilteredPreviewRenderer?
+    nonisolated(unsafe) weak var metalPreviewView: MetalFilteredPreviewView?
+    nonisolated(unsafe) weak var peakingView: PeakingUIView?
+    nonisolated(unsafe) weak var previewLayer: AVCaptureVideoPreviewLayer?
+    nonisolated(unsafe) weak var previewUIView: PreviewUIView?
 
     // MARK: Init
 
@@ -385,10 +419,19 @@ final class CameraManager: NSObject, ObservableObject {
             session.addOutput(photoOutput)
         }
 
-        // Select best format inside config block for smooth startup
+        // Select best format and configure fast autofocus
         do {
             try device.lockForConfiguration()
             selectBestFormat(for: device)
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isSmoothAutoFocusSupported {
+                device.isSmoothAutoFocusEnabled = true
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
             device.unlockForConfiguration()
         } catch {}
 
@@ -419,10 +462,10 @@ final class CameraManager: NSObject, ObservableObject {
         videoOutputAdded = true
         session.beginConfiguration()
         videoDataOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ]
         videoDataOutput.alwaysDiscardsLateVideoFrames = true
-        videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+        videoDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
         if session.canAddOutput(videoDataOutput) {
             session.addOutput(videoDataOutput)
         }
@@ -439,9 +482,24 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func swapInputDevice(to preset: FocalPreset, animateFromZoom: CGFloat? = nil) {
+        // Snapshot current preview on main thread BEFORE the session swap
+        let preview = previewUIView
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                preview?.freezeAndCrossfade(duration: 0.35)
+            }
+        } else {
+            DispatchQueue.main.sync {
+                MainActor.assumeIsolated {
+                    preview?.freezeAndCrossfade(duration: 0.35)
+                }
+            }
+        }
+
         sessionQueue.async { [self] in
             guard let device = bestDevice(for: preset) else { return }
-            // Suspend video output delegate to avoid FigCaptureSourceRemote errors during reconfig
+
+            // Suspend video output delegate
             videoDataOutput.setSampleBufferDelegate(nil, queue: nil)
             session.beginConfiguration()
             session.inputs.forEach { session.removeInput($0) }
@@ -449,16 +507,25 @@ final class CameraManager: NSObject, ObservableObject {
             guard let newInput = try? AVCaptureDeviceInput(device: device),
                   session.canAddInput(newInput) else {
                 session.commitConfiguration()
-                videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+                videoDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
                 return
             }
             session.addInput(newInput)
             currentDevice = device
 
-            // Select best format inside config block
+            // Select best format and configure fast AF
             do {
                 try device.lockForConfiguration()
                 selectBestFormat(for: device)
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isSmoothAutoFocusSupported {
+                    device.isSmoothAutoFocusEnabled = true
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
                 device.unlockForConfiguration()
             } catch {}
 
@@ -477,7 +544,7 @@ final class CameraManager: NSObject, ObservableObject {
 
             session.commitConfiguration()
             // Re-enable video delegate after session settles
-            videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+            videoDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
 
             // Set max photo dims after commit
             let dims = device.activeFormat.supportedMaxPhotoDimensions
@@ -488,9 +555,9 @@ final class CameraManager: NSObject, ObservableObject {
                 photoOutput.isAppleProRAWEnabled = true
             }
 
-            // Animate zoom to target (or set immediately if no animation)
+            // Animate zoom to target smoothly
             if animateFromZoom != nil {
-                animateZoom(to: preset.zoomFactor, on: device, duration: 0.35)
+                animateZoom(to: preset.zoomFactor, on: device, duration: 0.6)
             } else {
                 applyZoom(factor: preset.zoomFactor, on: device)
             }
@@ -535,6 +602,7 @@ final class CameraManager: NSObject, ObservableObject {
     func flipCamera() {
         let goingFront = !isFrontCamera
         isFrontCamera = goingFront
+        previewUIView?.freezeAndCrossfade(duration: 0.4)
         sessionQueue.async { [self] in
             let position: AVCaptureDevice.Position = goingFront ? .front : .back
             let deviceType: AVCaptureDevice.DeviceType = goingFront ? .builtInWideAngleCamera : (currentDevice?.deviceType ?? .builtInWideAngleCamera)
@@ -547,7 +615,7 @@ final class CameraManager: NSObject, ObservableObject {
             guard let newInput = try? AVCaptureDeviceInput(device: device),
                   session.canAddInput(newInput) else {
                 session.commitConfiguration()
-                videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+                videoDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
                 return
             }
             session.addInput(newInput)
@@ -556,6 +624,15 @@ final class CameraManager: NSObject, ObservableObject {
             do {
                 try device.lockForConfiguration()
                 selectBestFormat(for: device)
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isSmoothAutoFocusSupported {
+                    device.isSmoothAutoFocusEnabled = true
+                }
+                if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
                 device.unlockForConfiguration()
             } catch {}
 
@@ -571,7 +648,7 @@ final class CameraManager: NSObject, ObservableObject {
             }
 
             session.commitConfiguration()
-            videoDataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "cam.frame.output", qos: .userInteractive))
+            videoDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
 
             let dims = device.activeFormat.supportedMaxPhotoDimensions
             if let maxDim = dims.max(by: { $0.width * $0.height < $1.width * $1.height }), maxDim.width > 0 {
@@ -587,7 +664,7 @@ final class CameraManager: NSObject, ObservableObject {
         evTimer?.invalidate()
 
         // Poll ISO + shutter speed to compute scene EV
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
             let iso = device.iso
             let duration = device.exposureDuration.seconds
@@ -609,6 +686,7 @@ final class CameraManager: NSObject, ObservableObject {
                 try device.lockForConfiguration()
                 if device.isFocusPointOfInterestSupported {
                     device.focusPointOfInterest = point
+                    // Use autoFocus first for immediate snap, then switch to continuous
                     device.focusMode = .autoFocus
                 }
                 if device.isExposurePointOfInterestSupported {
@@ -616,6 +694,20 @@ final class CameraManager: NSObject, ObservableObject {
                     device.exposureMode = .autoExpose
                 }
                 device.unlockForConfiguration()
+
+                // After the initial focus snap, switch back to continuous AF
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+                    do {
+                        try device.lockForConfiguration()
+                        if device.isFocusModeSupported(.continuousAutoFocus) {
+                            device.focusMode = .continuousAutoFocus
+                        }
+                        if device.isExposureModeSupported(.continuousAutoExposure) {
+                            device.exposureMode = .continuousAutoExposure
+                        }
+                        device.unlockForConfiguration()
+                    } catch {}
+                }
             } catch {}
         }
     }
@@ -689,6 +781,8 @@ final class CameraManager: NSObject, ObservableObject {
         pendingSim = selectedSim
         pendingGrain = grainAmount
         pendingAspectRatio = selectedAspectRatio
+        pendingIsLandscape = isLandscape
+        pendingDeviceAngle = deviceAngle
         pendingGrainEnabled = grainEnabled
         pendingISO = isoValue
         pendingCrosstalk = crosstalkAmount
@@ -700,6 +794,7 @@ final class CameraManager: NSObject, ObservableObject {
         pendingDoubleExposureOpacity = doubleExposureOpacity
         pendingCustomSim = activeCustomSim
         pendingQuality = effectiveQualityPrioritization
+        pendingLongExposureDuration = longExposureDuration
 
         if isLongExposure {
             switch longExposureMode {
@@ -749,6 +844,20 @@ final class CameraManager: NSObject, ObservableObject {
         isBursting = true
         burstActive = true
         burstCount = 0
+        // Snapshot pending values for burst processing
+        pendingSim = selectedSim
+        pendingCustomSim = activeCustomSim
+        pendingGrain = grainAmount
+        pendingGrainEnabled = grainEnabled
+        pendingAspectRatio = selectedAspectRatio
+        pendingIsLandscape = isLandscape
+        pendingDeviceAngle = deviceAngle
+        pendingCrosstalk = crosstalkAmount
+        pendingCrosstalkEnabled = crosstalkEnabled
+        pendingHalation = halationAmount
+        pendingHalationEnabled = halationEnabled
+        pendingRolloff = rolloffThreshold
+        pendingRolloffEnabled = rolloffEnabled
         fireBurstShot()
     }
 
@@ -876,10 +985,10 @@ final class CameraManager: NSObject, ObservableObject {
 
         // Check if telephoto gives better quality
         // Telephoto is native 120mm. Use it when target >= 90mm (less digital zoom needed)
-        let teleAvailable = bestDevice(for: focalPresets[4]) != nil
+        let teleAvailable = bestDevice(for: focalPresets[5]) != nil
         if mm >= 90 && teleAvailable {
             let zoom = max(1.0, mm / 120.0)
-            return (focalPresets[4], zoom)  // telephoto preset
+            return (focalPresets[5], zoom)  // telephoto preset
         }
 
         // Use wide — native 26mm, zoom = mm / 26
@@ -906,7 +1015,7 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated func startFrameStackExposure() {
         frameStack.removeAll()
         isCollectingFrames = true
-        let duration = DispatchQueue.main.sync { self.longExposureDuration }
+        let duration = pendingLongExposureDuration
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             self?.sessionQueue.async {
                 self?.isCollectingFrames = false
@@ -957,33 +1066,57 @@ final class CameraManager: NSObject, ObservableObject {
             DispatchQueue.main.async { self.isCapturing = false }
             return
         }
-        let duration = DispatchQueue.main.sync { self.longExposureDuration }
+        let duration = pendingLongExposureDuration
+
+        // Clamp to what the current format supports
+        let targetDuration = CMTimeMakeWithSeconds(duration, preferredTimescale: 1000000)
+        let maxDuration = device.activeFormat.maxExposureDuration
+        let minDuration = device.activeFormat.minExposureDuration
+        let clampedDuration = CMTimeMinimum(CMTimeMaximum(targetDuration, minDuration), maxDuration)
+
+        // Lock current ISO before switching to custom mode
+        let currentISO = min(max(device.iso, device.activeFormat.minISO), device.activeFormat.maxISO)
+
         do {
             try device.lockForConfiguration()
-            let targetDuration = CMTimeMakeWithSeconds(duration, preferredTimescale: 1000000)
-            let maxDuration = device.activeFormat.maxExposureDuration
-            let clampedDuration = CMTimeMinimum(targetDuration, maxDuration)
-            device.setExposureModeCustom(duration: clampedDuration, iso: device.iso)
+            device.setExposureModeCustom(duration: clampedDuration, iso: currentISO) { [weak self] _ in
+                // Exposure is now applied — wait for the full duration then capture
+                guard let self else { return }
+                let waitTime = CMTimeGetSeconds(clampedDuration) + 0.3
+                self.sessionQueue.asyncAfter(deadline: .now() + waitTime) {
+                    self.captureAfterNativeExposure(device: device)
+                }
+            }
+            device.unlockForConfiguration()
+        } catch {
+            DispatchQueue.main.async { self.isCapturing = false }
+            return
+        }
+    }
+
+    nonisolated func captureAfterNativeExposure(device: AVCaptureDevice) {
+        let settings: AVCapturePhotoSettings
+        if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+        } else {
+            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+        }
+        settings.photoQualityPrioritization = pendingQuality
+        if pendingQuality == .quality,
+           let maxDim = device.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            settings.maxPhotoDimensions = maxDim
+        }
+        photoOutput.capturePhoto(with: settings, delegate: self)
+
+        // Reset exposure and focus back to continuous auto so preview recovers
+        do {
+            try device.lockForConfiguration()
+            device.exposureMode = .continuousAutoExposure
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
             device.unlockForConfiguration()
         } catch {}
-
-        // After the exposure time, take a photo
-        let dispatchDuration = duration + 0.5
-        sessionQueue.asyncAfter(deadline: .now() + dispatchDuration) { [weak self] in
-            guard let self else { return }
-            let settings: AVCapturePhotoSettings
-            if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
-                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
-            } else {
-                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
-            }
-            settings.photoQualityPrioritization = pendingQuality
-            if pendingQuality == .quality,
-               let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
-                settings.maxPhotoDimensions = maxDim
-            }
-            photoOutput.capturePhoto(with: settings, delegate: self)
-        }
     }
 
     // MARK: Film Processing & Save
@@ -995,11 +1128,14 @@ final class CameraManager: NSObject, ObservableObject {
         processQueue.async { [self] in
             guard var ciImage = CIImage(data: imageData) else { return }
 
+            // Extract original metadata (focal length, lens, GPS, etc.) before processing
+            let originalMetadata = ciImage.properties
+
             // Apply EXIF orientation so the image is upright before processing
             ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
 
             let processed = applySimAndGrain(to: ciImage)
-            renderAndSave(ciImage: processed)
+            renderAndSave(ciImage: processed, metadata: originalMetadata)
         }
     }
 
@@ -1023,7 +1159,9 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func cropRect(for extent: CGRect) -> CGRect {
-        guard let ratio = pendingAspectRatio.ratio else { return extent }
+        guard let baseRatio = pendingAspectRatio.ratio else { return extent }
+        // In landscape, flip the aspect ratio (e.g. 16:9 portrait → 9:16 landscape output)
+        let ratio = pendingIsLandscape ? (1.0 / baseRatio) : baseRatio
         let w = extent.width
         let h = extent.height
         let sensorRatio = w / h
@@ -1041,8 +1179,21 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    nonisolated func renderAndSave(ciImage: CIImage) {
-        let cropped = ciImage.cropped(to: cropRect(for: ciImage.extent))
+    nonisolated func renderAndSave(ciImage: CIImage, metadata: [String: Any] = [:]) {
+        var cropped = ciImage.cropped(to: cropRect(for: ciImage.extent))
+
+        // Rotate image to match device orientation at capture time
+        if pendingDeviceAngle == -90 {
+            // Landscape right (home button on right) — rotate 90° CW
+            cropped = cropped.oriented(.right)
+        } else if pendingDeviceAngle == 90 {
+            // Landscape left (home button on left) — rotate 90° CCW
+            cropped = cropped.oriented(.left)
+        } else if pendingDeviceAngle == 180 {
+            // Upside down
+            cropped = cropped.oriented(.down)
+        }
+
         let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
 
         // Render in Display P3 — use RGBx (no alpha) to halve memory and avoid alpha warning
@@ -1050,7 +1201,6 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
 
-        // Save as HEIF (P3) when possible, otherwise max quality JPEG
         // Force noneSkipLast alpha info so encoder knows image is opaque
         let w = cgImage.width, h = cgImage.height
         let opaqueImage: CGImage
@@ -1063,9 +1213,35 @@ final class CameraManager: NSObject, ObservableObject {
         } else {
             opaqueImage = cgImage
         }
-        let uiImage = UIImage(cgImage: opaqueImage)
-        let finalData = uiImage.heicData() ?? uiImage.jpegData(compressionQuality: 1.0)
-        guard let finalData else { return }
+
+        // Write HEIF/JPEG with original EXIF metadata (focal length, lens, GPS, etc.)
+        let mutableData = NSMutableData()
+        // Prefer HEIF, fall back to JPEG
+        let uti = AVFileType.heic.rawValue as CFString
+        guard let dest = CGImageDestinationCreateWithData(mutableData, uti, 1, nil)
+                ?? CGImageDestinationCreateWithData(mutableData, "public.jpeg" as CFString, 1, nil) else {
+            return
+        }
+
+        // Build metadata: preserve original EXIF but fix orientation to Up (already rotated)
+        var meta = metadata
+        // Remove orientation since we already applied it
+        meta.removeValue(forKey: kCGImagePropertyOrientation as String)
+        if var exif = meta[kCGImagePropertyExifDictionary as String] as? [String: Any] {
+            // Update pixel dimensions to match cropped output
+            exif[kCGImagePropertyExifPixelXDimension as String] = w
+            exif[kCGImagePropertyExifPixelYDimension as String] = h
+            meta[kCGImagePropertyExifDictionary as String] = exif
+        }
+        // Set TIFF orientation to normal
+        if var tiff = meta[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
+            tiff[kCGImagePropertyTIFFOrientation as String] = 1
+            meta[kCGImagePropertyTIFFDictionary as String] = tiff
+        }
+
+        CGImageDestinationAddImage(dest, opaqueImage, meta as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return }
+        let finalData = mutableData as Data
 
         guard photoLibAuthorized else { return }
         PHPhotoLibrary.shared().performChanges({
@@ -1659,22 +1835,31 @@ final class CameraManager: NSObject, ObservableObject {
         let needsLensSwap = previousDevice?.deviceType != preset.deviceType
         selectedFocalIndex = index
 
+        // No zoom smoothing for 24mm (ultrawide) and 120mm (telephoto) — instant switch
+        let isInstantPreset = preset.deviceType == .builtInUltraWideCamera || preset.deviceType == .builtInTelephotoCamera
+
         if needsLensSwap {
-            // Calculate a starting zoom that matches the previous FOV for a smooth transition
-            let previousPresetIndex = focalPresets.firstIndex(where: { $0.deviceType == previousDevice?.deviceType }) ?? 1
-            let previousMM = focalPresets[previousPresetIndex].mm
-            let targetMM = preset.mm
-            // Start zoomed to approximate the previous FOV, then animate to target
-            let startZoom = max(1.0, CGFloat(previousMM) / CGFloat(targetMM)) * preset.zoomFactor
-            swapInputDevice(to: preset, animateFromZoom: startZoom)
+            if isInstantPreset {
+                swapInputDevice(to: preset, animateFromZoom: nil)
+            } else {
+                // Use actual current mm (from zoom state) for accurate FOV matching
+                let currentMM = Double(self.currentMM)
+                let targetBaseMM: Double = 26.0  // wide lens base
+                let startZoom = max(1.0, currentMM / targetBaseMM)
+                swapInputDevice(to: preset, animateFromZoom: CGFloat(startZoom))
+            }
         } else {
             sessionQueue.async { [self] in
                 guard let device = currentDevice else { return }
-                self.animateZoom(to: preset.zoomFactor, on: device, duration: 0.3)
+                if isInstantPreset {
+                    self.applyZoom(factor: preset.zoomFactor, on: device)
+                } else {
+                    self.animateZoom(to: preset.zoomFactor, on: device, duration: 0.3)
+                }
             }
         }
-        // Sync mm display
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        // Sync mm display after animation settles
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             self.syncZoomState()
         }
     }
@@ -1683,6 +1868,17 @@ final class CameraManager: NSObject, ObservableObject {
         isCapturing = true
         capturingFirstExposure = true
         pendingQuality = effectiveQualityPrioritization
+        // Snapshot sim settings for first exposure
+        pendingSim = selectedSim
+        pendingCustomSim = activeCustomSim
+        pendingGrain = grainAmount
+        pendingGrainEnabled = grainEnabled
+        pendingCrosstalk = crosstalkAmount
+        pendingCrosstalkEnabled = crosstalkEnabled
+        pendingHalation = halationAmount
+        pendingHalationEnabled = halationEnabled
+        pendingRolloff = rolloffThreshold
+        pendingRolloffEnabled = rolloffEnabled
         let flash = flashMode
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
@@ -1728,43 +1924,50 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             renderer.processFrame(pixelBuffer: pixelBuffer)
         }
 
-        // Live filtered preview — throttle to ~20fps
-        let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastFilterFrameTime > 0.05 else { return }
-        lastFilterFrameTime = now
+        // Forward frames to focus peaking overlay
+        if let peaking = peakingView {
+            peaking.processFrame(pixelBuffer: pixelBuffer)
+        }
 
-        // Check if any sim is active (use cached values to avoid main.sync deadlock)
+        // Live filtered preview — render to Metal view (no CGImage round-trip)
         let sim = cachedSim
         let customSim = activeCustomSim
+        let metal = metalPreviewView
+
         guard sim != .none || customSim != nil else {
-            // No sim active — clear filtered frame so raw preview shows
-            if liveFilteredFrame != nil {
-                DispatchQueue.main.async { self.objectWillChange.send(); self.liveFilteredFrame = nil }
-            }
+            metal?.currentImage = nil
             return
         }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
 
-        // Downsample for performance (half resolution)
-        let scale = 0.5
-        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        // Downscale for preview — half resolution is plenty for screen display
+        let previewScale: CGFloat = 0.5
+        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: previewScale, y: previewScale))
 
-        // Apply sim
+        // Apply sim to downscaled image
         let filtered: CIImage
         if let customSim {
             filtered = applyCustomSim(to: scaled, sim: customSim)
         } else {
-            // Use the built-in sim — temporarily set pendingSim for applyFilmSim
-            // Safe: captureOutput runs on sessionQueue, photo processing on processQueue
             let prevPending = pendingSim
             pendingSim = cachedSim
             filtered = applyFilmSim(to: scaled)
             pendingSim = prevPending
         }
 
-        guard let cgImage = liveFilterContext.createCGImage(filtered, from: filtered.extent) else { return }
-        DispatchQueue.main.async { self.objectWillChange.send(); self.liveFilteredFrame = cgImage }
+        if let metal {
+            // GPU path — set CIImage directly, trigger draw
+            metal.currentImage = filtered
+            DispatchQueue.main.async { metal.setNeedsDisplay() }
+        } else {
+            // Fallback: CGImage path (slower)
+            let now = CFAbsoluteTimeGetCurrent()
+            guard now - lastFilterFrameTime > 0.05 else { return }
+            lastFilterFrameTime = now
+            guard let cgImage = ciContext.createCGImage(filtered, from: filtered.extent) else { return }
+            DispatchQueue.main.async { self.objectWillChange.send(); self.liveFilteredFrame = cgImage }
+        }
     }
 }
 
@@ -1799,14 +2002,16 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // Double exposure first shot — store CIImage, don't save
+        // Double exposure first shot — apply sim, store CIImage, don't save
         if capturingFirstExposure {
             capturingFirstExposure = false
             if let ciImage = CIImage(data: data) {
                 let oriented = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
-                firstExposureCIImage = oriented
+                // Apply film sim to first exposure so both shots match
+                let processed = applySimAndGrain(to: oriented)
+                firstExposureCIImage = processed
                 // Generate preview CGImage for overlay
-                let preview = ciContext.createCGImage(oriented, from: oriented.extent)
+                let preview = ciContext.createCGImage(processed, from: processed.extent)
                 DispatchQueue.main.async {
                     self.firstExposurePreview = preview
                     self.isCapturing = false
@@ -1817,27 +2022,21 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // For burst mode, save JPEG directly without film processing for speed
+        // For burst mode, process in background and chain next shot immediately
         if burstActive {
-            saveBurstJPEG(data: data)
+            let capturedData = data
+            processQueue.async { [self] in
+                guard var ciImage = CIImage(data: capturedData) else { return }
+                let metadata = ciImage.properties
+                ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
+                let processed = applySimAndGrain(to: ciImage)
+                renderAndSave(ciImage: processed, metadata: metadata)
+            }
             burstDidCapture()
             return
         }
 
         processAndSaveJPEG(imageData: data)
-    }
-}
-
-extension CameraManager {
-    nonisolated func saveBurstJPEG(data: Data) {
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else { return }
-            PHPhotoLibrary.shared().performChanges({
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: data, options: nil)
-                request.creationDate = Date()
-            }) { _, _ in }
-        }
     }
 }
 
@@ -1848,6 +2047,7 @@ final class PreviewUIView: UIView {
     var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
 
     private var observation: NSKeyValueObservation?
+    private var snapshotView: UIView?
 
     func configure(session: AVCaptureSession) {
         previewLayer.session = session
@@ -1867,6 +2067,31 @@ final class PreviewUIView: UIView {
         }
     }
 
+    /// Capture a snapshot of the current preview and overlay it, then crossfade out
+    func freezeAndCrossfade(duration: TimeInterval = 0.4) {
+        // Snapshot the current preview layer into an image view
+        let renderer = UIGraphicsImageRenderer(bounds: bounds)
+        let snapshot = renderer.image { ctx in
+            layer.render(in: ctx.cgContext)
+        }
+        let imageView = UIImageView(image: snapshot)
+        imageView.frame = bounds
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        addSubview(imageView)
+        snapshotView = imageView
+
+        // Fade out after the new lens starts producing frames
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            UIView.animate(withDuration: duration, delay: 0, options: .curveEaseInOut) {
+                imageView.alpha = 0
+            } completion: { _ in
+                imageView.removeFromSuperview()
+                self.snapshotView = nil
+            }
+        }
+    }
+
     deinit { observation?.invalidate() }
 }
 
@@ -1874,16 +2099,89 @@ final class PreviewUIView: UIView {
 
 struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
+    var camera: CameraManager? = nil
 
     func makeUIView(context: Context) -> PreviewUIView {
         let view = PreviewUIView()
         view.configure(session: session)
+        camera?.previewLayer = view.previewLayer
+        camera?.previewUIView = view
         return view
     }
 
     func updateUIView(_ uiView: PreviewUIView, context: Context) {
         uiView.applyRotation()
     }
+}
+
+// MARK: - Metal Filtered Preview
+
+/// Renders filtered CIImages directly on the GPU via Metal — no CGImage round-trip
+final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
+    private var commandQueue: MTLCommandQueue!
+    nonisolated(unsafe) var sharedCIContext: CIContext?
+    private let colorSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+    nonisolated(unsafe) var currentImage: CIImage?
+
+    func setup(sharedContext: CIContext? = nil) {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        self.device = device
+        commandQueue = device.makeCommandQueue()
+        sharedCIContext = sharedContext
+        delegate = self
+        framebufferOnly = false
+        // On-demand rendering: only draw when setNeedsDisplay() is called
+        isPaused = true
+        enableSetNeedsDisplay = true
+        preferredFramesPerSecond = 60
+        backgroundColor = .clear
+        isOpaque = false
+    }
+
+    func draw(in view: MTKView) {
+        guard let image = currentImage,
+              let context = sharedCIContext,
+              let drawable = currentDrawable,
+              let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
+
+        let dSize = drawableSize
+        // Scale image to fill the drawable (aspect fill)
+        let scaleX = dSize.width / image.extent.width
+        let scaleY = dSize.height / image.extent.height
+        let scale = max(scaleX, scaleY)
+        // Combine scale + translation into a single transform
+        let scaledW = image.extent.width * scale
+        let scaledH = image.extent.height * scale
+        let offsetX = (dSize.width - scaledW) / 2 - image.extent.origin.x * scale
+        let offsetY = (dSize.height - scaledH) / 2 - image.extent.origin.y * scale
+        let centered = image.transformed(by: CGAffineTransform(a: scale, b: 0, c: 0, d: scale, tx: offsetX, ty: offsetY))
+
+        let destination = CIRenderDestination(
+            width: Int(dSize.width),
+            height: Int(dSize.height),
+            pixelFormat: colorPixelFormat,
+            commandBuffer: commandBuffer,
+            mtlTextureProvider: { drawable.texture }
+        )
+        _ = try? context.startTask(toRender: centered, to: destination)
+        commandBuffer.present(drawable)
+        commandBuffer.commit()
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+}
+
+struct MetalFilteredPreview: UIViewRepresentable {
+    let camera: CameraManager
+
+    func makeUIView(context: Context) -> MetalFilteredPreviewView {
+        let view = MetalFilteredPreviewView()
+        view.setup(sharedContext: camera.ciContext)
+        camera.metalPreviewView = view
+        return view
+    }
+
+    func updateUIView(_ uiView: MetalFilteredPreviewView, context: Context) {}
 }
 
 // MARK: - ExposureMeterBar
@@ -2044,6 +2342,7 @@ final class MotionManager: ObservableObject {
     @Published var pitch: Double = 0.0
     /// Snapped rotation angle for UI elements: 0, 90, -90, or 180
     @Published var iconAngle: Double = 0.0
+    @Published var isLandscape: Bool = false
     nonisolated(unsafe) var motionManager = CMMotionManager()
 
     func startUpdates() {
@@ -2067,10 +2366,14 @@ final class MotionManager: ObservableObject {
                 // Portrait (normal)
                 newAngle = 0
             }
+            let landscape = abs(g.x) > abs(g.y)
             if newAngle != self.iconAngle {
                 withAnimation(.easeInOut(duration: 0.3)) {
                     self.iconAngle = newAngle
+                    self.isLandscape = landscape
                 }
+            } else if landscape != self.isLandscape {
+                self.isLandscape = landscape
             }
         }
     }
@@ -2085,9 +2388,12 @@ final class MotionManager: ObservableObject {
 struct AspectRatioOverlay: View {
     let aspectRatio: AspectRatio
     let geoSize: CGSize
+    var isLandscape: Bool = false
 
     var body: some View {
-        if let ratio = aspectRatio.ratio {
+        if let baseRatio = aspectRatio.ratio {
+            // In landscape, flip the ratio so the overlay matches the output crop
+            let ratio = isLandscape ? (1.0 / baseRatio) : baseRatio
             let fullW = geoSize.width
             let fullH = geoSize.height
             let fullRatio = fullW / fullH
@@ -2218,81 +2524,69 @@ struct OpacityDial: View {
 // MARK: - Focus Peaking
 
 struct FocusPeakingView: UIViewRepresentable {
-    let session: AVCaptureSession
+    let camera: CameraManager
 
     func makeUIView(context: Context) -> PeakingUIView {
         let view = PeakingUIView()
         view.backgroundColor = .clear
         view.isUserInteractionEnabled = false
-        view.setSession(session)
+        view.sharedContext = camera.ciContext
+        camera.peakingView = view
         return view
     }
 
     func updateUIView(_ uiView: PeakingUIView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: PeakingUIView, coordinator: ()) {
+        // Will be cleared when camera.showPeaking toggled off
+    }
 }
 
-@MainActor
-class PeakingUIView: UIView, AVCaptureVideoDataOutputSampleBufferDelegate {
-    private var peakingOutput = AVCaptureVideoDataOutput()
-    private let peakingQueue = DispatchQueue(label: "cam.peaking", qos: .userInteractive)
-    nonisolated(unsafe) var ciContext = CIContext(options: [
-        .useSoftwareRenderer: false,
-        .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
-        .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!
-    ])
+class PeakingUIView: UIView {
+    nonisolated(unsafe) var sharedContext: CIContext?
     private var overlayLayer = CALayer()
+    nonisolated(unsafe) var lastPeakingTime: CFTimeInterval = 0
+    // Reuse filter instances
+    nonisolated(unsafe) var edgesFilter = CIFilter.edges()
+    nonisolated(unsafe) var colorMatrixFilter = CIFilter.colorMatrix()
 
-    func setSession(_ session: AVCaptureSession) {
-        peakingOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        peakingOutput.alwaysDiscardsLateVideoFrames = true
-        peakingOutput.setSampleBufferDelegate(self, queue: peakingQueue)
-
-        session.beginConfiguration()
-        if session.canAddOutput(peakingOutput) {
-            session.addOutput(peakingOutput)
-            if let connection = peakingOutput.connection(with: .video),
-               connection.isVideoRotationAngleSupported(90) {
-                connection.videoRotationAngle = 90
-            }
-        }
-        session.commitConfiguration()
-
-        overlayLayer.frame = bounds
+    override init(frame: CGRect) {
+        super.init(frame: frame)
         overlayLayer.contentsGravity = .resizeAspectFill
         layer.addSublayer(overlayLayer)
+        // Pre-configure static filter params
+        edgesFilter.intensity = 5.0
+        colorMatrixFilter.rVector = CIVector(x: 1, y: 0, z: 0, w: 0)
+        colorMatrixFilter.gVector = CIVector(x: 0, y: 0, z: 0, w: 0)
+        colorMatrixFilter.bVector = CIVector(x: 0, y: 0, z: 0, w: 0)
+        colorMatrixFilter.aVector = CIVector(x: 1, y: 0, z: 0, w: 0)
     }
+
+    required init?(coder: NSCoder) { fatalError() }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         overlayLayer.frame = bounds
     }
 
-    nonisolated func captureOutput(
-        _ output: AVCaptureOutput,
-        didOutput sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+    nonisolated func processFrame(pixelBuffer: CVPixelBuffer) {
+        // Throttle to ~15fps
+        let now = CACurrentMediaTime()
+        guard now - lastPeakingTime > 0.066 else { return }
+        lastPeakingTime = now
+
+        guard let context = sharedContext else { return }
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        // Downscale for peaking — edges are visible at quarter res
+        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 0.25, y: 0.25))
 
-        // Edge detection for peaking
-        let edges = CIFilter.edges()
-        edges.inputImage = ciImage
-        edges.intensity = 5.0
-        guard let edgeImage = edges.outputImage else { return }
+        edgesFilter.inputImage = scaled
+        guard let edgeImage = edgesFilter.outputImage else { return }
 
-        // Color the edges red
-        let colorMatrix = CIFilter.colorMatrix()
-        colorMatrix.inputImage = edgeImage
-        colorMatrix.rVector = CIVector(x: 1, y: 0, z: 0, w: 0)
-        colorMatrix.gVector = CIVector(x: 0, y: 0, z: 0, w: 0)
-        colorMatrix.bVector = CIVector(x: 0, y: 0, z: 0, w: 0)
-        colorMatrix.aVector = CIVector(x: 1, y: 0, z: 0, w: 0)
+        colorMatrixFilter.inputImage = edgeImage
 
-        guard let colored = colorMatrix.outputImage,
-              let cgImage = ciContext.createCGImage(colored, from: ciImage.extent) else { return }
+        guard let colored = colorMatrixFilter.outputImage,
+              let cgImage = context.createCGImage(colored, from: scaled.extent) else { return }
 
         DispatchQueue.main.async {
             self.overlayLayer.contents = cgImage
@@ -2442,7 +2736,7 @@ struct CameraContentView: View {
                     }
 
                 // Aspect ratio overlay
-                AspectRatioOverlay(aspectRatio: camera.selectedAspectRatio, geoSize: geo.size)
+                AspectRatioOverlay(aspectRatio: camera.selectedAspectRatio, geoSize: geo.size, isLandscape: motion.isLandscape)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
 
@@ -2462,7 +2756,7 @@ struct CameraContentView: View {
 
                 // Focus peaking
                 if camera.showPeaking {
-                    FocusPeakingView(session: camera.session)
+                    FocusPeakingView(camera: camera)
                         .ignoresSafeArea()
                         .allowsHitTesting(false)
                 }
@@ -2498,6 +2792,12 @@ struct CameraContentView: View {
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
         .background { HiddenVolumeSlider(observer: volumeObserver).frame(width: 0, height: 0) }
+        .onChange(of: motion.isLandscape) { _, newValue in
+            camera.isLandscape = newValue
+        }
+        .onChange(of: motion.iconAngle) { _, newValue in
+            camera.deviceAngle = newValue
+        }
         .onAppear {
             motion.startUpdates()
             let step: Float = 0.33
@@ -2533,18 +2833,13 @@ struct CameraContentView: View {
                 }
             }
         } else {
-            CameraPreviewView(session: camera.session)
+            CameraPreviewView(session: camera.session, camera: camera)
                 .overlay {
-                    // Live filtered preview overlay
-                    if let filteredFrame = camera.liveFilteredFrame {
-                        GeometryReader { geo in
-                            Image(decorative: filteredFrame, scale: 1.0)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: geo.size.width, height: geo.size.height)
-                                .clipped()
-                                .allowsHitTesting(false)
-                        }
+                    // Live filtered preview — Metal-rendered, full GPU pipeline
+                    // Always present when a sim is selected; Metal view shows nothing if no image
+                    if camera.selectedSim != .none || camera.activeCustomSim != nil {
+                        MetalFilteredPreview(camera: camera)
+                            .allowsHitTesting(false)
                     }
                 }
                 .overlay {
@@ -2815,11 +3110,9 @@ struct CameraContentView: View {
                         Slider(value: $zoomSliderValue, in: 0.5...10.0)
                             .tint(.yellow)
                             .onChange(of: zoomSliderValue) { _, newValue in
-                                // Only adjust zoom on current lens while dragging (fast)
                                 camera.setZoomOnCurrentLens(CGFloat(newValue))
                             }
                             .onReceive(Just(zoomSliderValue).debounce(for: .milliseconds(300), scheduler: RunLoop.main)) { value in
-                                // Swap lens if needed after user pauses
                                 camera.setZoom(CGFloat(value))
                             }
                         Text("10x")
@@ -2831,56 +3124,63 @@ struct CameraContentView: View {
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
-            // Focal length presets + zoom toggle
+            // Focal length presets
             HStack(spacing: 18) {
                 ForEach(Array(focalPresets.enumerated()), id: \.offset) { index, preset in
-                    Button {
-                        camera.selectFocalPreset(index)
-                    } label: {
-                        VStack(spacing: 2) {
-                            Text("\(preset.mm)")
-                                .font(.system(size: 15, weight: camera.selectedFocalIndex == index ? .bold : .semibold, design: .rounded))
-                            Text("mm")
-                                .font(.system(size: 9))
-                        }
-                        .iconRotation(motion.iconAngle)
-                        .foregroundStyle(camera.selectedFocalIndex == index ? .yellow : .white)
-                        .frame(width: 54, height: 54)
-                        .background(
-                            Circle()
-                                .fill(Color.black.opacity(0.5))
-                                .overlay(
-                                    Circle().stroke(
-                                        camera.selectedFocalIndex == index ? Color.yellow : Color.white.opacity(0.3),
-                                        lineWidth: camera.selectedFocalIndex == index ? 1.5 : 0.5
-                                    )
-                                )
-                        )
+                    VStack(spacing: 2) {
+                        Text("\(preset.mm == 50 && camera.currentMM == 55 ? 55 : preset.mm)")
+                            .font(.system(size: 15, weight: camera.selectedFocalIndex == index ? .bold : .semibold, design: .rounded))
+                        Text("mm")
+                            .font(.system(size: 9))
                     }
-                    .buttonStyle(.plain)
+                    .iconRotation(motion.iconAngle)
+                    .foregroundStyle(camera.selectedFocalIndex == index ? .yellow : .white)
+                    .frame(width: 54, height: 54)
+                    .background(
+                        Circle()
+                            .fill(Color.black.opacity(0.5))
+                            .overlay(
+                                Circle().stroke(
+                                    camera.selectedFocalIndex == index ? Color.yellow : Color.white.opacity(0.3),
+                                    lineWidth: camera.selectedFocalIndex == index ? 1.5 : 0.5
+                                )
+                            )
+                    )
+                    .onTapGesture(count: 2) {
+                        if preset.mm == 50 {
+                            let alreadyOnThisLens = camera.selectedFocalIndex == index
+                            if alreadyOnThisLens {
+                                // Toggle between 50mm and 55mm
+                                let target = camera.currentMM == 55 ? 50.0 / 26.0 : 55.0 / 26.0
+                                camera.sessionQueue.async {
+                                    guard let device = camera.currentDevice else { return }
+                                    camera.applyZoom(factor: CGFloat(target), on: device)
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    camera.syncZoomState()
+                                }
+                            } else {
+                                // Switch to this lens first, then go to 55mm
+                                camera.selectFocalPreset(index)
+                                // Wait for lens swap to complete, then apply 55mm
+                                camera.sessionQueue.async {
+                                    guard let device = camera.currentDevice else { return }
+                                    let factor55 = 55.0 / 26.0
+                                    camera.applyZoom(factor: CGFloat(factor55), on: device)
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                    camera.syncZoomState()
+                                }
+                            }
+                        } else {
+                            camera.selectFocalPreset(index)
+                        }
+                    }
+                    .onTapGesture(count: 1) {
+                        camera.selectFocalPreset(index)
+                    }
                 }
 
-                // Zoom toggle button
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showZoomSlider.toggle()
-                        if showZoomSlider {
-                            camera.syncZoomState()
-                            zoomSliderValue = Double(camera.currentZoomFactor)
-                        }
-                    }
-                } label: {
-                    Image(systemName: "infinity")
-                        .font(.system(size: 14))
-                        .iconRotation(motion.iconAngle)
-                        .foregroundStyle(showZoomSlider ? .black : .white)
-                        .frame(width: 40, height: 40)
-                        .background(
-                            Circle()
-                                .fill(showZoomSlider ? Color.yellow : Color.white.opacity(0.18))
-                        )
-                }
-                .buttonStyle(.plain)
             }
 
             // Film simulation scroll
@@ -3030,6 +3330,29 @@ struct CameraContentView: View {
         ZStack {
             // Shutter button — always centred
             shutterButton
+
+            // Zoom toggle button — right of shutter
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showZoomSlider.toggle()
+                    if showZoomSlider {
+                        camera.syncZoomState()
+                        zoomSliderValue = Double(camera.currentZoomFactor)
+                    }
+                }
+            } label: {
+                Image(systemName: "infinity")
+                    .font(.system(size: 13))
+                    .iconRotation(motion.iconAngle)
+                    .foregroundStyle(showZoomSlider ? .black : .white)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle()
+                            .fill(showZoomSlider ? Color.yellow : Color.white.opacity(0.18))
+                    )
+            }
+            .buttonStyle(.plain)
+            .offset(x: 72)
 
             // Left side: EV dial + flash
             HStack {
@@ -3192,14 +3515,15 @@ private struct TopPill: View {
 
 final class FilteredPreviewRenderer: NSObject, ObservableObject {
     @Published var previewImage: CGImage?
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     nonisolated(unsafe) var currentSim: CustomSimulation = CustomSimulation()
     nonisolated(unsafe) var applyCustomSim: ((CIImage, CustomSimulation) -> CIImage)?
     nonisolated(unsafe) var lastFrameTime: CFAbsoluteTime = 0
+    nonisolated(unsafe) var sharedContext: CIContext?
     private weak var camera: CameraManager?
 
     func start(session: AVCaptureSession, camera: CameraManager) {
         self.camera = camera
+        self.sharedContext = camera.ciContext
         self.applyCustomSim = { [weak camera] image, sim in
             camera?.applyCustomSim(to: image, sim: sim) ?? image
         }
@@ -3220,12 +3544,13 @@ final class FilteredPreviewRenderer: NSObject, ObservableObject {
         guard now - lastFrameTime > 0.066 else { return }
         lastFrameTime = now
 
+        guard let context = sharedContext else { return }
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        // Downsample for performance
-        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 0.5, y: 0.5))
+        // Downsample for performance — quarter res for editor
+        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 0.25, y: 0.25))
         let sim = currentSim
         let filtered = applyCustomSim?(scaled, sim) ?? scaled
-        guard let cgImage = ciContext.createCGImage(filtered, from: filtered.extent) else { return }
+        guard let cgImage = context.createCGImage(filtered, from: filtered.extent) else { return }
         DispatchQueue.main.async { self.previewImage = cgImage }
     }
 }
