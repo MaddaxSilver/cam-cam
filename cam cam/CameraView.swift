@@ -228,13 +228,22 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var isAuthorized = false
     @Published var isDenied = false
     @Published var selectedSim: FilmSimulation = .none {
-        didSet { cachedSim = selectedSim }
+        didSet {
+            cachedSim = selectedSim
+            UserDefaults.standard.set(selectedSim.rawValue, forKey: "cc_selectedSim")
+        }
     }
-    @Published var selectedAspectRatio: AspectRatio = .full
+    @Published var selectedAspectRatio: AspectRatio = .full {
+        didSet { UserDefaults.standard.set(selectedAspectRatio.rawValue, forKey: "cc_aspectRatio") }
+    }
     @Published var isLandscape: Bool = false
     @Published var deviceAngle: Double = 0
-    @Published var grainAmount: Float = 0.0
-    @Published var grainEnabled: Bool = false
+    @Published var grainAmount: Float = 0.0 {
+        didSet { UserDefaults.standard.set(grainAmount, forKey: "cc_grainAmount") }
+    }
+    @Published var grainEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(grainEnabled, forKey: "cc_grainEnabled") }
+    }
     @Published var exposureBias: Float = 0.0
     @Published var isoValue: Float = 100.0
     @Published var shutterSpeed: Double = 1.0 / 60.0
@@ -243,35 +252,67 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var focusLocked: Bool = false
     @Published var manualFocusEnabled: Bool = false
     @Published var manualFocusValue: Float = 0.5
-    @Published var selectedFocalIndex: Int = 1
+    @Published var selectedFocalIndex: Int = 1 {
+        didSet { UserDefaults.standard.set(selectedFocalIndex, forKey: "cc_focalIndex") }
+    }
     @Published var isLongExposure: Bool = false
-    @Published var longExposureMode: LongExposureMode = .frameStack
-    @Published var longExposureDuration: Double = 2.0
+    @Published var longExposureMode: LongExposureMode = .frameStack {
+        didSet { UserDefaults.standard.set(longExposureMode.rawValue, forKey: "cc_longExposureMode") }
+    }
+    @Published var longExposureDuration: Double = 2.0 {
+        didSet { UserDefaults.standard.set(longExposureDuration, forKey: "cc_longExposureDuration") }
+    }
     @Published var doubleExposureEnabled: Bool = false
     @Published var doubleExposureMaskEnabled: Bool = false
     @Published var doubleExposureMask: UIImage? = nil
-    @Published var maskBrushSize: CGFloat = 40
+    @Published var maskBrushSize: CGFloat = 40 {
+        didSet { UserDefaults.standard.set(Double(maskBrushSize), forKey: "cc_maskBrushSize") }
+    }
     @Published var maskBrushOpacity: Double = 1.0 // 1 = expose more, 0 = erase mask
-    @Published var showGrid: Bool = false
-    @Published var showLevel: Bool = false
-    @Published var showPeaking: Bool = false
+    @Published var showGrid: Bool = false {
+        didSet { UserDefaults.standard.set(showGrid, forKey: "cc_showGrid") }
+    }
+    @Published var showLevel: Bool = false {
+        didSet { UserDefaults.standard.set(showLevel, forKey: "cc_showLevel") }
+    }
+    @Published var showPeaking: Bool = false {
+        didSet { UserDefaults.standard.set(showPeaking, forKey: "cc_showPeaking") }
+    }
     @Published var evReading: Float = 0.0
-    @Published var crosstalkAmount: Float = 0.1
-    @Published var crosstalkEnabled: Bool = false
-    @Published var halationAmount: Float = 0.2
-    @Published var halationEnabled: Bool = false
-    @Published var rolloffEnabled: Bool = false
-    @Published var rolloffThreshold: Float = 0.9
-    @Published var rawEnabled: Bool = false
+    @Published var crosstalkAmount: Float = 0.1 {
+        didSet { UserDefaults.standard.set(crosstalkAmount, forKey: "cc_crosstalkAmount") }
+    }
+    @Published var crosstalkEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(crosstalkEnabled, forKey: "cc_crosstalkEnabled") }
+    }
+    @Published var halationAmount: Float = 0.2 {
+        didSet { UserDefaults.standard.set(halationAmount, forKey: "cc_halationAmount") }
+    }
+    @Published var halationEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(halationEnabled, forKey: "cc_halationEnabled") }
+    }
+    @Published var rolloffEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(rolloffEnabled, forKey: "cc_rolloffEnabled") }
+    }
+    @Published var rolloffThreshold: Float = 0.9 {
+        didSet { UserDefaults.standard.set(rolloffThreshold, forKey: "cc_rolloffThreshold") }
+    }
+    @Published var rawEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(rawEnabled, forKey: "cc_rawEnabled") }
+    }
     @Published var doubleExposureOpacity: Double = 0.5
     @Published var firstExposurePreview: CGImage?
-    @Published var burstMode: Bool = false
+    @Published var burstMode: Bool = false {
+        didSet { UserDefaults.standard.set(burstMode, forKey: "cc_burstMode") }
+    }
     @Published var isBursting: Bool = false
     @Published var burstCount: Int = 0
     @Published var currentZoomFactor: CGFloat = 1.0
     @Published var currentMM: Int = 28
     @Published var isFrontCamera: Bool = false
-    @Published var photoQuality: Int = 2 // 0 speed, 1 balanced, 2 quality
+    @Published var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality
+        didSet { UserDefaults.standard.set(photoQuality, forKey: "cc_photoQuality") }
+    }
     nonisolated(unsafe) var liveFilteredFrame: CGImage?
     nonisolated(unsafe) var liveFilterActive: Bool = false
     nonisolated(unsafe) var activeCustomSim: CustomSimulation?
@@ -345,11 +386,44 @@ final class CameraManager: NSObject, ObservableObject {
 
     override nonisolated init() {
         super.init()
+        loadSettings()
         // Pre-authorize photo library so saves don't block on first capture
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             self.photoLibAuthorized = (status == .authorized || status == .limited)
         }
         requestPermissionAndStart()
+    }
+
+    nonisolated func loadSettings() {
+        let ud = UserDefaults.standard
+        DispatchQueue.main.async {
+            if let raw = ud.string(forKey: "cc_selectedSim"),
+               let sim = FilmSimulation(rawValue: raw) { self.selectedSim = sim }
+            if let raw = ud.string(forKey: "cc_aspectRatio"),
+               let ar = AspectRatio(rawValue: raw) { self.selectedAspectRatio = ar }
+            if ud.object(forKey: "cc_grainEnabled") != nil { self.grainEnabled = ud.bool(forKey: "cc_grainEnabled") }
+            if ud.object(forKey: "cc_grainAmount") != nil { self.grainAmount = ud.float(forKey: "cc_grainAmount") }
+            if ud.object(forKey: "cc_showGrid") != nil { self.showGrid = ud.bool(forKey: "cc_showGrid") }
+            if ud.object(forKey: "cc_showLevel") != nil { self.showLevel = ud.bool(forKey: "cc_showLevel") }
+            if ud.object(forKey: "cc_showPeaking") != nil { self.showPeaking = ud.bool(forKey: "cc_showPeaking") }
+            if ud.object(forKey: "cc_halationEnabled") != nil { self.halationEnabled = ud.bool(forKey: "cc_halationEnabled") }
+            if ud.object(forKey: "cc_halationAmount") != nil { self.halationAmount = ud.float(forKey: "cc_halationAmount") }
+            if ud.object(forKey: "cc_crosstalkEnabled") != nil { self.crosstalkEnabled = ud.bool(forKey: "cc_crosstalkEnabled") }
+            if ud.object(forKey: "cc_crosstalkAmount") != nil { self.crosstalkAmount = ud.float(forKey: "cc_crosstalkAmount") }
+            if ud.object(forKey: "cc_rolloffEnabled") != nil { self.rolloffEnabled = ud.bool(forKey: "cc_rolloffEnabled") }
+            if ud.object(forKey: "cc_rolloffThreshold") != nil { self.rolloffThreshold = ud.float(forKey: "cc_rolloffThreshold") }
+            if ud.object(forKey: "cc_rawEnabled") != nil { self.rawEnabled = ud.bool(forKey: "cc_rawEnabled") }
+            if ud.object(forKey: "cc_burstMode") != nil { self.burstMode = ud.bool(forKey: "cc_burstMode") }
+            if ud.object(forKey: "cc_photoQuality") != nil { self.photoQuality = ud.integer(forKey: "cc_photoQuality") }
+            if ud.object(forKey: "cc_focalIndex") != nil {
+                let idx = ud.integer(forKey: "cc_focalIndex")
+                if idx < focalPresets.count { self.selectedFocalIndex = idx }
+            }
+            if let raw = ud.string(forKey: "cc_longExposureMode"),
+               let mode = LongExposureMode(rawValue: raw) { self.longExposureMode = mode }
+            if ud.object(forKey: "cc_longExposureDuration") != nil { self.longExposureDuration = ud.double(forKey: "cc_longExposureDuration") }
+            if ud.object(forKey: "cc_maskBrushSize") != nil { self.maskBrushSize = CGFloat(ud.double(forKey: "cc_maskBrushSize")) }
+        }
     }
 
     // MARK: Permission and Session
@@ -3095,6 +3169,7 @@ struct CameraContentView: View {
 
             // Dropdown menu
             if showViewMenu {
+                ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 0) {
                     // Aspect ratios
                     HStack(spacing: 6) {
@@ -3281,6 +3356,8 @@ struct CameraContentView: View {
                     .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 12)
+                } // end ScrollView content (VStack)
+                .frame(maxHeight: UIScreen.main.bounds.height * 0.6)
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.75)))
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
