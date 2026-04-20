@@ -3428,6 +3428,11 @@ struct CameraContentView: View {
                             }
                             // Push / Pull
                             VStack(alignment: .leading, spacing: 6) {
+                                let pushPullLabel: String = {
+                                    if camera.pushPullAmount == 0 { return "Push / Pull" }
+                                    if camera.pushPullAmount > 0 { return "Push +\(String(format: "%.0f", camera.pushPullAmount))" }
+                                    return "Pull \(String(format: "%.0f", camera.pushPullAmount))"
+                                }()
                                 Button {
                                     camera.pushPullEnabled.toggle()
                                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -3435,9 +3440,7 @@ struct CameraContentView: View {
                                     HStack(spacing: 4) {
                                         Image(systemName: "arrow.up.arrow.down.circle")
                                             .font(.system(size: 12))
-                                        Text(camera.pushPullAmount == 0 ? "Push / Pull"
-                                             : camera.pushPullAmount > 0 ? "Push +\(String(format: "%.0f", camera.pushPullAmount))"
-                                             : "Pull \(String(format: "%.0f", camera.pushPullAmount))")
+                                        Text(pushPullLabel)
                                             .font(.system(size: 12, weight: camera.pushPullEnabled ? .bold : .regular))
                                     }
                                     .foregroundStyle(camera.pushPullEnabled ? .yellow : .white)
@@ -3481,7 +3484,6 @@ struct CameraContentView: View {
                     // DOUBLE EXPOSURE section (only when active)
                     if camera.doubleExposureEnabled {
                         Divider().background(Color.white.opacity(0.2))
-
                         VStack(alignment: .leading, spacing: 8) {
                             sectionHeader("DOUBLE EXPOSURE MASK", isExpanded: $sectionDoubleExpExpanded)
                             if sectionDoubleExpExpanded {
@@ -3489,61 +3491,10 @@ struct CameraContentView: View {
                                     viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
                                 }
                                 if camera.doubleExposureMaskEnabled {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack {
-                                            Text("Brush Size")
-                                                .font(.system(size: 11))
-                                                .foregroundStyle(.white.opacity(0.7))
-                                            Spacer()
-                                            Text("\(Int(camera.maskBrushSize))")
-                                                .font(.system(size: 11))
-                                                .foregroundStyle(.white.opacity(0.5))
-                                        }
-                                        Slider(value: $camera.maskBrushSize, in: 10...120, step: 5)
-                                            .tint(.white)
-                                    }
-                                    HStack(spacing: 8) {
-                                        Button {
-                                            camera.maskBrushOpacity = 1.0
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "plus.circle.fill").font(.system(size: 12))
-                                                Text("Expose").font(.system(size: 12))
-                                            }
-                                            .foregroundStyle(camera.maskBrushOpacity > 0.5 ? .black : .white)
-                                            .padding(.horizontal, 10).padding(.vertical, 6)
-                                            .background(Capsule().fill(camera.maskBrushOpacity > 0.5 ? Color.white : Color.white.opacity(0.15)))
-                                        }
-                                        .buttonStyle(.plain)
-                                        Button {
-                                            camera.maskBrushOpacity = 0.0
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "minus.circle.fill").font(.system(size: 12))
-                                                Text("Erase").font(.system(size: 12))
-                                            }
-                                            .foregroundStyle(camera.maskBrushOpacity <= 0.5 ? .black : .white)
-                                            .padding(.horizontal, 10).padding(.vertical, 6)
-                                            .background(Capsule().fill(camera.maskBrushOpacity <= 0.5 ? Color.white : Color.white.opacity(0.15)))
-                                        }
-                                        .buttonStyle(.plain)
-                                        Spacer()
-                                        Button {
-                                            camera.doubleExposureMask = nil
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "trash").font(.system(size: 12))
-                                                Text("Clear").font(.system(size: 12))
-                                            }
-                                            .foregroundStyle(.red.opacity(0.9))
-                                            .padding(.horizontal, 10).padding(.vertical, 6)
-                                            .background(Capsule().fill(Color.red.opacity(0.15)))
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
+                                    maskBrushControls
+                                        .padding(.bottom, 6)
+                                        .transition(.opacity.combined(with: .move(edge: .top)))
                                 }
-                                .padding(.bottom, 6)
-                                .transition(.opacity.combined(with: .move(edge: .top)))
                             }
                         }
                     }
@@ -3614,6 +3565,50 @@ struct CameraContentView: View {
         }
         .padding(.trailing, 20)
         } // end ZStack
+    }
+
+    @ViewBuilder
+    private var maskBrushControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Brush Size")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.7))
+                Spacer()
+                Text("\(Int(camera.maskBrushSize))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            Slider(value: $camera.maskBrushSize, in: 10...120, step: 5)
+                .tint(.white)
+            HStack(spacing: 8) {
+                Button { camera.maskBrushOpacity = 1.0 } label: {
+                    Label("Expose", systemImage: "plus.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(camera.maskBrushOpacity > 0.5 ? Color.black : Color.white)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(camera.maskBrushOpacity > 0.5 ? Color.white : Color.white.opacity(0.15)))
+                }
+                .buttonStyle(.plain)
+                Button { camera.maskBrushOpacity = 0.0 } label: {
+                    Label("Erase", systemImage: "minus.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(camera.maskBrushOpacity <= 0.5 ? Color.black : Color.white)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(camera.maskBrushOpacity <= 0.5 ? Color.white : Color.white.opacity(0.15)))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Button { camera.doubleExposureMask = nil } label: {
+                    Label("Clear", systemImage: "trash")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.red.opacity(0.9))
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(Color.red.opacity(0.15)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 
     @ViewBuilder
