@@ -395,34 +395,50 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func loadSettings() {
+        // Read all values synchronously on this thread (UserDefaults is thread-safe for reads)
         let ud = UserDefaults.standard
+        let simRaw         = ud.string(forKey: "cc_selectedSim")
+        let arRaw          = ud.string(forKey: "cc_aspectRatio")
+        let grainEnabled   = ud.object(forKey: "cc_grainEnabled")   != nil ? ud.bool(forKey: "cc_grainEnabled")   : nil as Bool?
+        let grainAmount    = ud.object(forKey: "cc_grainAmount")    != nil ? ud.float(forKey: "cc_grainAmount")   : nil as Float?
+        let showGrid       = ud.object(forKey: "cc_showGrid")       != nil ? ud.bool(forKey: "cc_showGrid")       : nil as Bool?
+        let showLevel      = ud.object(forKey: "cc_showLevel")      != nil ? ud.bool(forKey: "cc_showLevel")      : nil as Bool?
+        let showPeaking    = ud.object(forKey: "cc_showPeaking")    != nil ? ud.bool(forKey: "cc_showPeaking")    : nil as Bool?
+        let halationOn     = ud.object(forKey: "cc_halationEnabled") != nil ? ud.bool(forKey: "cc_halationEnabled") : nil as Bool?
+        let halationAmt    = ud.object(forKey: "cc_halationAmount") != nil ? ud.float(forKey: "cc_halationAmount") : nil as Float?
+        let crosstalkOn    = ud.object(forKey: "cc_crosstalkEnabled") != nil ? ud.bool(forKey: "cc_crosstalkEnabled") : nil as Bool?
+        let crosstalkAmt   = ud.object(forKey: "cc_crosstalkAmount") != nil ? ud.float(forKey: "cc_crosstalkAmount") : nil as Float?
+        let rolloffOn      = ud.object(forKey: "cc_rolloffEnabled") != nil ? ud.bool(forKey: "cc_rolloffEnabled") : nil as Bool?
+        let rolloffThresh  = ud.object(forKey: "cc_rolloffThreshold") != nil ? ud.float(forKey: "cc_rolloffThreshold") : nil as Float?
+        let rawOn          = ud.object(forKey: "cc_rawEnabled")     != nil ? ud.bool(forKey: "cc_rawEnabled")     : nil as Bool?
+        let burstOn        = ud.object(forKey: "cc_burstMode")      != nil ? ud.bool(forKey: "cc_burstMode")      : nil as Bool?
+        let quality        = ud.object(forKey: "cc_photoQuality")   != nil ? ud.integer(forKey: "cc_photoQuality") : nil as Int?
+        let focalIdx       = ud.object(forKey: "cc_focalIndex")     != nil ? ud.integer(forKey: "cc_focalIndex")  : nil as Int?
+        let leRaw          = ud.string(forKey: "cc_longExposureMode")
+        let leDur          = ud.object(forKey: "cc_longExposureDuration") != nil ? ud.double(forKey: "cc_longExposureDuration") : nil as Double?
+        let brushSize      = ud.object(forKey: "cc_maskBrushSize")  != nil ? ud.double(forKey: "cc_maskBrushSize") : nil as Double?
+
         DispatchQueue.main.async {
-            if let raw = ud.string(forKey: "cc_selectedSim"),
-               let sim = FilmSimulation(rawValue: raw) { self.selectedSim = sim }
-            if let raw = ud.string(forKey: "cc_aspectRatio"),
-               let ar = AspectRatio(rawValue: raw) { self.selectedAspectRatio = ar }
-            if ud.object(forKey: "cc_grainEnabled") != nil { self.grainEnabled = ud.bool(forKey: "cc_grainEnabled") }
-            if ud.object(forKey: "cc_grainAmount") != nil { self.grainAmount = ud.float(forKey: "cc_grainAmount") }
-            if ud.object(forKey: "cc_showGrid") != nil { self.showGrid = ud.bool(forKey: "cc_showGrid") }
-            if ud.object(forKey: "cc_showLevel") != nil { self.showLevel = ud.bool(forKey: "cc_showLevel") }
-            if ud.object(forKey: "cc_showPeaking") != nil { self.showPeaking = ud.bool(forKey: "cc_showPeaking") }
-            if ud.object(forKey: "cc_halationEnabled") != nil { self.halationEnabled = ud.bool(forKey: "cc_halationEnabled") }
-            if ud.object(forKey: "cc_halationAmount") != nil { self.halationAmount = ud.float(forKey: "cc_halationAmount") }
-            if ud.object(forKey: "cc_crosstalkEnabled") != nil { self.crosstalkEnabled = ud.bool(forKey: "cc_crosstalkEnabled") }
-            if ud.object(forKey: "cc_crosstalkAmount") != nil { self.crosstalkAmount = ud.float(forKey: "cc_crosstalkAmount") }
-            if ud.object(forKey: "cc_rolloffEnabled") != nil { self.rolloffEnabled = ud.bool(forKey: "cc_rolloffEnabled") }
-            if ud.object(forKey: "cc_rolloffThreshold") != nil { self.rolloffThreshold = ud.float(forKey: "cc_rolloffThreshold") }
-            if ud.object(forKey: "cc_rawEnabled") != nil { self.rawEnabled = ud.bool(forKey: "cc_rawEnabled") }
-            if ud.object(forKey: "cc_burstMode") != nil { self.burstMode = ud.bool(forKey: "cc_burstMode") }
-            if ud.object(forKey: "cc_photoQuality") != nil { self.photoQuality = ud.integer(forKey: "cc_photoQuality") }
-            if ud.object(forKey: "cc_focalIndex") != nil {
-                let idx = ud.integer(forKey: "cc_focalIndex")
-                if idx < focalPresets.count { self.selectedFocalIndex = idx }
-            }
-            if let raw = ud.string(forKey: "cc_longExposureMode"),
-               let mode = LongExposureMode(rawValue: raw) { self.longExposureMode = mode }
-            if ud.object(forKey: "cc_longExposureDuration") != nil { self.longExposureDuration = ud.double(forKey: "cc_longExposureDuration") }
-            if ud.object(forKey: "cc_maskBrushSize") != nil { self.maskBrushSize = CGFloat(ud.double(forKey: "cc_maskBrushSize")) }
+            if let raw = simRaw, let sim = FilmSimulation(rawValue: raw) { self.selectedSim = sim }
+            if let raw = arRaw, let ar = AspectRatio(rawValue: raw) { self.selectedAspectRatio = ar }
+            if let v = grainEnabled   { self.grainEnabled = v }
+            if let v = grainAmount    { self.grainAmount = v }
+            if let v = showGrid       { self.showGrid = v }
+            if let v = showLevel      { self.showLevel = v }
+            if let v = showPeaking    { self.showPeaking = v }
+            if let v = halationOn     { self.halationEnabled = v }
+            if let v = halationAmt    { self.halationAmount = v }
+            if let v = crosstalkOn    { self.crosstalkEnabled = v }
+            if let v = crosstalkAmt   { self.crosstalkAmount = v }
+            if let v = rolloffOn      { self.rolloffEnabled = v }
+            if let v = rolloffThresh  { self.rolloffThreshold = v }
+            if let v = rawOn          { self.rawEnabled = v }
+            if let v = burstOn        { self.burstMode = v }
+            if let v = quality        { self.photoQuality = v }
+            if let idx = focalIdx, idx < focalPresets.count { self.selectedFocalIndex = idx }
+            if let raw = leRaw, let mode = LongExposureMode(rawValue: raw) { self.longExposureMode = mode }
+            if let v = leDur          { self.longExposureDuration = v }
+            if let v = brushSize      { self.maskBrushSize = CGFloat(v) }
         }
     }
 
@@ -3357,7 +3373,7 @@ struct CameraContentView: View {
                 }
                 .padding(.horizontal, 12)
                 } // end ScrollView content (VStack)
-                .frame(maxHeight: UIScreen.main.bounds.height * 0.6)
+                .frame(maxHeight: 500)
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.75)))
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
