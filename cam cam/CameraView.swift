@@ -268,6 +268,18 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var maskBrushSize: CGFloat = 40 {
         didSet { UserDefaults.standard.set(Double(maskBrushSize), forKey: "cc_maskBrushSize") }
     }
+    @Published var pushPullEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(pushPullEnabled, forKey: "cc_pushPullEnabled") }
+    }
+    @Published var pushPullAmount: Float = 0.0 {
+        didSet { UserDefaults.standard.set(pushPullAmount, forKey: "cc_pushPullAmount") }
+    }
+    @Published var anamorphicFlareEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(anamorphicFlareEnabled, forKey: "cc_anamorphicFlare") }
+    }
+    @Published var filmRandomizationEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(filmRandomizationEnabled, forKey: "cc_filmRando") }
+    }
     @Published var maskBrushOpacity: Double = 1.0 // 1 = expose more, 0 = erase mask
     @Published var showGrid: Bool = false {
         didSet { UserDefaults.standard.set(showGrid, forKey: "cc_showGrid") }
@@ -367,6 +379,11 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingCustomSim: CustomSimulation?
     nonisolated(unsafe) var pendingQuality: AVCapturePhotoOutput.QualityPrioritization = .quality
     nonisolated(unsafe) var pendingLongExposureDuration: Double = 2.0
+    nonisolated(unsafe) var pendingPushPullEnabled: Bool = false
+    nonisolated(unsafe) var pendingPushPullAmount: Float = 0.0
+    nonisolated(unsafe) var pendingAnamorphicFlareEnabled: Bool = false
+    nonisolated(unsafe) var pendingRandomizationEnabled: Bool = false
+    nonisolated(unsafe) var pendingRandomSeed: UInt64 = 0
     nonisolated(unsafe) var cachedSim: FilmSimulation = .none
     nonisolated(unsafe) var processQueue = DispatchQueue(label: "cam.process", qos: .userInitiated)
     nonisolated(unsafe) var photoLibAuthorized = false
@@ -417,6 +434,10 @@ final class CameraManager: NSObject, ObservableObject {
         let leRaw          = ud.string(forKey: "cc_longExposureMode")
         let leDur          = ud.object(forKey: "cc_longExposureDuration") != nil ? ud.double(forKey: "cc_longExposureDuration") : nil as Double?
         let brushSize      = ud.object(forKey: "cc_maskBrushSize")  != nil ? ud.double(forKey: "cc_maskBrushSize") : nil as Double?
+        let pushPullOn     = ud.object(forKey: "cc_pushPullEnabled") != nil ? ud.bool(forKey: "cc_pushPullEnabled")   : nil as Bool?
+        let pushPullAmt    = ud.object(forKey: "cc_pushPullAmount")  != nil ? ud.float(forKey: "cc_pushPullAmount")   : nil as Float?
+        let anamorphicOn   = ud.object(forKey: "cc_anamorphicFlare") != nil ? ud.bool(forKey: "cc_anamorphicFlare")   : nil as Bool?
+        let randoOn        = ud.object(forKey: "cc_filmRando")       != nil ? ud.bool(forKey: "cc_filmRando")         : nil as Bool?
 
         DispatchQueue.main.async {
             if let raw = simRaw, let sim = FilmSimulation(rawValue: raw) { self.selectedSim = sim }
@@ -439,6 +460,10 @@ final class CameraManager: NSObject, ObservableObject {
             if let raw = leRaw, let mode = LongExposureMode(rawValue: raw) { self.longExposureMode = mode }
             if let v = leDur          { self.longExposureDuration = v }
             if let v = brushSize      { self.maskBrushSize = CGFloat(v) }
+            if let v = pushPullOn   { self.pushPullEnabled = v }
+            if let v = pushPullAmt  { self.pushPullAmount = v }
+            if let v = anamorphicOn { self.anamorphicFlareEnabled = v }
+            if let v = randoOn      { self.filmRandomizationEnabled = v }
         }
     }
 
@@ -891,6 +916,11 @@ final class CameraManager: NSObject, ObservableObject {
         pendingCustomSim = activeCustomSim
         pendingQuality = effectiveQualityPrioritization
         pendingLongExposureDuration = longExposureDuration
+        pendingPushPullEnabled = pushPullEnabled
+        pendingPushPullAmount = pushPullAmount
+        pendingAnamorphicFlareEnabled = anamorphicFlareEnabled
+        pendingRandomizationEnabled = filmRandomizationEnabled
+        pendingRandomSeed = UInt64.random(in: 0..<UInt64.max)
 
         if isLongExposure {
             switch longExposureMode {
@@ -954,6 +984,11 @@ final class CameraManager: NSObject, ObservableObject {
         pendingHalationEnabled = halationEnabled
         pendingRolloff = rolloffThreshold
         pendingRolloffEnabled = rolloffEnabled
+        pendingPushPullEnabled = pushPullEnabled
+        pendingPushPullAmount = pushPullAmount
+        pendingAnamorphicFlareEnabled = anamorphicFlareEnabled
+        pendingRandomizationEnabled = filmRandomizationEnabled
+        pendingRandomSeed = UInt64.random(in: 0..<UInt64.max)
         fireBurstShot()
     }
 
@@ -1371,9 +1406,28 @@ final class CameraManager: NSObject, ObservableObject {
             image = applyHighlightRolloff(input: image, threshold: pendingRolloff)
         }
 
-        // Grain
+        // Push/Pull processing
+        if pendingPushPullEnabled {
+            image = applyPushPull(input: image, stops: pendingPushPullAmount)
+        }
+
+        // Grain (push adds extra grain)
         if pendingGrainEnabled && pendingGrain > 0 {
-            image = addGrain(input: image, amount: pendingGrain)
+            let pushExtra: Float = pendingPushPullEnabled ? max(0, pendingPushPullAmount * 0.08) : 0
+            image = addGrain(input: image, amount: pendingGrain + pushExtra)
+        } else if pendingPushPullEnabled && pendingPushPullAmount > 0 {
+            // Even with grain off, push adds a small amount of grain
+            image = addGrain(input: image, amount: pendingPushPullAmount * 0.06)
+        }
+
+        // Anamorphic flares
+        if pendingAnamorphicFlareEnabled {
+            image = applyAnamorphicFlare(input: image)
+        }
+
+        // Film randomization
+        if pendingRandomizationEnabled {
+            image = applyFilmRandomization(input: image, seed: pendingRandomSeed)
         }
 
         // Double exposure compositing
@@ -1798,6 +1852,115 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         return result
+    }
+
+    // MARK: Push/Pull Processing
+
+    nonisolated func applyPushPull(input: CIImage, stops: Float) -> CIImage {
+        // Clamp to valid range
+        let s = max(-2.0, min(3.0, stops))
+        guard abs(s) > 0.05 else { return input }
+
+        // Push: crush shadows, blow highlights, increase contrast
+        // Pull: open shadows, protect highlights, lower contrast
+        let shadowShift  = -s * 0.035   // push darkens shadows, pull lifts them
+        let highlightShift = s * 0.04   // push clips highlights, pull brings them down
+        let midShift     = s * 0.015
+
+        let curve = CIFilter.toneCurve()
+        curve.inputImage = input
+        let s0 = CGFloat(max(0, min(1, 0.0 + shadowShift)))
+        let s1 = CGFloat(max(0, min(1, 0.25 + shadowShift * 0.5)))
+        let s2 = CGFloat(max(0, min(1, 0.5 + midShift)))
+        let s3 = CGFloat(max(0, min(1, 0.75 + highlightShift * 0.5)))
+        let s4 = CGFloat(max(0, min(1, 1.0 + highlightShift)))
+        curve.point0 = CGPoint(x: 0,    y: s0)
+        curve.point1 = CGPoint(x: 0.25, y: s1)
+        curve.point2 = CGPoint(x: 0.5,  y: s2)
+        curve.point3 = CGPoint(x: 0.75, y: s3)
+        curve.point4 = CGPoint(x: 1,    y: s4)
+        return curve.outputImage ?? input
+    }
+
+    // MARK: Anamorphic Flares
+
+    nonisolated func applyAnamorphicFlare(input: CIImage) -> CIImage {
+        let extent = input.extent
+
+        // 1. Extract bright highlights via a luminance threshold
+        let highlight = CIFilter.colorMatrix()
+        highlight.inputImage = input
+        // Keep only pixels above ~0.82 luminance by biasing heavily negative then clamping
+        highlight.rVector = CIVector(x: 3, y: 0, z: 0, w: 0)
+        highlight.gVector = CIVector(x: 0, y: 3, z: 0, w: 0)
+        highlight.bVector = CIVector(x: 0, y: 0, z: 3, w: 0)
+        highlight.biasVector = CIVector(x: -2.2, y: -2.2, z: -2.2, w: 0)
+        let bright = highlight.outputImage?.clamped(to: extent) ?? input
+
+        // 2. Horizontal motion blur — wide streak
+        let blur = CIFilter.motionBlur()
+        blur.inputImage = bright
+        blur.radius = 220
+        blur.angle = 0  // horizontal
+        let streaked = blur.outputImage?.clamped(to: extent) ?? bright
+
+        // 3. Tint the streak blue/cyan
+        let tint = CIFilter.colorMatrix()
+        tint.inputImage = streaked
+        tint.rVector = CIVector(x: 0.3, y: 0, z: 0, w: 0)
+        tint.gVector = CIVector(x: 0, y: 0.6, z: 0, w: 0)
+        tint.bVector = CIVector(x: 0, y: 0, z: 1.4, w: 0)
+        tint.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+        let tinted = tint.outputImage?.clamped(to: extent) ?? streaked
+
+        // 4. Screen blend over original
+        let screen = CIFilter.screenBlendMode()
+        screen.inputImage = tinted
+        screen.backgroundImage = input
+        return screen.outputImage?.cropped(to: extent) ?? input
+    }
+
+    // MARK: Film Randomization
+
+    nonisolated func applyFilmRandomization(input: CIImage, seed: UInt64) -> CIImage {
+        var rng = seed
+        func nextFloat(min: Float, max: Float) -> Float {
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            let t = Float(rng >> 33) / Float(UInt32.max)
+            return min + t * (max - min)
+        }
+
+        var image = input
+
+        // Random temperature shift ±150K
+        let tempShift = nextFloat(min: -150, max: 150)
+        let temp = CIFilter.temperatureAndTint()
+        temp.inputImage = image
+        temp.neutral = CIVector(x: 6500, y: 0)
+        temp.targetNeutral = CIVector(x: CGFloat(6500 + tempShift), y: CGFloat(nextFloat(min: -4, max: 4)))
+        image = temp.outputImage ?? image
+
+        // Random micro-vignette
+        let vigStrength = nextFloat(min: 0, max: 0.25)
+        let vignette = CIFilter.vignette()
+        vignette.inputImage = image
+        vignette.intensity = vigStrength
+        vignette.radius = nextFloat(min: 1.2, max: 2.0)
+        image = vignette.outputImage ?? image
+
+        // Random subtle color bias (film batch variation)
+        let rb = nextFloat(min: -0.012, max: 0.012)
+        let gb = nextFloat(min: -0.008, max: 0.008)
+        let bb = nextFloat(min: -0.012, max: 0.012)
+        let bias = CIFilter.colorMatrix()
+        bias.inputImage = image
+        bias.rVector = CIVector(x: 1, y: 0, z: 0, w: 0)
+        bias.gVector = CIVector(x: 0, y: 1, z: 0, w: 0)
+        bias.bVector = CIVector(x: 0, y: 0, z: 1, w: 0)
+        bias.biasVector = CIVector(x: CGFloat(rb), y: CGFloat(gb), z: CGFloat(bb), w: 0)
+        image = bias.outputImage ?? image
+
+        return image
     }
 
     // MARK: Filter Building Blocks
@@ -3228,6 +3391,42 @@ struct CameraContentView: View {
                             viewMenuToggle(icon: "drop.fill", title: "Halation", isOn: $camera.halationEnabled)
                             viewMenuToggle(icon: "paintpalette", title: "Crosstalk", isOn: $camera.crosstalkEnabled)
                             viewMenuToggle(icon: "waveform", title: "Rolloff", isOn: $camera.rolloffEnabled)
+                        }
+
+                        HStack(spacing: 8) {
+                            viewMenuToggle(icon: "aqi.medium", title: "Flares", isOn: $camera.anamorphicFlareEnabled)
+                            viewMenuToggle(icon: "dice", title: "Randomize", isOn: $camera.filmRandomizationEnabled)
+                        }
+
+                        // Push / Pull
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Toggle(isOn: $camera.pushPullEnabled) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.up.arrow.down.circle")
+                                            .font(.system(size: 12))
+                                        Text(camera.pushPullAmount == 0 ? "Push / Pull"
+                                             : camera.pushPullAmount > 0 ? "Push +\(String(format: "%.0f", camera.pushPullAmount))"
+                                             : "Pull \(String(format: "%.0f", camera.pushPullAmount))")
+                                            .font(.system(size: 12))
+                                    }
+                                    .foregroundStyle(.white)
+                                }
+                                .toggleStyle(.button)
+                                .tint(camera.pushPullEnabled ? .yellow : .white.opacity(0.3))
+                            }
+                            if camera.pushPullEnabled {
+                                HStack(spacing: 8) {
+                                    Text("Pull")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.5))
+                                    Slider(value: $camera.pushPullAmount, in: -2...3, step: 1)
+                                        .tint(.yellow)
+                                    Text("Push")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.5))
+                                }
+                            }
                         }
                     }
 
