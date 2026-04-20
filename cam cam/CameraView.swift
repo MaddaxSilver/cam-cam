@@ -2112,6 +2112,7 @@ final class CameraManager: NSObject, ObservableObject {
 
     func selectFocalPreset(_ index: Int) {
         guard index >= 0, index < focalPresets.count else { return }
+        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
         let preset = focalPresets[index]
         let previousDevice = currentDevice
         let needsLensSwap = previousDevice?.deviceType != preset.deviceType
@@ -3120,6 +3121,11 @@ struct CameraContentView: View {
     @State private var isDraggingZoom = false
     @State private var showCustomSimEditor = false
     @State private var editingSim: CustomSimulation?
+    @State private var sectionOverlaysExpanded = true
+    @State private var sectionFilmEffectsExpanded = true
+    @State private var sectionShootingExpanded = true
+    @State private var sectionDoubleExpExpanded = true
+    @State private var sectionQualityExpanded = true
 
     var body: some View {
         GeometryReader { geo in
@@ -3305,6 +3311,7 @@ struct CameraContentView: View {
                     isActive: camera.doubleExposureEnabled
                 )
                 .onTapGesture {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     camera.doubleExposureEnabled.toggle()
                     if !camera.doubleExposureEnabled {
                         camera.firstExposureCIImage = nil
@@ -3317,6 +3324,7 @@ struct CameraContentView: View {
                     isActive: camera.rawEnabled
                 )
                 .onTapGesture {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     camera.rawEnabled.toggle()
                 }
 
@@ -3326,6 +3334,7 @@ struct CameraContentView: View {
                     isActive: camera.isLongExposure
                 )
                 .onTapGesture {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     camera.isLongExposure.toggle()
                 }
 
@@ -3335,6 +3344,7 @@ struct CameraContentView: View {
                     isActive: camera.manualFocusEnabled
                 )
                 .onTapGesture {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     camera.manualFocusEnabled.toggle()
                 }
 
@@ -3372,6 +3382,7 @@ struct CameraContentView: View {
                             let sel = camera.selectedAspectRatio == ratio
                             Button {
                                 camera.selectedAspectRatio = ratio
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             } label: {
                                 Text(ratio.label)
                                     .font(.system(size: 12, weight: sel ? .bold : .regular))
@@ -3386,63 +3397,152 @@ struct CameraContentView: View {
 
                     Divider().background(Color.white.opacity(0.2))
 
-                    // Grid + Level + Peaking
-                    HStack(spacing: 10) {
-                        viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
-                        viewMenuToggle(icon: "level", title: "Level", isOn: $camera.showLevel)
-                        viewMenuToggle(icon: "eye", title: "Peaking", isOn: $camera.showPeaking)
+                    // OVERLAYS section
+                    VStack(alignment: .leading, spacing: 8) {
+                        sectionHeader("OVERLAYS", isExpanded: $sectionOverlaysExpanded)
+                        if sectionOverlaysExpanded {
+                            HStack(spacing: 10) {
+                                viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
+                                viewMenuToggle(icon: "level", title: "Level", isOn: $camera.showLevel)
+                                viewMenuToggle(icon: "eye", title: "Peaking", isOn: $camera.showPeaking)
+                            }
+                            .padding(.bottom, 6)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                     }
-                    .padding(.vertical, 8)
 
                     Divider().background(Color.white.opacity(0.2))
 
-                    // Film effects
+                    // FILM EFFECTS section
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("FILM EFFECTS")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.4))
-                            .padding(.top, 4)
-
-                        HStack(spacing: 8) {
-                            viewMenuToggle(icon: "drop.fill", title: "Halation", isOn: $camera.halationEnabled)
-                            viewMenuToggle(icon: "paintpalette", title: "Crosstalk", isOn: $camera.crosstalkEnabled)
-                            viewMenuToggle(icon: "waveform", title: "Rolloff", isOn: $camera.rolloffEnabled)
-                        }
-
-                        HStack(spacing: 8) {
-                            viewMenuToggle(icon: "aqi.medium", title: "Flares", isOn: $camera.anamorphicFlareEnabled)
-                            viewMenuToggle(icon: "dice", title: "Randomize", isOn: $camera.filmRandomizationEnabled)
-                        }
-
-                        // Push / Pull
-                        VStack(alignment: .leading, spacing: 6) {
-                            Button {
-                                camera.pushPullEnabled.toggle()
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "arrow.up.arrow.down.circle")
-                                        .font(.system(size: 12))
-                                    Text(camera.pushPullAmount == 0 ? "Push / Pull"
-                                         : camera.pushPullAmount > 0 ? "Push +\(String(format: "%.0f", camera.pushPullAmount))"
-                                         : "Pull \(String(format: "%.0f", camera.pushPullAmount))")
-                                        .font(.system(size: 12, weight: camera.pushPullEnabled ? .bold : .regular))
-                                }
-                                .foregroundStyle(camera.pushPullEnabled ? .yellow : .white)
-                                .padding(.horizontal, 10).padding(.vertical, 6)
-                                .background(Capsule().fill(camera.pushPullEnabled ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
+                        sectionHeader("FILM EFFECTS", isExpanded: $sectionFilmEffectsExpanded)
+                        if sectionFilmEffectsExpanded {
+                            HStack(spacing: 8) {
+                                viewMenuToggle(icon: "drop.fill", title: "Halation", isOn: $camera.halationEnabled)
+                                viewMenuToggle(icon: "paintpalette", title: "Crosstalk", isOn: $camera.crosstalkEnabled)
+                                viewMenuToggle(icon: "waveform", title: "Rolloff", isOn: $camera.rolloffEnabled)
                             }
-                            .buttonStyle(.plain)
-                            if camera.pushPullEnabled {
-                                HStack(spacing: 8) {
-                                    Text("Pull")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.5))
-                                    Slider(value: $camera.pushPullAmount, in: -2...3, step: 1)
-                                        .tint(.yellow)
-                                    Text("Push")
-                                        .font(.system(size: 10))
-                                        .foregroundStyle(.white.opacity(0.5))
+                            HStack(spacing: 8) {
+                                viewMenuToggle(icon: "aqi.medium", title: "Flares", isOn: $camera.anamorphicFlareEnabled)
+                                viewMenuToggle(icon: "dice", title: "Randomize", isOn: $camera.filmRandomizationEnabled)
+                            }
+                            // Push / Pull
+                            VStack(alignment: .leading, spacing: 6) {
+                                Button {
+                                    camera.pushPullEnabled.toggle()
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.up.arrow.down.circle")
+                                            .font(.system(size: 12))
+                                        Text(camera.pushPullAmount == 0 ? "Push / Pull"
+                                             : camera.pushPullAmount > 0 ? "Push +\(String(format: "%.0f", camera.pushPullAmount))"
+                                             : "Pull \(String(format: "%.0f", camera.pushPullAmount))")
+                                            .font(.system(size: 12, weight: camera.pushPullEnabled ? .bold : .regular))
+                                    }
+                                    .foregroundStyle(camera.pushPullEnabled ? .yellow : .white)
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Capsule().fill(camera.pushPullEnabled ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
                                 }
+                                .buttonStyle(.plain)
+                                if camera.pushPullEnabled {
+                                    HStack(spacing: 8) {
+                                        Text("Pull")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.white.opacity(0.5))
+                                        Slider(value: $camera.pushPullAmount, in: -2...3, step: 1)
+                                            .tint(.yellow)
+                                        Text("Push")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.white.opacity(0.5))
+                                    }
+                                    .transition(.opacity.combined(with: .move(edge: .top)))
+                                }
+                            }
+                            .padding(.bottom, 6)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                    }
+
+                    Divider().background(Color.white.opacity(0.2))
+
+                    // SHOOTING section
+                    VStack(alignment: .leading, spacing: 8) {
+                        sectionHeader("SHOOTING", isExpanded: $sectionShootingExpanded)
+                        if sectionShootingExpanded {
+                            HStack(spacing: 10) {
+                                viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
+                            }
+                            .padding(.bottom, 6)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                    }
+
+                    // DOUBLE EXPOSURE section (only when active)
+                    if camera.doubleExposureEnabled {
+                        Divider().background(Color.white.opacity(0.2))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            sectionHeader("DOUBLE EXPOSURE MASK", isExpanded: $sectionDoubleExpExpanded)
+                            if sectionDoubleExpExpanded {
+                                HStack(spacing: 10) {
+                                    viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
+                                }
+                                if camera.doubleExposureMaskEnabled {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack {
+                                            Text("Brush Size")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(.white.opacity(0.7))
+                                            Spacer()
+                                            Text("\(Int(camera.maskBrushSize))")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(.white.opacity(0.5))
+                                        }
+                                        Slider(value: $camera.maskBrushSize, in: 10...120, step: 5)
+                                            .tint(.white)
+                                    }
+                                    HStack(spacing: 8) {
+                                        Button {
+                                            camera.maskBrushOpacity = 1.0
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "plus.circle.fill").font(.system(size: 12))
+                                                Text("Expose").font(.system(size: 12))
+                                            }
+                                            .foregroundStyle(camera.maskBrushOpacity > 0.5 ? .black : .white)
+                                            .padding(.horizontal, 10).padding(.vertical, 6)
+                                            .background(Capsule().fill(camera.maskBrushOpacity > 0.5 ? Color.white : Color.white.opacity(0.15)))
+                                        }
+                                        .buttonStyle(.plain)
+                                        Button {
+                                            camera.maskBrushOpacity = 0.0
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "minus.circle.fill").font(.system(size: 12))
+                                                Text("Erase").font(.system(size: 12))
+                                            }
+                                            .foregroundStyle(camera.maskBrushOpacity <= 0.5 ? .black : .white)
+                                            .padding(.horizontal, 10).padding(.vertical, 6)
+                                            .background(Capsule().fill(camera.maskBrushOpacity <= 0.5 ? Color.white : Color.white.opacity(0.15)))
+                                        }
+                                        .buttonStyle(.plain)
+                                        Spacer()
+                                        Button {
+                                            camera.doubleExposureMask = nil
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "trash").font(.system(size: 12))
+                                                Text("Clear").font(.system(size: 12))
+                                            }
+                                            .foregroundStyle(.red.opacity(0.9))
+                                            .padding(.horizontal, 10).padding(.vertical, 6)
+                                            .background(Capsule().fill(Color.red.opacity(0.15)))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.bottom, 6)
                                 .transition(.opacity.combined(with: .move(edge: .top)))
                             }
                         }
@@ -3450,118 +3550,30 @@ struct CameraContentView: View {
 
                     Divider().background(Color.white.opacity(0.2))
 
-                    // Shooting mode
-                    HStack(spacing: 10) {
-                        viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
-                    }
-                    .padding(.vertical, 8)
-
-                    // Double exposure mask controls (only visible when double exposure is active)
-                    if camera.doubleExposureEnabled {
-                        Divider().background(Color.white.opacity(0.2))
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("DOUBLE EXPOSURE MASK")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.4))
-                                .padding(.top, 4)
-
-                            // Mask mode toggle
-                            HStack(spacing: 10) {
-                                viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
-                            }
-
-                            if camera.doubleExposureMaskEnabled {
-                                // Brush size
-                                VStack(alignment: .leading, spacing: 3) {
-                                    HStack {
-                                        Text("Brush Size")
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(.white.opacity(0.7))
-                                        Spacer()
-                                        Text("\(Int(camera.maskBrushSize))")
-                                            .font(.system(size: 11))
-                                            .foregroundStyle(.white.opacity(0.5))
-                                    }
-                                    Slider(value: $camera.maskBrushSize, in: 10...120, step: 5)
-                                        .tint(.white)
-                                }
-
-                                // Paint / Erase toggle
-                                HStack(spacing: 8) {
-                                    Button {
-                                        camera.maskBrushOpacity = 1.0
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "plus.circle.fill").font(.system(size: 12))
-                                            Text("Expose").font(.system(size: 12))
-                                        }
-                                        .foregroundStyle(camera.maskBrushOpacity > 0.5 ? .black : .white)
-                                        .padding(.horizontal, 10).padding(.vertical, 6)
-                                        .background(Capsule().fill(camera.maskBrushOpacity > 0.5 ? Color.white : Color.white.opacity(0.15)))
-                                    }
-                                    .buttonStyle(.plain)
-
-                                    Button {
-                                        camera.maskBrushOpacity = 0.0
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "minus.circle.fill").font(.system(size: 12))
-                                            Text("Erase").font(.system(size: 12))
-                                        }
-                                        .foregroundStyle(camera.maskBrushOpacity <= 0.5 ? .black : .white)
-                                        .padding(.horizontal, 10).padding(.vertical, 6)
-                                        .background(Capsule().fill(camera.maskBrushOpacity <= 0.5 ? Color.white : Color.white.opacity(0.15)))
-                                    }
-                                    .buttonStyle(.plain)
-
-                                    Spacer()
-
-                                    // Clear mask
-                                    Button {
-                                        camera.doubleExposureMask = nil
-                                    } label: {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "trash").font(.system(size: 12))
-                                            Text("Clear").font(.system(size: 12))
-                                        }
-                                        .foregroundStyle(.red.opacity(0.9))
-                                        .padding(.horizontal, 10).padding(.vertical, 6)
-                                        .background(Capsule().fill(Color.red.opacity(0.15)))
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                        .padding(.bottom, 6)
-                    }
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // Photo quality
+                    // PHOTO QUALITY section
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("PHOTO QUALITY")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.4))
-                            .padding(.top, 4)
-
-                        HStack(spacing: 6) {
-                            ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
-                                let sel = camera.photoQuality == idx
-                                Button {
-                                    camera.photoQuality = idx
-                                } label: {
-                                    Text(label)
-                                        .font(.system(size: 12, weight: sel ? .bold : .regular))
-                                        .foregroundStyle(sel ? .black : .white)
-                                        .padding(.horizontal, 9).padding(.vertical, 6)
-                                        .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
+                        sectionHeader("PHOTO QUALITY", isExpanded: $sectionQualityExpanded)
+                        if sectionQualityExpanded {
+                            HStack(spacing: 6) {
+                                ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
+                                    let sel = camera.photoQuality == idx
+                                    Button {
+                                        camera.photoQuality = idx
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        Text(label)
+                                            .font(.system(size: 12, weight: sel ? .bold : .regular))
+                                            .foregroundStyle(sel ? .black : .white)
+                                            .padding(.horizontal, 9).padding(.vertical, 6)
+                                            .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
                             }
+                            .padding(.bottom, 8)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
                         }
                     }
-                    .padding(.bottom, 8)
 
                     Divider().background(Color.white.opacity(0.2))
 
@@ -3605,9 +3617,30 @@ struct CameraContentView: View {
     }
 
     @ViewBuilder
+    private func sectionHeader(_ title: String, isExpanded: Binding<Bool>) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) { isExpanded.wrappedValue.toggle() }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } label: {
+            HStack {
+                Text(title)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.4))
+                Spacer()
+                Image(systemName: isExpanded.wrappedValue ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.3))
+            }
+            .padding(.top, 4)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
     private func viewMenuToggle(icon: String, title: String, isOn: Binding<Bool>) -> some View {
         Button {
             isOn.wrappedValue.toggle()
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 12))
@@ -3985,6 +4018,7 @@ struct CameraContentView: View {
                     .frame(width: 72, height: 72)
                 } else {
                     Button {
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         withAnimation(.easeInOut(duration: 0.3)) {
                             camera.flipCamera()
                         }
@@ -4036,6 +4070,7 @@ struct CameraContentView: View {
             }
         }
         .onTapGesture {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             if camera.doubleExposureEnabled && camera.firstExposurePreview == nil {
                 camera.captureDoubleExposureFirst()
             } else {
