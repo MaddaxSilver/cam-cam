@@ -248,6 +248,10 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var longExposureMode: LongExposureMode = .frameStack
     @Published var longExposureDuration: Double = 2.0
     @Published var doubleExposureEnabled: Bool = false
+    @Published var doubleExposureMaskEnabled: Bool = false
+    @Published var doubleExposureMask: UIImage? = nil
+    @Published var maskBrushSize: CGFloat = 40
+    @Published var maskBrushOpacity: Double = 1.0 // 1 = expose more, 0 = erase mask
     @Published var showGrid: Bool = false
     @Published var showLevel: Bool = false
     @Published var showPeaking: Bool = false
@@ -318,6 +322,7 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingHalationEnabled: Bool = false
     nonisolated(unsafe) var pendingRolloffEnabled: Bool = false
     nonisolated(unsafe) var pendingDoubleExposureOpacity: Double = 0.5
+    nonisolated(unsafe) var pendingMask: UIImage? = nil
     nonisolated(unsafe) var pendingCustomSim: CustomSimulation?
     nonisolated(unsafe) var pendingQuality: AVCapturePhotoOutput.QualityPrioritization = .quality
     nonisolated(unsafe) var pendingLongExposureDuration: Double = 2.0
@@ -792,6 +797,7 @@ final class CameraManager: NSObject, ObservableObject {
         pendingHalationEnabled = halationEnabled
         pendingRolloffEnabled = rolloffEnabled
         pendingDoubleExposureOpacity = doubleExposureOpacity
+        pendingMask = doubleExposureMaskEnabled ? doubleExposureMask : nil
         pendingCustomSim = activeCustomSim
         pendingQuality = effectiveQualityPrioritization
         pendingLongExposureDuration = longExposureDuration
@@ -1282,7 +1288,7 @@ final class CameraManager: NSObject, ObservableObject {
 
         // Double exposure compositing
         if let first = firstExposureCIImage {
-            image = compositeDoubleExposure(base: first, overlay: image, opacity: Float(pendingDoubleExposureOpacity))
+            image = compositeDoubleExposure(base: first, overlay: image, opacity: Float(pendingDoubleExposureOpacity), mask: pendingMask)
             firstExposureCIImage = nil
             DispatchQueue.main.async { self.firstExposurePreview = nil }
         }
@@ -1808,7 +1814,7 @@ final class CameraManager: NSObject, ObservableObject {
         return curve.outputImage ?? input
     }
 
-    nonisolated func compositeDoubleExposure(base: CIImage, overlay: CIImage, opacity: Float) -> CIImage {
+    nonisolated func compositeDoubleExposure(base: CIImage, overlay: CIImage, opacity: Float, mask: UIImage? = nil) -> CIImage {
         // Scale base to match overlay extent if they differ
         var scaledBase = base
         let targetExtent = overlay.extent
@@ -1818,6 +1824,29 @@ final class CameraManager: NSObject, ObservableObject {
             scaledBase = base.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
         }
 
+        if let mask = mask, let cgMask = mask.cgImage {
+            // Mask mode: use painted mask to control blend per-pixel
+            // Scale mask to match overlay extent
+            var maskCI = CIImage(cgImage: cgMask)
+            let msx = targetExtent.width / maskCI.extent.width
+            let msy = targetExtent.height / maskCI.extent.height
+            maskCI = maskCI.transformed(by: CGAffineTransform(scaleX: msx, y: msy))
+
+            // Apply global opacity on top of per-pixel mask
+            let opacityFilter = CIFilter.colorMatrix()
+            opacityFilter.inputImage = maskCI
+            opacityFilter.aVector = CIVector(x: 0, y: 0, z: 0, w: CGFloat(opacity))
+            let scaledMask = opacityFilter.outputImage ?? maskCI
+
+            // BlendWithMask: overlay shows through where mask is white, base shows where black
+            let blendWithMask = CIFilter.blendWithMask()
+            blendWithMask.inputImage = overlay         // foreground (second shot)
+            blendWithMask.backgroundImage = scaledBase  // background (first shot)
+            blendWithMask.maskImage = scaledMask
+            return blendWithMask.outputImage?.cropped(to: targetExtent) ?? overlay
+        }
+
+        // No mask: uniform opacity screen blend
         let opacityFilter = CIFilter.colorMatrix()
         opacityFilter.inputImage = overlay
         opacityFilter.aVector = CIVector(x: 0, y: 0, z: 0, w: CGFloat(opacity))
@@ -2421,6 +2450,132 @@ struct AspectRatioOverlay: View {
     }
 }
 
+// MARK: - Double Exposure Mask Painter
+
+struct MaskPainterView: UIViewRepresentable {
+    @Binding var mask: UIImage?
+    var brushSize: CGFloat
+    var brushOpacity: Double  // 1 = paint (expose), 0 = erase
+    var viewSize: CGSize
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: CGRect(origin: .zero, size: viewSize))
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = true
+
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
+        pan.maximumNumberOfTouches = 1
+        view.addGestureRecognizer(pan)
+
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
+        view.addGestureRecognizer(tap)
+
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.parent = self
+    }
+
+    class Coordinator: NSObject {
+        var parent: MaskPainterView
+        var lastPoint: CGPoint?
+
+        init(_ parent: MaskPainterView) { self.parent = parent }
+
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            let pt = gesture.location(in: gesture.view)
+            draw(from: pt, to: pt)
+        }
+
+        @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
+            let pt = gesture.location(in: gesture.view)
+            switch gesture.state {
+            case .began:
+                lastPoint = pt
+                draw(from: pt, to: pt)
+            case .changed:
+                draw(from: lastPoint ?? pt, to: pt)
+                lastPoint = pt
+            default:
+                lastPoint = nil
+            }
+        }
+
+        func draw(from: CGPoint, to: CGPoint) {
+            let size = parent.viewSize
+            guard size.width > 0, size.height > 0 else { return }
+
+            // Create or reuse mask canvas
+            let current = parent.mask ?? UIImage.solidColor(.black, size: size)
+            UIGraphicsBeginImageContextWithOptions(size, false, 1.0)
+            defer { UIGraphicsEndImageContext() }
+            current.draw(at: .zero)
+
+            guard let ctx = UIGraphicsGetCurrentContext() else { return }
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.setLineWidth(parent.brushSize)
+
+            if parent.brushOpacity > 0.5 {
+                // Paint white = expose second image in this area
+                ctx.setStrokeColor(UIColor.white.withAlphaComponent(CGFloat(parent.brushOpacity)).cgColor)
+                ctx.setBlendMode(.normal)
+            } else {
+                // Erase = reveal first image (paint black)
+                ctx.setStrokeColor(UIColor.black.cgColor)
+                ctx.setBlendMode(.normal)
+            }
+
+            ctx.move(to: from)
+            ctx.addLine(to: to)
+            ctx.strokePath()
+
+            parent.mask = UIGraphicsGetImageFromCurrentImageContext()
+        }
+    }
+}
+
+struct MaskOverlayView: View {
+    @ObservedObject var camera: CameraManager
+    let geoSize: CGSize
+
+    var body: some View {
+        ZStack {
+            // Show current mask as semi-transparent overlay
+            if let mask = camera.doubleExposureMask, let cgImage = mask.cgImage {
+                Image(decorative: cgImage, scale: 1)
+                    .resizable()
+                    .scaledToFill()
+                    .blendMode(.screen)
+                    .opacity(0.35)
+                    .allowsHitTesting(false)
+            }
+
+            // Painting canvas
+            MaskPainterView(
+                mask: $camera.doubleExposureMask,
+                brushSize: camera.maskBrushSize,
+                brushOpacity: camera.maskBrushOpacity,
+                viewSize: geoSize
+            )
+        }
+    }
+}
+
+extension UIImage {
+    static func solidColor(_ color: UIColor, size: CGSize) -> UIImage {
+        UIGraphicsBeginImageContextWithOptions(size, false, 1.0)
+        color.setFill()
+        UIRectFill(CGRect(origin: .zero, size: size))
+        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
+        UIGraphicsEndImageContext()
+        return img
+    }
+}
+
 // MARK: - FocusIndicator
 
 struct FocusIndicator: View {
@@ -2800,14 +2955,23 @@ struct CameraContentView: View {
         }
         .onAppear {
             motion.startUpdates()
-            let step: Float = 0.33
+            let evStep: Float = 0.33
+            let opacityStep: Double = 0.1
             volumeObserver.onVolumeUp = {
-                let newBias = min(camera.exposureBias + step, 3.0)
-                camera.setExposureBias(newBias)
+                if camera.doubleExposureEnabled {
+                    camera.doubleExposureOpacity = min(camera.doubleExposureOpacity + opacityStep, 1.0)
+                } else {
+                    let newBias = min(camera.exposureBias + evStep, 3.0)
+                    camera.setExposureBias(newBias)
+                }
             }
             volumeObserver.onVolumeDown = {
-                let newBias = max(camera.exposureBias - step, -3.0)
-                camera.setExposureBias(newBias)
+                if camera.doubleExposureEnabled {
+                    camera.doubleExposureOpacity = max(camera.doubleExposureOpacity - opacityStep, 0.0)
+                } else {
+                    let newBias = max(camera.exposureBias - evStep, -3.0)
+                    camera.setExposureBias(newBias)
+                }
             }
         }
         .onDisappear {
@@ -2853,6 +3017,11 @@ struct CameraContentView: View {
                                 .clipped()
                                 .opacity(camera.doubleExposureOpacity)
                                 .allowsHitTesting(false)
+
+                            // Mask painter — only active when mask mode is on
+                            if camera.doubleExposureMaskEnabled {
+                                MaskOverlayView(camera: camera, geoSize: geo.size)
+                            }
                         }
                     }
                 }
@@ -2978,6 +3147,86 @@ struct CameraContentView: View {
                         viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
                     }
                     .padding(.vertical, 8)
+
+                    // Double exposure mask controls (only visible when double exposure is active)
+                    if camera.doubleExposureEnabled {
+                        Divider().background(Color.white.opacity(0.2))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("DOUBLE EXPOSURE MASK")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.4))
+                                .padding(.top, 4)
+
+                            // Mask mode toggle
+                            HStack(spacing: 10) {
+                                viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
+                            }
+
+                            if camera.doubleExposureMaskEnabled {
+                                // Brush size
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack {
+                                        Text("Brush Size")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.white.opacity(0.7))
+                                        Spacer()
+                                        Text("\(Int(camera.maskBrushSize))")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.white.opacity(0.5))
+                                    }
+                                    Slider(value: $camera.maskBrushSize, in: 10...120, step: 5)
+                                        .tint(.white)
+                                }
+
+                                // Paint / Erase toggle
+                                HStack(spacing: 8) {
+                                    Button {
+                                        camera.maskBrushOpacity = 1.0
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "plus.circle.fill").font(.system(size: 12))
+                                            Text("Expose").font(.system(size: 12))
+                                        }
+                                        .foregroundStyle(camera.maskBrushOpacity > 0.5 ? .black : .white)
+                                        .padding(.horizontal, 10).padding(.vertical, 6)
+                                        .background(Capsule().fill(camera.maskBrushOpacity > 0.5 ? Color.white : Color.white.opacity(0.15)))
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Button {
+                                        camera.maskBrushOpacity = 0.0
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "minus.circle.fill").font(.system(size: 12))
+                                            Text("Erase").font(.system(size: 12))
+                                        }
+                                        .foregroundStyle(camera.maskBrushOpacity <= 0.5 ? .black : .white)
+                                        .padding(.horizontal, 10).padding(.vertical, 6)
+                                        .background(Capsule().fill(camera.maskBrushOpacity <= 0.5 ? Color.white : Color.white.opacity(0.15)))
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+
+                                    // Clear mask
+                                    Button {
+                                        camera.doubleExposureMask = nil
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "trash").font(.system(size: 12))
+                                            Text("Clear").font(.system(size: 12))
+                                        }
+                                        .foregroundStyle(.red.opacity(0.9))
+                                        .padding(.horizontal, 10).padding(.vertical, 6)
+                                        .background(Capsule().fill(Color.red.opacity(0.15)))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .padding(.bottom, 6)
+                    }
 
                     Divider().background(Color.white.opacity(0.2))
 
