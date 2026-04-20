@@ -3284,6 +3284,16 @@ struct CameraContentView: View {
     // MARK: - Top Bar
 
     private var topBar: some View {
+        ZStack(alignment: .topTrailing) {
+            // Tap-outside overlay — dismisses dropdown when visible
+            if showViewMenu {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.spring(duration: 0.25)) { showViewMenu = false }
+                    }
+                    .ignoresSafeArea()
+            }
         VStack(alignment: .trailing, spacing: 8) {
             // Top pill row — right-aligned
             HStack(spacing: 8) {
@@ -3291,7 +3301,8 @@ struct CameraContentView: View {
 
                 TopPill(
                     icon: "square.stack",
-                    text: camera.doubleExposureEnabled ? "2X" : "1X"
+                    text: camera.doubleExposureEnabled ? "2X" : "1X",
+                    isActive: camera.doubleExposureEnabled
                 )
                 .onTapGesture {
                     camera.doubleExposureEnabled.toggle()
@@ -3301,14 +3312,18 @@ struct CameraContentView: View {
                     }
                 }
 
-                TopPill(text: camera.rawEnabled ? "RAW" : "JPEG")
-                    .onTapGesture {
-                        camera.rawEnabled.toggle()
-                    }
+                TopPill(
+                    text: camera.rawEnabled ? "RAW" : "JPEG",
+                    isActive: camera.rawEnabled
+                )
+                .onTapGesture {
+                    camera.rawEnabled.toggle()
+                }
 
                 TopPill(
                     icon: "timer",
-                    text: camera.isLongExposure ? String(format: "%.0fs", camera.longExposureDuration) : "BULB"
+                    text: camera.isLongExposure ? String(format: "%.0fs", camera.longExposureDuration) : "BULB",
+                    isActive: camera.isLongExposure
                 )
                 .onTapGesture {
                     camera.isLongExposure.toggle()
@@ -3316,7 +3331,8 @@ struct CameraContentView: View {
 
                 TopPill(
                     icon: "viewfinder",
-                    text: camera.manualFocusEnabled ? "MF" : "AF"
+                    text: camera.manualFocusEnabled ? "MF" : "AF",
+                    isActive: camera.manualFocusEnabled
                 )
                 .onTapGesture {
                     camera.manualFocusEnabled.toggle()
@@ -3331,7 +3347,7 @@ struct CameraContentView: View {
                     withAnimation(.spring(duration: 0.25)) { showViewMenu.toggle() }
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: "aspectratio").font(.system(size: 11))
+                        Image(systemName: "slider.horizontal.3").font(.system(size: 11))
                         Text(camera.selectedAspectRatio.label).font(.system(size: 12, weight: .semibold))
                         Image(systemName: showViewMenu ? "chevron.up" : "chevron.down").font(.system(size: 9))
                     }
@@ -3399,22 +3415,23 @@ struct CameraContentView: View {
                         }
 
                         // Push / Pull
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Toggle(isOn: $camera.pushPullEnabled) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "arrow.up.arrow.down.circle")
-                                            .font(.system(size: 12))
-                                        Text(camera.pushPullAmount == 0 ? "Push / Pull"
-                                             : camera.pushPullAmount > 0 ? "Push +\(String(format: "%.0f", camera.pushPullAmount))"
-                                             : "Pull \(String(format: "%.0f", camera.pushPullAmount))")
-                                            .font(.system(size: 12))
-                                    }
-                                    .foregroundStyle(.white)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Button {
+                                camera.pushPullEnabled.toggle()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.up.arrow.down.circle")
+                                        .font(.system(size: 12))
+                                    Text(camera.pushPullAmount == 0 ? "Push / Pull"
+                                         : camera.pushPullAmount > 0 ? "Push +\(String(format: "%.0f", camera.pushPullAmount))"
+                                         : "Pull \(String(format: "%.0f", camera.pushPullAmount))")
+                                        .font(.system(size: 12, weight: camera.pushPullEnabled ? .bold : .regular))
                                 }
-                                .toggleStyle(.button)
-                                .tint(camera.pushPullEnabled ? .yellow : .white.opacity(0.3))
+                                .foregroundStyle(camera.pushPullEnabled ? .yellow : .white)
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(Capsule().fill(camera.pushPullEnabled ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
                             }
+                            .buttonStyle(.plain)
                             if camera.pushPullEnabled {
                                 HStack(spacing: 8) {
                                     Text("Pull")
@@ -3426,6 +3443,7 @@ struct CameraContentView: View {
                                         .font(.system(size: 10))
                                         .foregroundStyle(.white.opacity(0.5))
                                 }
+                                .transition(.opacity.combined(with: .move(edge: .top)))
                             }
                         }
                     }
@@ -3573,11 +3591,17 @@ struct CameraContentView: View {
                 .padding(.horizontal, 12)
                 } // end ScrollView content (VStack)
                 .frame(maxHeight: 500)
-                .background(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.75)))
+                .background(
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(.ultraThinMaterial)
+                        .overlay(RoundedRectangle(cornerRadius: 14).fill(Color.black.opacity(0.35)))
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.12), lineWidth: 1))
+                )
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .padding(.trailing, 20)
+        } // end ZStack
     }
 
     @ViewBuilder
@@ -3863,6 +3887,15 @@ struct CameraContentView: View {
                 .padding(.bottom, 30)
         }
         .padding(.horizontal, 8)
+        .padding(.top, 12)
+        .background(
+            LinearGradient(
+                colors: [Color.black.opacity(0), Color.black.opacity(0.55)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
+        )
     }
 
     // MARK: - Shutter Row
@@ -3882,7 +3915,7 @@ struct CameraContentView: View {
                     }
                 }
             } label: {
-                Image(systemName: "infinity")
+                Image(systemName: "plus.magnifyingglass")
                     .font(.system(size: 13))
                     .iconRotation(motion.iconAngle)
                     .foregroundStyle(showZoomSlider ? .black : .white)
@@ -3890,6 +3923,7 @@ struct CameraContentView: View {
                     .background(
                         Circle()
                             .fill(showZoomSlider ? Color.yellow : Color.white.opacity(0.18))
+                            .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 1))
                     )
             }
             .buttonStyle(.plain)
@@ -3981,6 +4015,8 @@ struct CameraContentView: View {
             Circle()
                 .fill(camera.isBursting ? Color.yellow : (camera.isCapturing ? Color.gray : Color.white))
                 .frame(width: 70, height: 70)
+                .scaleEffect(camera.isCapturing && !camera.isBursting ? 0.88 : 1.0)
+                .animation(.easeInOut(duration: 0.12), value: camera.isCapturing)
 
             if camera.isCapturing && !camera.isBursting {
                 ProgressView()
@@ -4026,6 +4062,7 @@ private struct TopPill: View {
     var icon: String? = nil
     var text: String
     var showChevron: Bool = false
+    var isActive: Bool = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -4042,11 +4079,14 @@ private struct TopPill: View {
                     .font(.system(size: 8, weight: .bold))
             }
         }
-        .foregroundStyle(.white)
+        .foregroundStyle(isActive ? .black : .white)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(.black.opacity(0.5))
-        .clipShape(Capsule())
+        .background(
+            Capsule()
+                .fill(isActive ? Color.yellow : Color.black.opacity(0.5))
+                .overlay(Capsule().stroke(isActive ? Color.yellow : Color.white.opacity(0.25), lineWidth: 1))
+        )
     }
 }
 
