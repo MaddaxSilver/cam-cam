@@ -964,7 +964,7 @@ final class CameraManager: NSObject, ObservableObject {
             }
             // Flash: use torch-as-flash for adjustable strength, full strength uses native flash
             if flash == .on, let device = currentDevice, device.hasTorch {
-                let level = AVCaptureDevice.TorchLevel(max(0.01, min(1.0, strength)))
+                let level = Float(max(0.01, min(1.0, strength)))
                 try? device.lockForConfiguration()
                 try? device.setTorchModeOn(level: level)
                 device.unlockForConfiguration()
@@ -3457,7 +3457,7 @@ struct CameraContentView: View {
                                 Button {
                                     camera.pushPullEnabled.toggle()
                                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                } label: {≈
+                                } label: {
                                     HStack(spacing: 4) {
                                         Image(systemName: "arrow.up.arrow.down.circle")
                                             .font(.system(size: 12))
