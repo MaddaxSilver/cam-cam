@@ -4012,16 +4012,21 @@ struct CameraContentView: View {
                     .buttonStyle(.plain)
 
                     if camera.flashMode == .on {
-                        HStack(spacing: 6) {
-                            Image(systemName: "bolt")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.white.opacity(0.4))
-                            Slider(value: $camera.flashStrength, in: 0.1...1.0, step: 0.1)
-                                .tint(.yellow)
-                                .frame(width: 90)
-                            Image(systemName: "bolt.fill")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.yellow.opacity(0.8))
+                        HStack(spacing: 5) {
+                            ForEach([("Min", Float(0.1)), ("Med", Float(0.5)), ("Max", Float(1.0))], id: \.0) { label, value in
+                                let sel = abs(camera.flashStrength - value) < 0.1
+                                Button {
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    camera.flashStrength = value
+                                } label: {
+                                    Text(label)
+                                        .font(.system(size: 11, weight: sel ? .bold : .regular))
+                                        .foregroundStyle(sel ? .black : .white)
+                                        .padding(.horizontal, 8).padding(.vertical, 4)
+                                        .background(Capsule().fill(sel ? Color.yellow : Color.white.opacity(0.15)))
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
