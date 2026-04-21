@@ -249,6 +249,9 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var shutterSpeed: Double = 1.0 / 60.0
     @Published var isCapturing = false
     @Published var flashMode: AVCaptureDevice.FlashMode = .off
+    @Published var flashStrength: Float = 1.0 {
+        didSet { UserDefaults.standard.set(flashStrength, forKey: "cc_flashStrength") }
+    }
     @Published var focusLocked: Bool = false
     @Published var manualFocusEnabled: Bool = false
     @Published var manualFocusValue: Float = 0.5
@@ -434,6 +437,7 @@ final class CameraManager: NSObject, ObservableObject {
         let leRaw          = ud.string(forKey: "cc_longExposureMode")
         let leDur          = ud.object(forKey: "cc_longExposureDuration") != nil ? ud.double(forKey: "cc_longExposureDuration") : nil as Double?
         let brushSize      = ud.object(forKey: "cc_maskBrushSize")  != nil ? ud.double(forKey: "cc_maskBrushSize") : nil as Double?
+        let flashStr       = ud.object(forKey: "cc_flashStrength")  != nil ? ud.float(forKey: "cc_flashStrength")  : nil as Float?
         let pushPullOn     = ud.object(forKey: "cc_pushPullEnabled") != nil ? ud.bool(forKey: "cc_pushPullEnabled")   : nil as Bool?
         let pushPullAmt    = ud.object(forKey: "cc_pushPullAmount")  != nil ? ud.float(forKey: "cc_pushPullAmount")   : nil as Float?
         let anamorphicOn   = ud.object(forKey: "cc_anamorphicFlare") != nil ? ud.bool(forKey: "cc_anamorphicFlare")   : nil as Bool?
@@ -460,6 +464,7 @@ final class CameraManager: NSObject, ObservableObject {
             if let raw = leRaw, let mode = LongExposureMode(rawValue: raw) { self.longExposureMode = mode }
             if let v = leDur          { self.longExposureDuration = v }
             if let v = brushSize      { self.maskBrushSize = CGFloat(v) }
+            if let v = flashStr       { self.flashStrength = v }
             if let v = pushPullOn   { self.pushPullEnabled = v }
             if let v = pushPullAmt  { self.pushPullAmount = v }
             if let v = anamorphicOn { self.anamorphicFlareEnabled = v }
@@ -933,6 +938,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         let flash = flashMode
+        let strength = flashStrength
         let useRAW = rawEnabled
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
@@ -956,7 +962,14 @@ final class CameraManager: NSObject, ObservableObject {
                let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
                 settings.maxPhotoDimensions = maxDim
             }
-            if photoOutput.supportedFlashModes.contains(flash) {
+            // Flash: use torch-as-flash for adjustable strength, full strength uses native flash
+            if flash == .on, let device = currentDevice, device.hasTorch {
+                let level = AVCaptureDevice.TorchLevel(max(0.01, min(1.0, strength)))
+                try? device.lockForConfiguration()
+                try? device.setTorchModeOn(level: level)
+                device.unlockForConfiguration()
+                settings.flashMode = .off  // torch provides the light
+            } else if photoOutput.supportedFlashModes.contains(flash) {
                 settings.flashMode = flash
             }
             photoOutput.capturePhoto(with: settings, delegate: self)
@@ -2262,6 +2275,14 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
+        // Turn off torch if it was used as flash
+        if let device = currentDevice, device.torchMode == .on {
+            sessionQueue.async {
+                try? device.lockForConfiguration()
+                device.torchMode = .off
+                device.unlockForConfiguration()
+            }
+        }
         guard error == nil else {
             DispatchQueue.main.async {
                 self.isCapturing = false
@@ -3436,7 +3457,7 @@ struct CameraContentView: View {
                                 Button {
                                     camera.pushPullEnabled.toggle()
                                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                } label: {
+                                } label: {≈
                                     HStack(spacing: 4) {
                                         Image(systemName: "arrow.up.arrow.down.circle")
                                             .font(.system(size: 12))
@@ -3968,25 +3989,43 @@ struct CameraContentView: View {
                 )
                 .frame(width: 72, height: 72)
 
-                Button {
-                    camera.toggleFlash()
-                } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
-                            .font(.system(size: 16))
-                        Text(camera.flashLabel)
-                            .font(.system(size: 10, weight: .semibold))
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        camera.toggleFlash()
+                    } label: {
+                        VStack(spacing: 3) {
+                            Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
+                                .font(.system(size: 16))
+                            Text(camera.flashLabel)
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .iconRotation(motion.iconAngle)
+                        .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
+                        .frame(width: 44, height: 38)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.45))
+                                .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                        )
                     }
-                    .iconRotation(motion.iconAngle)
-                    .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
-                    .frame(width: 44, height: 38)
-                    .background(
-                        Capsule()
-                            .fill(Color.black.opacity(0.45))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
-                    )
+                    .buttonStyle(.plain)
+
+                    if camera.flashMode == .on {
+                        HStack(spacing: 6) {
+                            Image(systemName: "bolt")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white.opacity(0.4))
+                            Slider(value: $camera.flashStrength, in: 0.1...1.0, step: 0.1)
+                                .tint(.yellow)
+                                .frame(width: 90)
+                            Image(systemName: "bolt.fill")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.yellow.opacity(0.8))
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
                 }
-                .buttonStyle(.plain)
 
                 Spacer()
             }
