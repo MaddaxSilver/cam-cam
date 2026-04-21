@@ -867,8 +867,16 @@ final class CameraManager: NSObject, ObservableObject {
 
     func toggleFlash() {
         switch flashMode {
-        case .off:  flashMode = .on
-        case .on:   flashMode = .auto
+        case .off:
+            flashMode = .on; flashStrength = 0.1   // Min
+        case .on:
+            if flashStrength < 0.3 {
+                flashStrength = 0.5                 // Min → Med
+            } else if flashStrength < 0.8 {
+                flashStrength = 1.0                 // Med → Max
+            } else {
+                flashMode = .auto                   // Max → Auto
+            }
         case .auto: flashMode = .off
         @unknown default: flashMode = .off
         }
@@ -877,7 +885,10 @@ final class CameraManager: NSObject, ObservableObject {
     var flashLabel: String {
         switch flashMode {
         case .off:  return "OFF"
-        case .on:   return "ON"
+        case .on:
+            if flashStrength < 0.3 { return "MIN" }
+            if flashStrength < 0.8 { return "MED" }
+            return "MAX"
         case .auto: return "AUTO"
         @unknown default: return "OFF"
         }
@@ -3989,48 +4000,26 @@ struct CameraContentView: View {
                 )
                 .frame(width: 72, height: 72)
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        camera.toggleFlash()
-                    } label: {
-                        VStack(spacing: 3) {
-                            Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
-                                .font(.system(size: 16))
-                            Text(camera.flashLabel)
-                                .font(.system(size: 10, weight: .semibold))
-                        }
-                        .iconRotation(motion.iconAngle)
-                        .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
-                        .frame(width: 44, height: 38)
-                        .background(
-                            Capsule()
-                                .fill(Color.black.opacity(0.45))
-                                .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
-                        )
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    camera.toggleFlash()
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
+                            .font(.system(size: 16))
+                        Text(camera.flashLabel)
+                            .font(.system(size: 10, weight: .semibold))
                     }
-                    .buttonStyle(.plain)
-
-                    if camera.flashMode == .on {
-                        HStack(spacing: 5) {
-                            ForEach([("Min", Float(0.1)), ("Med", Float(0.5)), ("Max", Float(1.0))], id: \.0) { label, value in
-                                let sel = abs(camera.flashStrength - value) < 0.1
-                                Button {
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                    camera.flashStrength = value
-                                } label: {
-                                    Text(label)
-                                        .font(.system(size: 11, weight: sel ? .bold : .regular))
-                                        .foregroundStyle(sel ? .black : .white)
-                                        .padding(.horizontal, 8).padding(.vertical, 4)
-                                        .background(Capsule().fill(sel ? Color.yellow : Color.white.opacity(0.15)))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                    }
+                    .iconRotation(motion.iconAngle)
+                    .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
+                    .frame(width: 44, height: 38)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.45))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                    )
                 }
+                .buttonStyle(.plain)
 
                 Spacer()
             }
