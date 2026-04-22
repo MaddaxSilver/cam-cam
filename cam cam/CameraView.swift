@@ -2009,30 +2009,39 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func addGrain(input: CIImage, amount: Float) -> CIImage {
-        // Generate monochrome noise
-        let noise = CIFilter.randomGenerator().outputImage!
-        let cropped = noise.cropped(to: input.extent)
+        guard amount > 0 else { return input }
+        let a = max(0, min(0.5, amount))
+
+        // 1. Raw pixel noise
+        let noise = CIFilter.randomGenerator().outputImage!.cropped(to: input.extent)
+
+        // 2. Monochrome, centred at 0.5 so it both lightens and darkens
         let mono = CIFilter.colorControls()
-        mono.inputImage = cropped
+        mono.inputImage = noise
         mono.saturation = 0.0
-        mono.brightness = -0.5  // Centre noise around mid-grey so it darkens AND lightens
-        mono.contrast = 1.0
-        guard let grainImage = mono.outputImage else { return input }
+        mono.brightness = -0.5
+        mono.contrast = Float(1.0 + a * 3.0)   // more contrast = chunkier grain at higher amounts
+        guard let monoNoise = mono.outputImage else { return input }
 
-        // Blend: mix original with (original + grain) using amount as weight
-        // dissolve = original * (1 - amount) + grained * amount
-        let blend = CIFilter.softLightBlendMode()
-        blend.inputImage = grainImage
-        blend.backgroundImage = input
-        guard let grained = blend.outputImage else { return input }
+        // 3. Slight gaussian blur so grain clumps like silver halide instead of pixel-perfect digital noise
+        let blur = CIFilter.gaussianBlur()
+        blur.inputImage = monoNoise
+        blur.radius = Float(0.4 + a * 1.6)        // subtle at low amounts, chunkier at high
+        guard let blurred = blur.outputImage?.cropped(to: input.extent) else { return input }
 
-        // Mix original and grained result by amount (0 = no grain, 0.5 = max grain)
+        // 4. Single overlay blend — one grain structure, no competing layers
+        let overlay = CIFilter.overlayBlendMode()
+        overlay.inputImage = blurred
+        overlay.backgroundImage = input
+        guard let blended = overlay.outputImage?.cropped(to: input.extent) else { return input }
+
+        // 5. Mix back with original to scale intensity (a=0→original, a=0.5→full grain)
         let mix = CIFilter(name: "CIDissolveTransition", parameters: [
-            kCIInputImageKey: grained,
+            kCIInputImageKey: blended,
             kCIInputTargetImageKey: input,
-            "inputTime": NSNumber(value: 1.0 - amount * 2.0)  // amount 0..0.5 → time 1..0
+            "inputTime": NSNumber(value: 1.0 - Double(a) * 2.0)
         ])
-        return mix?.outputImage ?? grained
+        return mix?.outputImage?.cropped(to: input.extent) ?? blended
     }
 
     nonisolated func applyColorCrosstalk(input: CIImage, amount: Float) -> CIImage {
