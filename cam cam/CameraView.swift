@@ -272,10 +272,10 @@ final class CameraManager: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(Double(maskBrushSize), forKey: "cc_maskBrushSize") }
     }
     @Published var pushPullEnabled: Bool = false {
-        didSet { UserDefaults.standard.set(pushPullEnabled, forKey: "cc_pushPullEnabled") }
+        didSet { UserDefaults.standard.set(pushPullEnabled, forKey: "cc_pushPullEnabled"); cachedPushPullEnabled = pushPullEnabled }
     }
     @Published var pushPullAmount: Float = 0.0 {
-        didSet { UserDefaults.standard.set(pushPullAmount, forKey: "cc_pushPullAmount") }
+        didSet { UserDefaults.standard.set(pushPullAmount, forKey: "cc_pushPullAmount"); cachedPushPullAmount = pushPullAmount }
     }
     @Published var anamorphicFlareEnabled: Bool = false {
         didSet { UserDefaults.standard.set(anamorphicFlareEnabled, forKey: "cc_anamorphicFlare") }
@@ -295,22 +295,22 @@ final class CameraManager: NSObject, ObservableObject {
     }
     @Published var evReading: Float = 0.0
     @Published var crosstalkAmount: Float = 0.1 {
-        didSet { UserDefaults.standard.set(crosstalkAmount, forKey: "cc_crosstalkAmount") }
+        didSet { UserDefaults.standard.set(crosstalkAmount, forKey: "cc_crosstalkAmount"); cachedCrosstalkAmount = crosstalkAmount }
     }
     @Published var crosstalkEnabled: Bool = false {
-        didSet { UserDefaults.standard.set(crosstalkEnabled, forKey: "cc_crosstalkEnabled") }
+        didSet { UserDefaults.standard.set(crosstalkEnabled, forKey: "cc_crosstalkEnabled"); cachedCrosstalkEnabled = crosstalkEnabled }
     }
     @Published var halationAmount: Float = 0.2 {
-        didSet { UserDefaults.standard.set(halationAmount, forKey: "cc_halationAmount") }
+        didSet { UserDefaults.standard.set(halationAmount, forKey: "cc_halationAmount"); cachedHalationAmount = halationAmount }
     }
     @Published var halationEnabled: Bool = false {
-        didSet { UserDefaults.standard.set(halationEnabled, forKey: "cc_halationEnabled") }
+        didSet { UserDefaults.standard.set(halationEnabled, forKey: "cc_halationEnabled"); cachedHalationEnabled = halationEnabled }
     }
     @Published var rolloffEnabled: Bool = false {
-        didSet { UserDefaults.standard.set(rolloffEnabled, forKey: "cc_rolloffEnabled") }
+        didSet { UserDefaults.standard.set(rolloffEnabled, forKey: "cc_rolloffEnabled"); cachedRolloffEnabled = rolloffEnabled }
     }
     @Published var rolloffThreshold: Float = 0.9 {
-        didSet { UserDefaults.standard.set(rolloffThreshold, forKey: "cc_rolloffThreshold") }
+        didSet { UserDefaults.standard.set(rolloffThreshold, forKey: "cc_rolloffThreshold"); cachedRolloffThreshold = rolloffThreshold }
     }
     @Published var rawEnabled: Bool = false {
         didSet { UserDefaults.standard.set(rawEnabled, forKey: "cc_rawEnabled") }
@@ -332,6 +332,15 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var liveFilterActive: Bool = false
     nonisolated(unsafe) var activeCustomSim: CustomSimulation?
     nonisolated(unsafe) var lastFilterFrameTime: CFAbsoluteTime = 0
+    // Live-cached effect flags for preview rendering (updated via didSet)
+    nonisolated(unsafe) var cachedCrosstalkEnabled: Bool = false
+    nonisolated(unsafe) var cachedCrosstalkAmount: Float = 0.1
+    nonisolated(unsafe) var cachedHalationEnabled: Bool = false
+    nonisolated(unsafe) var cachedHalationAmount: Float = 0.2
+    nonisolated(unsafe) var cachedRolloffEnabled: Bool = false
+    nonisolated(unsafe) var cachedRolloffThreshold: Float = 0.9
+    nonisolated(unsafe) var cachedPushPullEnabled: Bool = false
+    nonisolated(unsafe) var cachedPushPullAmount: Float = 0.0
 
     // MARK: nonisolated(unsafe) stored properties
     nonisolated(unsafe) let session = AVCaptureSession()
@@ -2261,8 +2270,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         let previewScale: CGFloat = 0.5
         let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: previewScale, y: previewScale))
 
-        // Apply sim to downscaled image
-        let filtered: CIImage
+        // Apply full sim + effects pipeline to preview
+        var filtered: CIImage
         if let customSim {
             filtered = applyCustomSim(to: scaled, sim: customSim)
         } else {
@@ -2270,6 +2279,19 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             pendingSim = cachedSim
             filtered = applyFilmSim(to: scaled)
             pendingSim = prevPending
+        }
+        // Apply live effects so preview matches saved output
+        if cachedCrosstalkEnabled {
+            filtered = applyColorCrosstalk(input: filtered, amount: cachedCrosstalkAmount)
+        }
+        if cachedHalationEnabled {
+            filtered = applyHalation(input: filtered, amount: cachedHalationAmount)
+        }
+        if cachedRolloffEnabled {
+            filtered = applyHighlightRolloff(input: filtered, threshold: cachedRolloffThreshold)
+        }
+        if cachedPushPullEnabled {
+            filtered = applyPushPull(input: filtered, stops: cachedPushPullAmount)
         }
 
         if let metal {
