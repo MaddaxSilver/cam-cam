@@ -129,13 +129,14 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
     case leica
     case fujiProvia, fujiVelvia, fujiColor200, fujiPro400H, fujiSuperia
     case kodakPortra, kodakGold, kodakUltramax, kodakColorplus, kodakEktar
-    case cinestill800T, kodakVision3
+    case cinestill800T, kodakVision3, cinestill50D
     case agfaVista
-    case ilfordHP5
+    case ilfordHP5, kodakTriX, fujiAcros
     case lomography
     case digiCam
     case nightShot
     case urbanJade
+    case kodachrome64, ektachrome100, polaroid600
 
     var id: String { rawValue }
     var label: String {
@@ -154,12 +155,18 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
         case .kodakEktar:     return "Ektar"
         case .cinestill800T:  return "800T"
         case .kodakVision3:   return "Vision3"
+        case .cinestill50D:   return "50D"
         case .agfaVista:      return "Vista"
         case .ilfordHP5:      return "HP5"
+        case .kodakTriX:      return "Tri-X"
+        case .fujiAcros:      return "Acros"
         case .lomography:     return "Lomo"
         case .digiCam:        return "DigiCam"
         case .nightShot:      return "Night"
         case .urbanJade:      return "Urban Jade"
+        case .kodachrome64:   return "Kodachrome"
+        case .ektachrome100:  return "Ektachrome"
+        case .polaroid600:    return "Polaroid"
         }
     }
 }
@@ -321,6 +328,10 @@ final class CameraManager: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(burstMode, forKey: "cc_burstMode") }
     }
     @Published var isBursting: Bool = false
+    @Published var isRecording: Bool = false {
+        didSet { cachedIsRecording = isRecording }
+    }
+    @Published var recordingDuration: TimeInterval = 0
     @Published var burstCount: Int = 0
     @Published var currentZoomFactor: CGFloat = 1.0
     @Published var currentMM: Int = 28
@@ -370,6 +381,18 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var reusableVignette = CIFilter.vignette()
     nonisolated(unsafe) var photoOutput = AVCapturePhotoOutput()
     nonisolated(unsafe) var videoDataOutput = AVCaptureVideoDataOutput()
+    // Video recording
+    nonisolated(unsafe) var audioDataOutput = AVCaptureAudioDataOutput()
+    nonisolated(unsafe) var audioOutputAdded = false
+    nonisolated(unsafe) var cachedIsRecording: Bool = false
+    nonisolated(unsafe) var assetWriter: AVAssetWriter? = nil
+    nonisolated(unsafe) var videoWriterInput: AVAssetWriterInput? = nil
+    nonisolated(unsafe) var audioWriterInput: AVAssetWriterInput? = nil
+    nonisolated(unsafe) var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor? = nil
+    nonisolated(unsafe) var recordingSessionStarted = false
+    nonisolated(unsafe) var recordingOutputURL: URL? = nil
+    nonisolated(unsafe) var recordingTimer: Timer? = nil
+    nonisolated(unsafe) var lastRecordFrameTime: Double = 0
     nonisolated(unsafe) var frameStack: [CIImage] = []
     nonisolated(unsafe) var frameTimer: Timer?
     nonisolated(unsafe) var isCollectingFrames = false
@@ -508,23 +531,25 @@ final class CameraManager: NSObject, ObservableObject {
     /// Select the best device format: highest photo resolution while keeping video preview >= 1080p
     /// Must be called while device is locked for configuration
     nonisolated func selectBestFormat(for device: AVCaptureDevice) {
-        // Filter to formats with decent video preview (at least 1080p width)
-        // then pick the one with the highest photo resolution
+        // Keep only video formats with a preview stream ≥ 1080p wide
         let candidates = device.formats.filter { f in
-            let mediaType = CMFormatDescriptionGetMediaType(f.formatDescription)
-            guard mediaType == kCMMediaType_Video else { return false }
-            let videoDims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-            return videoDims.width >= 1920
+            guard CMFormatDescriptionGetMediaType(f.formatDescription) == kCMMediaType_Video else { return false }
+            let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            return dims.width >= 1920
         }
-        // Among candidates with good preview, pick highest photo res
-        let best = (candidates.isEmpty ? device.formats : candidates)
-            .max { a, b in
-                let aMax = a.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height })
-                let bMax = b.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height })
-                let aPixels = Int(aMax?.width ?? 0) * Int(aMax?.height ?? 0)
-                let bPixels = Int(bMax?.width ?? 0) * Int(bMax?.height ?? 0)
-                return aPixels < bPixels
-            }
+        let pool = candidates.isEmpty ? device.formats : candidates
+
+        // Primary sort: highest still-photo resolution (gets 48MP on Pro sensors)
+        let best = pool.max { a, b in
+            let aPhoto = a.supportedMaxPhotoDimensions
+                .map { Int($0.width) * Int($0.height) }.max() ?? 0
+            let bPhoto = b.supportedMaxPhotoDimensions
+                .map { Int($0.width) * Int($0.height) }.max() ?? 0
+            if aPhoto != bPhoto { return aPhoto < bPhoto }
+            let aVid = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+            let bVid = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+            return Int(aVid.width) * Int(aVid.height) < Int(bVid.width) * Int(bVid.height)
+        }
         guard let best else { return }
         device.activeFormat = best
     }
@@ -608,6 +633,80 @@ final class CameraManager: NSObject, ObservableObject {
            connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
         }
+        // Adding an output can cause AVFoundation to swap formats — re-pin max photo dimensions
+        if let maxDim = currentDevice?.activeFormat
+            .supportedMaxPhotoDimensions
+            .max(by: { $0.width * $0.height < $1.width * $1.height }) {
+            photoOutput.maxPhotoDimensions = maxDim
+        }
+    }
+
+    nonisolated func addAudioOutputIfNeeded() {
+        guard !audioOutputAdded else { return }
+        audioOutputAdded = true
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playAndRecord, mode: .videoRecording,
+                                      options: [.defaultToSpeaker, .allowBluetoothHFP])
+        try? audioSession.setActive(true)
+        session.beginConfiguration()
+        if let audioDevice = AVCaptureDevice.default(for: .audio),
+           let audioInput = try? AVCaptureDeviceInput(device: audioDevice),
+           session.canAddInput(audioInput) {
+            session.addInput(audioInput)
+        }
+        audioDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
+        if session.canAddOutput(audioDataOutput) {
+            session.addOutput(audioDataOutput)
+        }
+        session.commitConfiguration()
+    }
+
+    nonisolated func setupAssetWriter(width: Int, height: Int, startTime: CMTime) {
+        let maxLong = 1920
+        let scale = min(1.0, Double(maxLong) / Double(max(width, height)))
+        let outW = Int(Double(width)  * scale) & ~1
+        let outH = Int(Double(height) * scale) & ~1
+        let fname = "cc_\(Int(Date().timeIntervalSince1970)).mov"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fname)
+        try? FileManager.default.removeItem(at: url)
+        guard let writer = try? AVAssetWriter(url: url, fileType: .mov) else { return }
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: outW,
+            AVVideoHeightKey: outH,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 16_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+            ]
+        ]
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        videoInput.expectsMediaDataInRealTime = true
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: outW,
+                kCVPixelBufferHeightKey as String: outH
+            ]
+        )
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: 128_000
+        ]
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        audioInput.expectsMediaDataInRealTime = true
+        if writer.canAdd(videoInput) { writer.add(videoInput) }
+        if writer.canAdd(audioInput) { writer.add(audioInput) }
+        writer.startWriting()
+        writer.startSession(atSourceTime: startTime)
+        self.recordingOutputURL = url
+        self.assetWriter = writer
+        self.videoWriterInput = videoInput
+        self.audioWriterInput = audioInput
+        self.pixelBufferAdaptor = adaptor
+        self.recordingSessionStarted = true
     }
 
     nonisolated func bestDevice(for preset: FocalPreset) -> AVCaptureDevice? {
@@ -616,6 +715,10 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func swapInputDevice(to preset: FocalPreset, animateFromZoom: CGFloat? = nil) {
+        // Stop any active recording before reconfiguring the session
+        if cachedIsRecording {
+            DispatchQueue.main.async { self.stopRecording() }
+        }
         // Snapshot current preview on main thread BEFORE the session swap
         let preview = previewUIView
         if Thread.isMainThread {
@@ -977,10 +1080,18 @@ final class CameraManager: NSObject, ObservableObject {
                 }
             }
             settings.photoQualityPrioritization = pendingQuality
-            // Max quality → full sensor resolution (48MP on Pro), otherwise use default binned
-            if pendingQuality == .quality,
-               let maxDim = currentDevice?.activeFormat.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height }) {
-                settings.maxPhotoDimensions = maxDim
+            let dims = currentDevice?.activeFormat.supportedMaxPhotoDimensions
+            switch pendingQuality {
+            case .quality:
+                if let d = dims?.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+                    settings.maxPhotoDimensions = d
+                }
+            case .speed:
+                if let d = dims?.min(by: { $0.width * $0.height < $1.width * $1.height }) {
+                    settings.maxPhotoDimensions = d
+                }
+            default:
+                break
             }
             // Flash: use torch-as-flash for adjustable strength, full strength uses native flash
             if flash == .on, let device = currentDevice, device.hasTorch {
@@ -999,7 +1110,7 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: Burst Capture
 
     func startBurst() {
-        guard !isBursting else { return }
+        guard !isBursting, !isRecording else { return }
         isBursting = true
         burstActive = true
         burstCount = 0
@@ -1028,6 +1139,50 @@ final class CameraManager: NSObject, ObservableObject {
     func stopBurst() {
         isBursting = false
         burstActive = false
+    }
+
+    // MARK: Video Recording
+
+    func startRecording() {
+        guard !isRecording, !isBursting else { return }
+        isRecording = true
+        recordingDuration = 0
+        recordingSessionStarted = false
+        recordingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self, self.isRecording else { return }
+            self.recordingDuration += 0.1
+        }
+        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        sessionQueue.async { [self] in
+            self.addVideoDataOutputIfNeeded()
+            self.addAudioOutputIfNeeded()
+        }
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        let writer = assetWriter
+        let url = recordingOutputURL
+        videoWriterInput?.markAsFinished()
+        audioWriterInput?.markAsFinished()
+        assetWriter = nil
+        videoWriterInput = nil
+        audioWriterInput = nil
+        pixelBufferAdaptor = nil
+        recordingOutputURL = nil
+        recordingSessionStarted = false
+        writer?.finishWriting {
+            guard writer?.status == .completed, let url else { return }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            }, completionHandler: nil)
+            DispatchQueue.main.async {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            }
+        }
     }
 
     private nonisolated func fireBurstShot() {
@@ -1506,18 +1661,26 @@ final class CameraManager: NSObject, ObservableObject {
             return toneCurve(input: temp.outputImage ?? image, shadows: 0.02, mid: 0.0, highlights: -0.02)
 
         case .fujiVelvia:
-            // Velvia: high saturation, deep contrast, vivid
+            // Velvia: ultra-vivid saturation, deep contrast, cool cast, electric greens & blues
             let cc = CIFilter.colorControls()
             cc.inputImage = image
-            cc.saturation = 1.4
-            cc.contrast = 1.15
-            cc.brightness = 0.0
-            let warm = CIFilter.temperatureAndTint()
-            warm.inputImage = cc.outputImage
-            warm.neutral = CIVector(x: 6500, y: 0)
-            warm.targetNeutral = CIVector(x: 6000, y: 0)
-            let sharpened = claritySharpen(input: warm.outputImage ?? image)
-            return sharpened
+            cc.saturation = 1.65    // Velvia's signature extreme pop
+            cc.contrast = 1.25     // punchy contrast
+            cc.brightness = -0.01
+            // Slightly cool — Velvia pops blues and greens, not warm
+            let cool = CIFilter.temperatureAndTint()
+            cool.inputImage = cc.outputImage
+            cool.neutral = CIVector(x: 6500, y: 0)
+            cool.targetNeutral = CIVector(x: 6900, y: 0)  // pull toward cool
+            // Strong green channel push: foliage pops electric; slight blue lift for sky
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cool.outputImage
+            matrix.rVector = CIVector(x: 1.0,  y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.12, z: 0.0,  w: 0)   // electric foliage
+            matrix.bVector = CIVector(x: 0.0,  y: 0.0,  z: 1.06, w: 0)   // sky pop
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.0, mid: -0.01, highlights: -0.04)
+            return claritySharpen(input: curved)
 
         case .fujiColor200:
             // Fuji C200: daylight film, slightly cool, moderate saturation
@@ -1572,17 +1735,26 @@ final class CameraManager: NSObject, ObservableObject {
             return toneCurve(input: warm.outputImage ?? image, shadows: 0.03, mid: 0.01, highlights: -0.01)
 
         case .kodakUltramax:
-            // Ultramax 400: punchy, saturated, slightly blue shadows
+            // Ultramax 400: warm highlights, distinctly blue (not green) shadows, punchy
             let cc = CIFilter.colorControls()
             cc.inputImage = image
             cc.saturation = 1.25
             cc.contrast = 1.1
             cc.brightness = 0.0
-            let cool = CIFilter.temperatureAndTint()
-            cool.inputImage = cc.outputImage
-            cool.neutral = CIVector(x: 6500, y: 0)
-            cool.targetNeutral = CIVector(x: 6800, y: -5)
-            return toneCurve(input: cool.outputImage ?? image, shadows: 0.04, mid: 0.0, highlights: -0.03)
+            // Warm shift — highlights lean golden/amber
+            let warm = CIFilter.temperatureAndTint()
+            warm.inputImage = cc.outputImage
+            warm.neutral = CIVector(x: 6500, y: 0)
+            warm.targetNeutral = CIVector(x: 5900, y: 0)   // warm highlights
+            // Blue push into shadows via bias — the signature Ultramax shadow color
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = warm.outputImage
+            matrix.rVector = CIVector(x: 1.0,  y: 0.0, z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.0, z: 0.0,  w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.0, z: 1.06, w: 0)   // blue lift
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.0, y: 0.0, z: 0.03, w: 0)  // blue in the blacks
+            return toneCurve(input: matrix.outputImage ?? image, shadows: 0.03, mid: 0.0, highlights: -0.03)
 
         case .kodakColorplus:
             // ColorPlus: budget warm film, moderate saturation, warm cast
@@ -1598,17 +1770,25 @@ final class CameraManager: NSObject, ObservableObject {
             return toneCurve(input: warm.outputImage ?? image, shadows: 0.02, mid: 0.0, highlights: 0.0)
 
         case .kodakEktar:
-            // Ektar 100: extremely saturated, fine grain simulation, deep colors
+            // Ektar 100: extreme reds, very fine grain, highly saturated, daylight balanced
             let cc = CIFilter.colorControls()
             cc.inputImage = image
-            cc.saturation = 1.45
-            cc.contrast = 1.12
+            cc.saturation = 1.5    // extremely saturated
+            cc.contrast = 1.15
             cc.brightness = -0.01
-            let warm = CIFilter.temperatureAndTint()
-            warm.inputImage = cc.outputImage
-            warm.neutral = CIVector(x: 6500, y: 0)
-            warm.targetNeutral = CIVector(x: 6200, y: 0)
-            let sharpened = claritySharpen(input: warm.outputImage ?? image)
+            // Daylight balanced — neutral to slightly cool, not warm
+            let temp = CIFilter.temperatureAndTint()
+            temp.inputImage = cc.outputImage
+            temp.neutral = CIVector(x: 6500, y: 0)
+            temp.targetNeutral = CIVector(x: 6400, y: 0)  // basically neutral
+            // RED BOOST: Ektar's defining trait — reds are almost aggressive
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = temp.outputImage
+            matrix.rVector = CIVector(x: 1.2,  y: 0.0,  z: 0.0,  w: 0)   // extreme red push
+            matrix.gVector = CIVector(x: 0.0,  y: 1.04, z: 0.0,  w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.0,  z: 0.93, w: 0)   // slightly suppress blue
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let sharpened = claritySharpen(input: matrix.outputImage ?? image)
             return toneCurve(input: sharpened, shadows: 0.01, mid: 0.0, highlights: -0.04)
 
         case .digiCam:
@@ -1679,80 +1859,85 @@ final class CameraManager: NSObject, ObservableObject {
             return vignette.outputImage ?? curved
 
         case .fujiSuperia:
-            // Superia 400: warm amber shadows, faded lifted blacks, muted greens, golden cast
+            // Superia 400: ~5900K with green bias — not as warm as before, green-leaning daylight
             let cc = CIFilter.colorControls()
             cc.inputImage = image
-            cc.saturation = 0.92
-            cc.contrast = 1.1
-            cc.brightness = 0.0
+            cc.saturation = 0.95
+            cc.contrast = 1.08
+            cc.brightness = 0.01
+            // 5900K + green tint: slightly warm but distinctly green-biased
             let warm = CIFilter.temperatureAndTint()
             warm.inputImage = cc.outputImage
             warm.neutral = CIVector(x: 6500, y: 0)
-            warm.targetNeutral = CIVector(x: 5200, y: -12)
-            // Push amber into shadows, mute greens
+            warm.targetNeutral = CIVector(x: 5900, y: -8)  // mild warm + green
+            // Boost green channel, light amber in shadows, pull down blue slightly
             let matrix = CIFilter.colorMatrix()
             matrix.inputImage = warm.outputImage
-            matrix.rVector = CIVector(x: 1.06, y: 0.04, z: 0.0, w: 0)
-            matrix.gVector = CIVector(x: 0.02, y: 0.96, z: 0.0, w: 0)
-            matrix.bVector = CIVector(x: 0.0, y: 0.0, z: 0.88, w: 0)
+            matrix.rVector = CIVector(x: 1.02, y: 0.01, z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.06, z: 0.0,  w: 0)  // green push
+            matrix.bVector = CIVector(x: 0.0,  y: 0.0,  z: 0.93, w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            matrix.biasVector = CIVector(x: 0.015, y: 0.008, z: 0.0, w: 0)
-            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.08, mid: 0.02, highlights: -0.03)
+            matrix.biasVector = CIVector(x: 0.008, y: 0.006, z: 0.0, w: 0)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.05, mid: 0.01, highlights: -0.02)
             let vignette = CIFilter.vignette()
             vignette.inputImage = curved
-            vignette.intensity = 0.6
-            vignette.radius = 1.2
+            vignette.intensity = 0.5
+            vignette.radius = 1.3
             return vignette.outputImage ?? curved
 
         case .cinestill800T:
-            // CineStill 800T: strong teal-orange split, neon halation glow, deep blacks
+            // CineStill 800T: strong teal-orange split, orange-red halation around lights (not global warm)
             let cc = CIFilter.colorControls()
             cc.inputImage = image
             cc.saturation = 1.2
             cc.contrast = 1.25
             cc.brightness = -0.02
-            // Heavy teal shadows / warm orange highlights
+            // Heavy teal shadows / warm orange highlights via color matrix
             let matrix = CIFilter.colorMatrix()
             matrix.inputImage = cc.outputImage
-            matrix.rVector = CIVector(x: 1.15, y: 0.0, z: 0.0, w: 0)
-            matrix.gVector = CIVector(x: 0.0, y: 0.88, z: 0.08, w: 0)
-            matrix.bVector = CIVector(x: 0.0, y: 0.12, z: 1.2, w: 0)
+            matrix.rVector = CIVector(x: 1.15, y: 0.0,  z: 0.0, w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 0.88, z: 0.08, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.12, z: 1.2,  w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
             matrix.biasVector = CIVector(x: 0.01, y: -0.01, z: 0.03, w: 0)
             let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.04, mid: -0.01, highlights: -0.06)
-            // Warm halation bloom on highlights — the CineStill signature
+            // Orange halation: tint source orange-red, bloom it, screen-blend so only bright areas halo
+            let orangeSrc = CIFilter.colorMatrix()
+            orangeSrc.inputImage = curved
+            orangeSrc.rVector = CIVector(x: 1.35, y: 0.05, z: 0.0,  w: 0)
+            orangeSrc.gVector = CIVector(x: 0.0,  y: 0.85, z: 0.0,  w: 0)
+            orangeSrc.bVector = CIVector(x: 0.0,  y: 0.0,  z: 0.35, w: 0)
+            orangeSrc.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let orangeTinted = orangeSrc.outputImage?.cropped(to: image.extent) ?? curved
             let bloom = CIFilter.bloom()
-            bloom.inputImage = curved
-            bloom.intensity = 0.3
-            bloom.radius = 12
-            let bloomed = bloom.outputImage?.cropped(to: image.extent) ?? curved
-            // Warm the bloom
-            let warmBloom = CIFilter.temperatureAndTint()
-            warmBloom.inputImage = bloomed
-            warmBloom.neutral = CIVector(x: 6500, y: 0)
-            warmBloom.targetNeutral = CIVector(x: 5000, y: 0)
-            return warmBloom.outputImage ?? bloomed
+            bloom.inputImage = orangeTinted
+            bloom.intensity = 0.55
+            bloom.radius = 18
+            let orangeBloom = bloom.outputImage?.cropped(to: image.extent) ?? orangeTinted
+            let screen = CIFilter(name: "CIScreenBlendMode")!
+            screen.setValue(orangeBloom, forKey: kCIInputImageKey)
+            screen.setValue(curved, forKey: kCIInputBackgroundImageKey)
+            return screen.outputImage?.cropped(to: image.extent) ?? curved
 
         case .kodakVision3:
-            // Vision3 500T: deep crushed blacks, strong teal shadows, warm neon highlights, cinematic
+            // Vision3 500T: flat cinema negative — wide exposure latitude, NOT high contrast
             let cc = CIFilter.colorControls()
             cc.inputImage = image
-            cc.saturation = 1.1
-            cc.contrast = 1.35
-            cc.brightness = -0.04
+            cc.saturation = 1.05
+            cc.contrast = 0.9     // intentionally flat: cinema negative holds detail, not crushed
+            cc.brightness = 0.01
             // Teal in shadows, preserve warm highlights
             let matrix = CIFilter.colorMatrix()
             matrix.inputImage = cc.outputImage
-            matrix.rVector = CIVector(x: 1.0, y: 0.0, z: 0.0, w: 0)
-            matrix.gVector = CIVector(x: 0.0, y: 0.92, z: 0.06, w: 0)
-            matrix.bVector = CIVector(x: 0.0, y: 0.1, z: 1.18, w: 0)
+            matrix.rVector = CIVector(x: 1.0,  y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 0.93, z: 0.05, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.1,  z: 1.15, w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
             matrix.biasVector = CIVector(x: 0.0, y: 0.0, z: 0.02, w: 0)
-            // Crush blacks hard, soft rolloff on highlights
-            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.02, mid: -0.02, highlights: -0.06)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.04, mid: -0.01, highlights: -0.04)
             let vignette = CIFilter.vignette()
             vignette.inputImage = curved
-            vignette.intensity = 1.0
+            vignette.intensity = 0.7
             vignette.radius = 1.5
             return vignette.outputImage ?? curved
 
@@ -1818,6 +2003,156 @@ final class CameraManager: NSObject, ObservableObject {
             vignette.intensity = 1.8
             vignette.radius = 1.8
             return vignette.outputImage ?? curved
+
+        case .cinestill50D:
+            // CineStill 50D: daylight cinema stock — clean, fine grain, neutral-cool, low contrast
+            // The daylight counterpart to 800T: no halation, crisp, highly detailed
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.05
+            cc.contrast = 1.05
+            cc.brightness = 0.01
+            // Slightly cool daylight balance
+            let cool = CIFilter.temperatureAndTint()
+            cool.inputImage = cc.outputImage
+            cool.neutral = CIVector(x: 6500, y: 0)
+            cool.targetNeutral = CIVector(x: 6800, y: 0)
+            // Gentle teal-green in shadows (cinema stock characteristic)
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cool.outputImage
+            matrix.rVector = CIVector(x: 1.0,  y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.04, z: 0.02, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.04, z: 1.08, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.0, y: 0.002, z: 0.01, w: 0)
+            return toneCurve(input: matrix.outputImage ?? image, shadows: 0.03, mid: 0.0, highlights: -0.03)
+
+        case .kodakTriX:
+            // Kodak Tri-X 400: the definitive photojournalism B&W — gritty, high contrast, chunky grain
+            let mono = CIFilter.photoEffectNoir()
+            mono.inputImage = image
+            let cc = CIFilter.colorControls()
+            cc.inputImage = mono.outputImage
+            cc.contrast = 1.35   // punchy, street-photography contrast
+            cc.brightness = -0.02
+            cc.saturation = 0.0
+            // Slightly warm/sepia tone (Tri-X has a warm silver tone)
+            let toned = CIFilter.colorMatrix()
+            toned.inputImage = cc.outputImage
+            toned.rVector = CIVector(x: 1.0,  y: 0.0, z: 0.0, w: 0)
+            toned.gVector = CIVector(x: 0.0,  y: 0.96, z: 0.0, w: 0)
+            toned.bVector = CIVector(x: 0.0,  y: 0.0, z: 0.90, w: 0)
+            toned.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let curved = toneCurve(input: toned.outputImage ?? image, shadows: 0.0, mid: -0.02, highlights: -0.05)
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 0.9
+            vignette.radius = 1.4
+            return vignette.outputImage ?? curved
+
+        case .fujiAcros:
+            // Fuji Acros 100: ultra-fine grain B&W, smooth gradations, deep blacks, luminous highlights
+            let mono = CIFilter.photoEffectMono()
+            mono.inputImage = image
+            let cc = CIFilter.colorControls()
+            cc.inputImage = mono.outputImage
+            cc.contrast = 1.15   // refined contrast — not as crushed as Tri-X
+            cc.brightness = 0.0
+            cc.saturation = 0.0
+            // Acros has a distinctly cooler/bluer tone than HP5 or Tri-X
+            let cooled = CIFilter.colorMatrix()
+            cooled.inputImage = cc.outputImage
+            cooled.rVector = CIVector(x: 0.96, y: 0.0,  z: 0.0,  w: 0)
+            cooled.gVector = CIVector(x: 0.0,  y: 0.97, z: 0.0,  w: 0)
+            cooled.bVector = CIVector(x: 0.0,  y: 0.0,  z: 1.0,  w: 0)
+            cooled.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let curved = toneCurve(input: cooled.outputImage ?? image, shadows: 0.02, mid: 0.0, highlights: -0.03)
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = curved
+            vignette.intensity = 0.5
+            vignette.radius = 1.6
+            return vignette.outputImage ?? curved
+
+        case .kodachrome64:
+            // Kodachrome 64: the most iconic slide film — warm reds, saturated blues, deep greens
+            // Distinct look: punchy primaries, slightly elevated blacks, unique color rendering
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.3
+            cc.contrast = 1.2
+            cc.brightness = 0.0
+            // Slightly warm — Kodachrome's famous warm cast
+            let warm = CIFilter.temperatureAndTint()
+            warm.inputImage = cc.outputImage
+            warm.neutral = CIVector(x: 6500, y: 0)
+            warm.targetNeutral = CIVector(x: 5800, y: 5)
+            // The Kodachrome color matrix: reds push orange, blues go deep, greens stay rich
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = warm.outputImage
+            matrix.rVector = CIVector(x: 1.15, y: 0.05, z: 0.0,  w: 0)  // warm red push
+            matrix.gVector = CIVector(x: 0.0,  y: 1.0,  z: 0.0,  w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.0,  z: 1.12, w: 0)  // deep blue
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.01, y: 0.0, z: 0.0, w: 0)  // lifted blacks
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.04, mid: 0.0, highlights: -0.04)
+            return claritySharpen(input: curved)
+
+        case .ektachrome100:
+            // Ektachrome E100: cool, clinical slide film — fine detail, punchy blues, accurate colors
+            // Popular for landscapes, aviation, underwater — very different from warm Kodachrome
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 1.2
+            cc.contrast = 1.15
+            cc.brightness = 0.0
+            // Cool balanced — Ektachrome runs cool, blues and cyans are dominant
+            let cool = CIFilter.temperatureAndTint()
+            cool.inputImage = cc.outputImage
+            cool.neutral = CIVector(x: 6500, y: 0)
+            cool.targetNeutral = CIVector(x: 7200, y: -5)  // notably cool
+            // Blue/cyan emphasis — the Ektachrome signature
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cool.outputImage
+            matrix.rVector = CIVector(x: 0.97, y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.05, z: 0.03, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.03, z: 1.15, w: 0)  // electric blue
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.02, mid: 0.0, highlights: -0.05)
+            return claritySharpen(input: curved)
+
+        case .polaroid600:
+            // Polaroid 600: lo-fi instant film — faded, shifted colors, heavy vignette, soft
+            // Colors shift toward blue-green, contrast is low, whites are milky
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 0.75   // muted — Polaroid colors are never punchy
+            cc.contrast = 0.85    // low contrast, milky
+            cc.brightness = 0.04  // lifted — Polaroid overexposes slightly
+            // Cool-green shift characteristic of 600 film
+            let cool = CIFilter.temperatureAndTint()
+            cool.inputImage = cc.outputImage
+            cool.neutral = CIVector(x: 6500, y: 0)
+            cool.targetNeutral = CIVector(x: 7500, y: -12)  // cool + green
+            // Fade and shift: push blue-green into everything, lift shadows
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = cool.outputImage
+            matrix.rVector = CIVector(x: 0.88, y: 0.0,  z: 0.0,  w: 0)   // suppress red
+            matrix.gVector = CIVector(x: 0.0,  y: 1.02, z: 0.04, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.05, z: 1.05, w: 0)
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.02, y: 0.02, z: 0.04, w: 0)  // milky lifted blacks
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.08, mid: 0.02, highlights: -0.01)
+            // Soft blur — Polaroid optics are never sharp
+            let blur = CIFilter.gaussianBlur()
+            blur.inputImage = curved
+            blur.radius = 0.8
+            let softened = blur.outputImage?.cropped(to: image.extent) ?? curved
+            // Heavy vignette — characteristic Polaroid frame darkening
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = softened
+            vignette.intensity = 1.4
+            vignette.radius = 0.9
+            return vignette.outputImage ?? softened
         }
     }
 
@@ -2231,12 +2566,23 @@ final class CameraManager: NSObject, ObservableObject {
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 
-extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     nonisolated func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        // Route audio to writer when recording
+        if output === audioDataOutput {
+            guard cachedIsRecording,
+                  recordingSessionStarted,
+                  let audioIn = audioWriterInput,
+                  audioIn.isReadyForMoreMediaData
+            else { return }
+            audioIn.append(sampleBuffer)
+            return
+        }
+
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         // Long exposure frame stacking
@@ -2265,6 +2611,50 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        // Video recording — bake film sim into frames, capped at 1080p, throttled to 30fps
+        if cachedIsRecording {
+            if !recordingSessionStarted {
+                let w = Int(ciImage.extent.width)
+                let h = Int(ciImage.extent.height)
+                setupAssetWriter(width: w, height: h, startTime: pts)
+                lastRecordFrameTime = 0
+            }
+            let ptsSeconds = CMTimeGetSeconds(pts)
+            if ptsSeconds - lastRecordFrameTime >= (1.0 / 30.0),
+               recordingSessionStarted,
+               let adaptor = pixelBufferAdaptor,
+               let videoIn = videoWriterInput,
+               videoIn.isReadyForMoreMediaData {
+                lastRecordFrameTime = ptsSeconds
+                let maxLong = 1920.0
+                let srcMax = max(ciImage.extent.width, ciImage.extent.height)
+                let recScale = min(1.0, maxLong / srcMax)
+                var rec = recScale < 1.0
+                    ? ciImage.transformed(by: CGAffineTransform(scaleX: recScale, y: recScale))
+                    : ciImage
+                if let cs = activeCustomSim {
+                    rec = applyCustomSim(to: rec, sim: cs)
+                } else {
+                    let saved = pendingSim; pendingSim = cachedSim
+                    rec = applyFilmSim(to: rec)
+                    pendingSim = saved
+                }
+                if cachedCrosstalkEnabled { rec = applyColorCrosstalk(input: rec, amount: cachedCrosstalkAmount) }
+                if cachedHalationEnabled  { rec = applyHalation(input: rec, amount: cachedHalationAmount) }
+                if cachedRolloffEnabled   { rec = applyHighlightRolloff(input: rec, threshold: cachedRolloffThreshold) }
+                if cachedPushPullEnabled  { rec = applyPushPull(input: rec, stops: cachedPushPullAmount) }
+                var pb: CVPixelBuffer?
+                if let pool = adaptor.pixelBufferPool {
+                    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb)
+                }
+                if let pb {
+                    ciContext.render(rec, to: pb)
+                    adaptor.append(pb, withPresentationTime: pts)
+                }
+            }
+        }
 
         // Downscale for preview — half resolution is plenty for screen display
         let previewScale: CGFloat = 0.5
@@ -3189,6 +3579,8 @@ struct CameraContentView: View {
     @State private var sectionShootingExpanded = true
     @State private var sectionDoubleExpExpanded = true
     @State private var sectionQualityExpanded = true
+    @State private var shutterPressTimer: Timer? = nil
+    @State private var shutterIsHolding = false
 
     var body: some View {
         GeometryReader { geo in
@@ -4064,6 +4456,20 @@ struct CameraContentView: View {
                         label: "BLEND"
                     )
                     .frame(width: 72, height: 72)
+                } else if camera.isRecording {
+                    let totalSecs = Int(camera.recordingDuration)
+                    let mins = totalSecs / 60
+                    let secs = totalSecs % 60
+                    VStack(spacing: 2) {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 8, height: 8)
+                        Text(String(format: "%d:%02d", mins, secs))
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.white)
+                    }
+                    .iconRotation(motion.iconAngle)
+                    .frame(width: 72, height: 72)
                 } else if camera.isBursting {
                     VStack(spacing: 2) {
                         Text("\(camera.burstCount)")
@@ -4100,52 +4506,79 @@ struct CameraContentView: View {
     }
 
     private var shutterButton: some View {
-        // Burst mode: hold to burst, tap for single
         ZStack {
             Circle()
-                .stroke(camera.burstMode ? Color.yellow.opacity(0.5) : Color.white.opacity(0.5), lineWidth: 3)
+                .stroke(
+                    camera.isRecording ? Color.red.opacity(0.8) :
+                    camera.burstMode   ? Color.yellow.opacity(0.5) :
+                                         Color.white.opacity(0.5),
+                    lineWidth: 3
+                )
                 .frame(width: 84, height: 84)
-            Circle()
-                .fill(camera.isBursting ? Color.yellow : (camera.isCapturing ? Color.gray : Color.white))
-                .frame(width: 70, height: 70)
-                .scaleEffect(camera.isCapturing && !camera.isBursting ? 0.88 : 1.0)
+            RoundedRectangle(cornerRadius: camera.isRecording ? 8 : 35)
+                .fill(
+                    camera.isRecording  ? Color.red :
+                    camera.isBursting   ? Color.yellow :
+                    camera.isCapturing  ? Color.gray :
+                                          Color.white
+                )
+                .frame(
+                    width:  camera.isRecording ? 28 : 70,
+                    height: camera.isRecording ? 28 : 70
+                )
+                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: camera.isRecording)
                 .animation(.easeInOut(duration: 0.12), value: camera.isCapturing)
-
-            if camera.isCapturing && !camera.isBursting {
-                ProgressView()
-                    .tint(.white)
+            if camera.isCapturing && !camera.isBursting && !camera.isRecording {
+                ProgressView().tint(.white)
             }
-
-            if camera.doubleExposureEnabled && camera.firstExposurePreview != nil {
+            if camera.doubleExposureEnabled && camera.firstExposurePreview != nil && !camera.isRecording {
                 Text("2nd")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(.black)
             }
-
-            if camera.burstMode && !camera.isBursting {
+            if camera.burstMode && !camera.isBursting && !camera.isRecording {
                 Image(systemName: "bolt.circle.fill")
                     .font(.system(size: 14))
                     .foregroundStyle(.black.opacity(0.4))
             }
         }
-        .onTapGesture {
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            if camera.doubleExposureEnabled && camera.firstExposurePreview == nil {
-                camera.captureDoubleExposureFirst()
-            } else {
-                camera.capturePhoto()
-            }
-        }
-        .onLongPressGesture(minimumDuration: 0.3, pressing: { pressing in
-            if camera.burstMode {
-                if pressing {
-                    camera.startBurst()
-                } else {
-                    camera.stopBurst()
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    guard shutterPressTimer == nil, !shutterIsHolding else { return }
+                    shutterPressTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { _ in
+                        shutterIsHolding = true
+                        shutterPressTimer = nil
+                        if camera.burstMode {
+                            camera.startBurst()
+                        } else {
+                            camera.startRecording()
+                        }
+                    }
                 }
-            }
-        }, perform: {})
-        .disabled(camera.isCapturing && !camera.burstMode)
+                .onEnded { _ in
+                    if let t = shutterPressTimer {
+                        t.invalidate()
+                        shutterPressTimer = nil
+                        shutterIsHolding = false
+                        guard !camera.isCapturing else { return }
+                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        if camera.doubleExposureEnabled && camera.firstExposurePreview == nil {
+                            camera.captureDoubleExposureFirst()
+                        } else {
+                            camera.capturePhoto()
+                        }
+                    } else {
+                        shutterIsHolding = false
+                        if camera.burstMode {
+                            camera.stopBurst()
+                        } else if camera.isRecording {
+                            camera.stopRecording()
+                        }
+                    }
+                }
+        )
+        .disabled(camera.isCapturing && !camera.burstMode && !camera.isRecording)
     }
 
 }
