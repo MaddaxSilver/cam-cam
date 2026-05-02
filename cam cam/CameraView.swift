@@ -361,16 +361,17 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var frameOutputQueue = DispatchQueue(label: "cam.frame.output", qos: .userInteractive)
     // Single shared Metal-backed CIContext for all rendering (preview, capture, peaking)
     nonisolated(unsafe) var ciContext: CIContext = {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         guard let device = MTLCreateSystemDefaultDevice() else {
             return CIContext(options: [
                 .useSoftwareRenderer: false,
-                .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
-                .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!
+                .workingColorSpace: p3,
+                .outputColorSpace: p3
             ])
         }
         return CIContext(mtlDevice: device, options: [
-            .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
-            .outputColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
+            .workingColorSpace: p3,
+            .outputColorSpace: p3,
             .cacheIntermediates: false
         ])
     }()
@@ -620,7 +621,6 @@ final class CameraManager: NSObject, ObservableObject {
 
     nonisolated func addVideoDataOutputIfNeeded() {
         guard !videoOutputAdded else { return }
-        videoOutputAdded = true
         session.beginConfiguration()
         videoDataOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -629,6 +629,7 @@ final class CameraManager: NSObject, ObservableObject {
         videoDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
         if session.canAddOutput(videoDataOutput) {
             session.addOutput(videoDataOutput)
+            videoOutputAdded = true
         }
         session.commitConfiguration()
         if let connection = videoDataOutput.connection(with: .video),
@@ -645,7 +646,6 @@ final class CameraManager: NSObject, ObservableObject {
 
     nonisolated func addAudioOutputIfNeeded() {
         guard !audioOutputAdded else { return }
-        audioOutputAdded = true
         let audioSession = AVAudioSession.sharedInstance()
         try? audioSession.setCategory(.playAndRecord, mode: .videoRecording,
                                       options: [.defaultToSpeaker, .allowBluetoothHFP])
@@ -659,11 +659,13 @@ final class CameraManager: NSObject, ObservableObject {
         audioDataOutput.setSampleBufferDelegate(self, queue: frameOutputQueue)
         if session.canAddOutput(audioDataOutput) {
             session.addOutput(audioDataOutput)
+            audioOutputAdded = true
         }
         session.commitConfiguration()
     }
 
     nonisolated func setupAssetWriter(width: Int, height: Int, startTime: CMTime) {
+        guard assetWriter == nil else { return }   // prevent double-init
         let maxLong = 1920
         let scale = min(1.0, Double(maxLong) / Double(max(width, height)))
         let outW = Int(Double(width)  * scale) & ~1
@@ -1168,16 +1170,20 @@ final class CameraManager: NSObject, ObservableObject {
         recordingTimer = nil
         let writer = assetWriter
         let url = recordingOutputURL
-        videoWriterInput?.markAsFinished()
-        audioWriterInput?.markAsFinished()
+        let sessionWasStarted = recordingSessionStarted
+        if sessionWasStarted {
+            videoWriterInput?.markAsFinished()
+            audioWriterInput?.markAsFinished()
+        }
         assetWriter = nil
         videoWriterInput = nil
         audioWriterInput = nil
         pixelBufferAdaptor = nil
         recordingOutputURL = nil
         recordingSessionStarted = false
-        writer?.finishWriting {
-            guard writer?.status == .completed, let url else { return }
+        guard sessionWasStarted, let writer else { return }
+        writer.finishWriting {
+            guard writer.status == .completed, let url else { return }
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }, completionHandler: nil)
@@ -1515,7 +1521,7 @@ final class CameraManager: NSObject, ObservableObject {
             cropped = cropped.oriented(.down)
         }
 
-        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
 
         // Render in Display P3 — use RGBx (no alpha) to halve memory and avoid alpha warning
         guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent, format: .RGBA8, colorSpace: p3) else {
@@ -1916,9 +1922,9 @@ final class CameraManager: NSObject, ObservableObject {
             bloom.intensity = 0.55
             bloom.radius = 18
             let orangeBloom = bloom.outputImage?.cropped(to: image.extent) ?? orangeTinted
-            let screen = CIFilter(name: "CIScreenBlendMode")!
-            screen.setValue(orangeBloom, forKey: kCIInputImageKey)
-            screen.setValue(curved, forKey: kCIInputBackgroundImageKey)
+            let screen = CIFilter.screenBlendMode()
+            screen.inputImage = orangeBloom
+            screen.backgroundImage = curved
             return screen.outputImage?.cropped(to: image.extent) ?? curved
 
         case .kodakVision3:
@@ -2400,7 +2406,7 @@ final class CameraManager: NSObject, ObservableObject {
         let a = max(0, min(0.5, amount))
 
         // 1. Raw pixel noise
-        let noise = CIFilter.randomGenerator().outputImage!.cropped(to: input.extent)
+        guard let noise = CIFilter.randomGenerator().outputImage?.cropped(to: input.extent) else { return input }
 
         // 2. Monochrome, centred at 0.5 so it both lightens and darkens
         let mono = CIFilter.colorControls()
@@ -2897,9 +2903,9 @@ struct CameraPreviewView: UIViewRepresentable {
 
 /// Renders filtered CIImages directly on the GPU via Metal — no CGImage round-trip
 final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
-    private var commandQueue: MTLCommandQueue!
+    private var commandQueue: MTLCommandQueue?
     nonisolated(unsafe) var sharedCIContext: CIContext?
-    private let colorSpace = CGColorSpace(name: CGColorSpace.displayP3)!
+    private let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
     nonisolated(unsafe) var currentImage: CIImage?
 
     func setup(sharedContext: CIContext? = nil) {
@@ -3467,7 +3473,7 @@ class PeakingUIView: UIView {
         colorMatrixFilter.aVector = CIVector(x: 1, y: 0, z: 0, w: 0)
     }
 
-    required init?(coder: NSCoder) { fatalError() }
+    required init?(coder: NSCoder) { return nil }
 
     override func layoutSubviews() {
         super.layoutSubviews()
