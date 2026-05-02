@@ -137,6 +137,7 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
     case nightShot
     case urbanJade
     case kodachrome64, ektachrome100, polaroid600
+    case goldenHaze
 
     var id: String { rawValue }
     var label: String {
@@ -167,6 +168,7 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
         case .kodachrome64:   return "Kodachrome"
         case .ektachrome100:  return "Ektachrome"
         case .polaroid600:    return "Polaroid"
+        case .goldenHaze:     return "Golden Haze"
         }
     }
 }
@@ -2119,6 +2121,47 @@ final class CameraManager: NSObject, ObservableObject {
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
             let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.02, mid: 0.0, highlights: -0.05)
             return claritySharpen(input: curved)
+
+        case .goldenHaze:
+            // Golden Haze: dreamy backlit look — lifted blacks, lush greens, warm glow,
+            // heavy diffusion bloom and Pro-Mist softness. No true shadows, pure luminance.
+            let cc = CIFilter.colorControls()
+            cc.inputImage = image
+            cc.saturation = 0.88   // slightly muted — dreaminess, not pop
+            cc.contrast = 0.82     // low contrast, nothing is crushed
+            cc.brightness = 0.05   // airy, slightly overexposed feel
+            // Warm golden-hour cast
+            let warm = CIFilter.temperatureAndTint()
+            warm.inputImage = cc.outputImage
+            warm.neutral = CIVector(x: 6500, y: 0)
+            warm.targetNeutral = CIVector(x: 5300, y: 6)
+            // Lush green boost + suppress blue for that sunlit foliage look
+            let matrix = CIFilter.colorMatrix()
+            matrix.inputImage = warm.outputImage
+            matrix.rVector = CIVector(x: 1.02, y: 0.02, z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.12, z: 0.0,  w: 0)   // electric foliage
+            matrix.bVector = CIVector(x: 0.0,  y: 0.0,  z: 0.82, w: 0)   // suppress blue
+            matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+            matrix.biasVector = CIVector(x: 0.03, y: 0.025, z: 0.01, w: 0) // milky lifted blacks
+            // Lift shadows hard — no true blacks, everything is luminous
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.12, mid: 0.02, highlights: -0.01)
+            // Heavy bloom — the backlit glow that defines this look
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = curved
+            bloom.intensity = 0.85
+            bloom.radius = 28
+            let bloomed = bloom.outputImage?.cropped(to: image.extent) ?? curved
+            // Pro-Mist style diffusion — very slight gaussian to soften edges
+            let blur = CIFilter.gaussianBlur()
+            blur.inputImage = bloomed
+            blur.radius = 1.5
+            let softened = blur.outputImage?.cropped(to: image.extent) ?? bloomed
+            // Wide soft vignette — just enough to frame without darkening
+            let vignette = CIFilter.vignette()
+            vignette.inputImage = softened
+            vignette.intensity = 0.25
+            vignette.radius = 2.5
+            return vignette.outputImage ?? softened
 
         case .polaroid600:
             // Polaroid 600: lo-fi instant film — faded, shifted colors, heavy vignette, soft
