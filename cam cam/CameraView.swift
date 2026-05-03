@@ -1182,8 +1182,11 @@ final class CameraManager: NSObject, ObservableObject {
         recordingOutputURL = nil
         recordingSessionStarted = false
         guard sessionWasStarted, let writer else { return }
-        writer.finishWriting {
-            guard writer.status == .completed, let url else { return }
+        // AVAssetWriter isn't Sendable — use nonisolated(unsafe) so the compiler
+        // doesn't warn when it's captured inside the @Sendable finishWriting closure.
+        nonisolated(unsafe) let finishWriter = writer
+        finishWriter.finishWriting {
+            guard finishWriter.status == .completed, let url else { return }
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }, completionHandler: nil)
