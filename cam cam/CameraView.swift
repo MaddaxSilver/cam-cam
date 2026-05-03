@@ -3963,6 +3963,23 @@ struct CameraContentView: View {
             HStack(spacing: 6) {
                 Spacer()
 
+                // Flash state pill — visible when flash is not off
+                if camera.flashMode != .off {
+                    HStack(spacing: 4) {
+                        Image(systemName: camera.flashMode == .auto ? "bolt.badge.automatic" : "bolt.fill")
+                            .font(.system(size: 10))
+                        Text(camera.flashLabel)
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(
+                        Capsule()
+                            .fill(Color.yellow)
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
+
                 // Blend % pill — visible when double exposure is active
                 if camera.doubleExposureEnabled {
                     Text("BLEND \(Int(camera.doubleExposureOpacity * 100))%")
