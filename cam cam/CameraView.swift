@@ -3960,8 +3960,23 @@ struct CameraContentView: View {
             }
 
             // View options button + dropdown
-            HStack {
+            HStack(spacing: 6) {
                 Spacer()
+
+                // Blend % pill — visible when double exposure is active
+                if camera.doubleExposureEnabled {
+                    Text("BLEND \(Int(camera.doubleExposureOpacity * 100))%")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.4))
+                                .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
+
                 Button {
                     withAnimation(.spring(duration: 0.25)) { showViewMenu.toggle() }
                 } label: {
@@ -4571,7 +4586,7 @@ struct CameraContentView: View {
             .buttonStyle(.plain)
             .offset(x: 72)
 
-            // Left side: EV dial + flash
+            // Left side: EV dial
             HStack {
                 ExposureDial(
                     value: Binding(
@@ -4581,41 +4596,32 @@ struct CameraContentView: View {
                     range: -3.0...3.0
                 )
                 .frame(width: 72, height: 72)
-
-                Button {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    camera.toggleFlash()
-                } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
-                            .font(.system(size: 16))
-                        Text(camera.flashLabel)
-                            .font(.system(size: 10, weight: .semibold))
-                    }
-                    .iconRotation(motion.iconAngle)
-                    .foregroundStyle(camera.flashMode == .on ? .yellow : (camera.flashMode == .off ? .white.opacity(0.4) : .white))
-                    .frame(width: 44, height: 38)
-                    .background(
-                        Capsule()
-                            .fill(Color.black.opacity(0.45))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.3), lineWidth: 1))
-                    )
-                }
-                .buttonStyle(.plain)
-
                 Spacer()
             }
+
+            // Flash button — left of shutter, same style as zoom button
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                camera.toggleFlash()
+            } label: {
+                Image(systemName: camera.flashMode == .off ? "bolt.slash.fill" : (camera.flashMode == .on ? "bolt.fill" : "bolt.badge.automatic"))
+                    .font(.system(size: 13))
+                    .iconRotation(motion.iconAngle)
+                    .foregroundStyle(camera.flashMode == .on ? .black : (camera.flashMode == .auto ? .black : .white))
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle()
+                            .fill(camera.flashMode != .off ? Color.yellow : Color.white.opacity(0.18))
+                            .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 1))
+                    )
+            }
+            .buttonStyle(.plain)
+            .offset(x: -72)
 
             // Right side: flip camera + opacity dial or burst count
             HStack {
                 Spacer()
-                if camera.doubleExposureEnabled {
-                    OpacityDial(
-                        value: $camera.doubleExposureOpacity,
-                        label: "BLEND"
-                    )
-                    .frame(width: 72, height: 72)
-                } else if camera.isRecording {
+                if camera.isRecording {
                     let totalSecs = Int(camera.recordingDuration)
                     let mins = totalSecs / 60
                     let secs = totalSecs % 60
