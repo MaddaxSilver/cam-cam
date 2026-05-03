@@ -1240,16 +1240,10 @@ final class CameraManager: NSObject, ObservableObject {
         let step: CGFloat = 0.2
         let next = up ? min(currentZoomFactor + step, 10.0)
                       : max(currentZoomFactor - step, 0.5)
-        guard let device = currentDevice else { return }
-        let baseMM: Double = switch device.deviceType {
-        case .builtInUltraWideCamera: 13.0
-        case .builtInTelephotoCamera: 120.0
-        default: 26.0
-        }
-        let deviceZoom = CGFloat((26.0 * Double(next)) / baseMM)
+        // Use the same path as the slider (direct videoZoomFactor assignment)
+        // so it can't be cancelled by competing session operations like ramp() can.
+        setZoomOnCurrentLens(next)
         currentZoomFactor = next
-        selectedFocalIndex = -1
-        sessionQueue.async { self.animateZoom(to: deviceZoom, on: device, duration: 0.18) }
     }
 
     func setZoomOnCurrentLens(_ factor: CGFloat) {
