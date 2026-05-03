@@ -1621,7 +1621,12 @@ final class CameraManager: NSObject, ObservableObject {
 
         // Grain (push adds extra grain)
         // DigiCam routes through addDigitalNoise to keep its CCD character separate from film grain
-        let isDigiCam = pendingCustomSim == nil && pendingSim == .digiCam
+        // Use switch (not ==) to avoid triggering CustomSimulation's @MainActor Equatable conformance
+        let isDigiCam: Bool
+        switch pendingCustomSim {
+        case .none:  isDigiCam = pendingSim == .digiCam
+        case .some:  isDigiCam = false
+        }
         if pendingGrainEnabled && pendingGrain > 0 {
             let pushExtra: Float = pendingPushPullEnabled ? max(0, pendingPushPullAmount * 0.08) : 0
             var grainAmt = pendingGrain + pushExtra
