@@ -253,6 +253,9 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var grainEnabled: Bool = false {
         didSet { UserDefaults.standard.set(grainEnabled, forKey: "cc_grainEnabled") }
     }
+    @Published var contextAwareGrainEnabled: Bool = false {
+        didSet { UserDefaults.standard.set(contextAwareGrainEnabled, forKey: "cc_contextAwareGrain") }
+    }
     @Published var exposureBias: Float = 0.0
     @Published var isoValue: Float = 100.0
     @Published var shutterSpeed: Double = 1.0 / 60.0
@@ -336,6 +339,7 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var recordingDuration: TimeInterval = 0
     @Published var burstCount: Int = 0
     @Published var currentZoomFactor: CGFloat = 1.0
+    @Published var showZoomSlider: Bool = false
     @Published var currentMM: Int = 28
     @Published var isFrontCamera: Bool = false
     @Published var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality
@@ -405,6 +409,7 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated(unsafe) var pendingIsLandscape: Bool = false
     nonisolated(unsafe) var pendingDeviceAngle: Double = 0
     nonisolated(unsafe) var pendingGrainEnabled: Bool = false
+    nonisolated(unsafe) var pendingContextAwareGrain: Bool = false
     nonisolated(unsafe) var pendingISO: Float = 100
     nonisolated(unsafe) var pendingCrosstalk: Float = 0.1
     nonisolated(unsafe) var pendingHalation: Float = 0.2
@@ -456,6 +461,7 @@ final class CameraManager: NSObject, ObservableObject {
         let arRaw          = ud.string(forKey: "cc_aspectRatio")
         let grainEnabled   = ud.object(forKey: "cc_grainEnabled")   != nil ? ud.bool(forKey: "cc_grainEnabled")   : nil as Bool?
         let grainAmount    = ud.object(forKey: "cc_grainAmount")    != nil ? ud.float(forKey: "cc_grainAmount")   : nil as Float?
+        let contextAwareGrain = ud.object(forKey: "cc_contextAwareGrain") != nil ? ud.bool(forKey: "cc_contextAwareGrain") : nil as Bool?
         let showGrid       = ud.object(forKey: "cc_showGrid")       != nil ? ud.bool(forKey: "cc_showGrid")       : nil as Bool?
         let showLevel      = ud.object(forKey: "cc_showLevel")      != nil ? ud.bool(forKey: "cc_showLevel")      : nil as Bool?
         let showPeaking    = ud.object(forKey: "cc_showPeaking")    != nil ? ud.bool(forKey: "cc_showPeaking")    : nil as Bool?
@@ -483,6 +489,7 @@ final class CameraManager: NSObject, ObservableObject {
             if let raw = arRaw, let ar = AspectRatio(rawValue: raw) { self.selectedAspectRatio = ar }
             if let v = grainEnabled   { self.grainEnabled = v }
             if let v = grainAmount    { self.grainAmount = v }
+            if let v = contextAwareGrain { self.contextAwareGrainEnabled = v }
             if let v = showGrid       { self.showGrid = v }
             if let v = showLevel      { self.showLevel = v }
             if let v = showPeaking    { self.showPeaking = v }
@@ -1036,6 +1043,7 @@ final class CameraManager: NSObject, ObservableObject {
         pendingIsLandscape = isLandscape
         pendingDeviceAngle = deviceAngle
         pendingGrainEnabled = grainEnabled
+        pendingContextAwareGrain = contextAwareGrainEnabled
         pendingISO = isoValue
         pendingCrosstalk = crosstalkAmount
         pendingHalation = halationAmount
@@ -1123,6 +1131,7 @@ final class CameraManager: NSObject, ObservableObject {
         pendingCustomSim = activeCustomSim
         pendingGrain = grainAmount
         pendingGrainEnabled = grainEnabled
+        pendingContextAwareGrain = contextAwareGrainEnabled
         pendingAspectRatio = selectedAspectRatio
         pendingIsLandscape = isLandscape
         pendingDeviceAngle = deviceAngle
@@ -1611,9 +1620,38 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         // Grain (push adds extra grain)
+        // DigiCam routes through addDigitalNoise to keep its CCD character separate from film grain
+        let isDigiCam = pendingCustomSim == nil && pendingSim == .digiCam
         if pendingGrainEnabled && pendingGrain > 0 {
             let pushExtra: Float = pendingPushPullEnabled ? max(0, pendingPushPullAmount * 0.08) : 0
-            image = addGrain(input: image, amount: pendingGrain + pushExtra)
+            var grainAmt = pendingGrain + pushExtra
+
+            // Context-aware grain: scale amount by inverse of scene luminance
+            // Dark scenes → more grain (like underexposed film), bright scenes → less
+            if pendingContextAwareGrain {
+                let avgFilter = CIFilter.areaAverage()
+                avgFilter.inputImage = image
+                avgFilter.extent = image.extent
+                if let avgImg = avgFilter.outputImage {
+                    var bitmap = [UInt8](repeating: 0, count: 4)
+                    ciContext.render(avgImg,
+                                    toBitmap: &bitmap,
+                                    rowBytes: 4,
+                                    bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                                    format: .RGBA8,
+                                    colorSpace: CGColorSpaceCreateDeviceRGB())
+                    let luma = (Float(bitmap[0]) * 0.299 + Float(bitmap[1]) * 0.587 + Float(bitmap[2]) * 0.114) / 255.0
+                    // Dark (luma≈0) → 1.7x, mid (luma≈0.5) → 1.0x, bright (luma≈1.0) → 0.4x
+                    let scale = 1.7 - luma * 1.3
+                    grainAmt = min(0.5, grainAmt * scale)
+                }
+            }
+
+            if isDigiCam {
+                image = addDigitalNoise(input: image, amount: grainAmt)
+            } else {
+                image = addGrain(input: image, amount: grainAmt)
+            }
         } else if pendingPushPullEnabled && pendingPushPullAmount > 0 {
             // Even with grain off, push adds a small amount of grain
             image = addGrain(input: image, amount: pendingPushPullAmount * 0.06)
@@ -1818,7 +1856,9 @@ final class CameraManager: NSObject, ObservableObject {
             let blur = CIFilter.gaussianBlur()
             blur.inputImage = crushed
             blur.radius = 0.5
-            return blur.outputImage?.cropped(to: image.extent) ?? crushed
+            let blurred = blur.outputImage?.cropped(to: image.extent) ?? crushed
+            // Baked-in digital CCD baseline noise — always present, distinct from film grain
+            return addDigitalNoise(input: blurred, amount: 0.12)
 
         case .nightShot:
             // Night shot: infrared-ish green cast, blown highlights
@@ -2440,6 +2480,40 @@ final class CameraManager: NSObject, ObservableObject {
         return mix?.outputImage?.cropped(to: input.extent) ?? blended
     }
 
+    /// Sharp CCD-style digital noise — no blur, slight chroma component.
+    /// Used by DigiCam instead of the film-grain pipeline.
+    nonisolated func addDigitalNoise(input: CIImage, amount: Float) -> CIImage {
+        guard amount > 0 else { return input }
+        let a = max(0, min(0.5, amount))
+
+        // 1. Raw random noise — keep it sharp (no blur = digital pixel noise)
+        guard let noise = CIFilter.randomGenerator().outputImage?.cropped(to: input.extent) else { return input }
+
+        // 2. Slight colour cast so it reads as CCD chroma noise (faint red/blue channels)
+        let colorMatrix = CIFilter.colorMatrix()
+        colorMatrix.inputImage = noise
+        colorMatrix.rVector = CIVector(x: CGFloat(0.5 + a * 0.3), y: 0, z: 0, w: 0)
+        colorMatrix.gVector = CIVector(x: 0, y: CGFloat(0.45), z: 0, w: 0)
+        colorMatrix.bVector = CIVector(x: 0, y: 0, z: CGFloat(0.5 + a * 0.3), w: 0)
+        colorMatrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+        colorMatrix.biasVector = CIVector(x: -0.25, y: -0.225, z: -0.25, w: 0)
+        guard let colorNoise = colorMatrix.outputImage?.cropped(to: input.extent) else { return input }
+
+        // 3. Screen blend (brightens selectively — looks like sensor hot pixels / amp noise)
+        let screen = CIFilter.screenBlendMode()
+        screen.inputImage = colorNoise
+        screen.backgroundImage = input
+        guard let screened = screen.outputImage?.cropped(to: input.extent) else { return input }
+
+        // 4. Mix: low amounts stay subtle, high amounts get gritty
+        let mix = CIFilter(name: "CIDissolveTransition", parameters: [
+            kCIInputImageKey: screened,
+            kCIInputTargetImageKey: input,
+            "inputTime": NSNumber(value: 1.0 - Double(a) * 1.8)
+        ])
+        return mix?.outputImage?.cropped(to: input.extent) ?? screened
+    }
+
     nonisolated func applyColorCrosstalk(input: CIImage, amount: Float) -> CIImage {
         let a = CGFloat(max(0, min(0.2, amount)))
         let r = CIVector(x: 1 - a, y: a * 0.5, z: a * 0.5, w: 0)
@@ -2585,6 +2659,7 @@ final class CameraManager: NSObject, ObservableObject {
         pendingCustomSim = activeCustomSim
         pendingGrain = grainAmount
         pendingGrainEnabled = grainEnabled
+        pendingContextAwareGrain = contextAwareGrainEnabled
         pendingCrosstalk = crosstalkAmount
         pendingCrosstalkEnabled = crosstalkEnabled
         pendingHalation = halationAmount
@@ -3621,7 +3696,7 @@ struct CameraContentView: View {
     @State private var focusPoint: CGPoint?
     @State private var showFocusIndicator = false
     @State private var showViewMenu = false
-    @State private var showZoomSlider = false
+    // showZoomSlider lives on camera so volume callbacks can check it
     @State private var zoomSliderValue: Double = 1.0
     @State private var isDraggingZoom = false
     @State private var showCustomSimEditor = false
@@ -3724,7 +3799,12 @@ struct CameraContentView: View {
             let evStep: Float = 0.33
             let opacityStep: Double = 0.1
             volumeObserver.onVolumeUp = {
-                if camera.doubleExposureEnabled {
+                if camera.showZoomSlider {
+                    // Manual zoom mode: volume steps zoom up by 0.2x per press
+                    let next = min(camera.currentZoomFactor + 0.2, 10.0)
+                    camera.setZoom(next)
+                    camera.currentZoomFactor = next
+                } else if camera.doubleExposureEnabled {
                     camera.doubleExposureOpacity = min(camera.doubleExposureOpacity + opacityStep, 1.0)
                 } else {
                     let newBias = min(camera.exposureBias + evStep, 3.0)
@@ -3732,7 +3812,12 @@ struct CameraContentView: View {
                 }
             }
             volumeObserver.onVolumeDown = {
-                if camera.doubleExposureEnabled {
+                if camera.showZoomSlider {
+                    // Manual zoom mode: volume steps zoom down by 0.2x per press
+                    let next = max(camera.currentZoomFactor - 0.2, 0.5)
+                    camera.setZoom(next)
+                    camera.currentZoomFactor = next
+                } else if camera.doubleExposureEnabled {
                     camera.doubleExposureOpacity = max(camera.doubleExposureOpacity - opacityStep, 0.0)
                 } else {
                     let newBias = max(camera.exposureBias - evStep, -3.0)
@@ -4197,7 +4282,7 @@ struct CameraContentView: View {
             .padding(.horizontal, 8)
 
             // Zoom slider (iPhone-style, toggleable)
-            if showZoomSlider {
+            if camera.showZoomSlider {
                 VStack(spacing: 6) {
                     Text("\(Int(round(26.0 * zoomSliderValue)))mm")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
@@ -4222,6 +4307,12 @@ struct CameraContentView: View {
                 }
                 .padding(.horizontal, 8)
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .onReceive(camera.$currentZoomFactor) { factor in
+                    let rounded = Double(factor)
+                    if abs(rounded - zoomSliderValue) > 0.05 {
+                        zoomSliderValue = rounded
+                    }
+                }
             }
 
             // Focal length presets
@@ -4357,6 +4448,8 @@ struct CameraContentView: View {
                 HStack(spacing: 10) {
                     Button {
                         camera.grainEnabled.toggle()
+                        // Context-aware requires grain to be on
+                        if !camera.grainEnabled { camera.contextAwareGrainEnabled = false }
                     } label: {
                         Image(systemName: camera.grainEnabled ? "circle.grid.3x3.fill" : "circle.grid.3x3")
                             .font(.system(size: 16))
@@ -4371,6 +4464,18 @@ struct CameraContentView: View {
                         Image(systemName: "circle.grid.3x3.fill")
                             .font(.system(size: 14))
                             .foregroundStyle(.white.opacity(0.6))
+
+                        // Context-aware grain button — only active when grain is on
+                        Button {
+                            camera.contextAwareGrainEnabled.toggle()
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Image(systemName: camera.contextAwareGrainEnabled ? "waveform.badge.magnifyingglass" : "waveform")
+                                .font(.system(size: 14))
+                                .iconRotation(motion.iconAngle)
+                                .foregroundStyle(camera.contextAwareGrainEnabled ? .yellow : .white.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, 8)
@@ -4443,8 +4548,8 @@ struct CameraContentView: View {
             // Zoom toggle button — right of shutter
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    showZoomSlider.toggle()
-                    if showZoomSlider {
+                    camera.showZoomSlider.toggle()
+                    if camera.showZoomSlider {
                         camera.syncZoomState()
                         zoomSliderValue = Double(camera.currentZoomFactor)
                     }
@@ -4453,11 +4558,11 @@ struct CameraContentView: View {
                 Image(systemName: "plus.magnifyingglass")
                     .font(.system(size: 13))
                     .iconRotation(motion.iconAngle)
-                    .foregroundStyle(showZoomSlider ? .black : .white)
+                    .foregroundStyle(camera.showZoomSlider ? .black : .white)
                     .frame(width: 36, height: 36)
                     .background(
                         Circle()
-                            .fill(showZoomSlider ? Color.yellow : Color.white.opacity(0.18))
+                            .fill(camera.showZoomSlider ? Color.yellow : Color.white.opacity(0.18))
                             .overlay(Circle().stroke(Color.white.opacity(0.2), lineWidth: 1))
                     )
             }
