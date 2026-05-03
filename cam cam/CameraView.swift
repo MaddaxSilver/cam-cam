@@ -819,7 +819,8 @@ final class CameraManager: NSObject, ObservableObject {
             try device.lockForConfiguration()
             let clamped = max(device.minAvailableVideoZoomFactor,
                               min(factor, device.maxAvailableVideoZoomFactor))
-            device.ramp(toVideoZoomFactor: clamped, withRate: Float(abs(device.videoZoomFactor - clamped) / CGFloat(duration)))
+            let rate = Float(abs(device.videoZoomFactor - clamped) / CGFloat(max(duration, 0.01)))
+            device.ramp(toVideoZoomFactor: clamped, withRate: max(0.1, min(rate, 100.0)))
             device.unlockForConfiguration()
         } catch {}
     }
@@ -909,20 +910,22 @@ final class CameraManager: NSObject, ObservableObject {
     nonisolated func startEVObservation() {
         guard let device = currentDevice else { return }
         evObservation?.invalidate()
-        evTimer?.invalidate()
-
-        // Poll ISO + shutter speed to compute scene EV
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+        // Timer must be created and added to RunLoop.main on the main thread
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let iso = device.iso
-            let duration = device.exposureDuration.seconds
-            guard duration > 0 else { return }
-            // EV = log2(100/ISO) + log2(1/duration) — maps to roughly -3..+3 for typical scenes
-            let ev = log2(100.0 / Float(iso)) + log2(Float(1.0 / duration))
-            DispatchQueue.main.async { self.evReading = ev }
+            self.evTimer?.invalidate()
+            let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                let iso = device.iso
+                let duration = device.exposureDuration.seconds
+                guard duration > 0 else { return }
+                // EV = log2(100/ISO) + log2(1/duration) — maps to roughly -3..+3 for typical scenes
+                let ev = log2(100.0 / Float(iso)) + log2(Float(1.0 / duration))
+                self.evReading = ev  // already on main
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.evTimer = timer
         }
-        RunLoop.main.add(timer, forMode: .common)
-        evTimer = timer
     }
 
     // MARK: Focus and Exposure
@@ -1382,12 +1385,14 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     nonisolated func finishFrameStack() {
-        guard !frameStack.isEmpty else {
+        // Take a local snapshot atomically before any guard so a concurrent
+        // append on frameOutputQueue can't empty the array between the check and use.
+        let stack = frameStack
+        frameStack.removeAll()
+        guard !stack.isEmpty else {
             DispatchQueue.main.async { self.isCapturing = false }
             return
         }
-        let stack = frameStack
-        frameStack.removeAll()
         let extent = stack[0].extent
         let count = Float(stack.count)
 
@@ -2930,12 +2935,13 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
 
 final class PreviewUIView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    var previewLayer: AVCaptureVideoPreviewLayer? { layer as? AVCaptureVideoPreviewLayer }
 
     private var observation: NSKeyValueObservation?
     private var snapshotView: UIView?
 
     func configure(session: AVCaptureSession) {
+        guard let previewLayer else { return }
         previewLayer.session = session
         previewLayer.videoGravity = .resizeAspectFill
         applyRotation()
@@ -2947,7 +2953,7 @@ final class PreviewUIView: UIView {
     }
 
     func applyRotation() {
-        if let conn = previewLayer.connection,
+        if let conn = previewLayer?.connection,
            conn.isVideoRotationAngleSupported(90) {
             conn.videoRotationAngle = 90
         }
@@ -3651,6 +3657,9 @@ final class VolumeButtonObserver: ObservableObject {
     }
 
     private func activateSession() {
+        // Don't override the .playAndRecord category if recording is in progress
+        let current = session.category
+        guard current != .playAndRecord else { return }
         try? session.setCategory(.playback, options: .mixWithOthers)
         try? session.setActive(true, options: .notifyOthersOnDeactivation)
     }
@@ -3721,6 +3730,7 @@ struct CameraContentView: View {
     @State private var showViewMenu = false
     // showZoomSlider lives on camera so volume callbacks can check it
     @State private var zoomSliderValue: Double = 1.0
+    @State private var zoomDebounceWork: DispatchWorkItem? = nil
     @State private var isDraggingZoom = false
     @State private var showCustomSimEditor = false
     @State private var editingSim: CustomSimulation?
@@ -3844,6 +3854,8 @@ struct CameraContentView: View {
         }
         .onDisappear {
             motion.stopUpdates()
+            shutterPressTimer?.invalidate()
+            shutterPressTimer = nil
         }
     }
 
@@ -4329,10 +4341,15 @@ struct CameraContentView: View {
                         Slider(value: $zoomSliderValue, in: 0.5...10.0)
                             .tint(.yellow)
                             .onChange(of: zoomSliderValue) { _, newValue in
+                                // Live update on current lens while dragging
                                 camera.setZoomOnCurrentLens(CGFloat(newValue))
-                            }
-                            .onReceive(Just(zoomSliderValue).debounce(for: .milliseconds(300), scheduler: RunLoop.main)) { value in
-                                camera.setZoom(CGFloat(value))
+                                // Debounce lens swap: cancel previous work, schedule new one
+                                zoomDebounceWork?.cancel()
+                                let work = DispatchWorkItem {
+                                    camera.setZoom(CGFloat(newValue))
+                                }
+                                zoomDebounceWork = work
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
                             }
                         Text("10x")
                             .font(.system(size: 10))

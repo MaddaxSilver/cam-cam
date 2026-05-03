@@ -1,8 +1,8 @@
 import SwiftUI
 
 struct SplashView: View {
-    @State private var phase: SplashPhase = .idle
     @State private var showCamera = false
+    @State private var animationTask: Task<Void, Never>? = nil
 
     // Image
     @State private var logoOpacity: Double = 0
@@ -14,8 +14,6 @@ struct SplashView: View {
 
     // Vignette that closes in at the end
     @State private var vignetteOpacity: Double = 0
-
-    enum SplashPhase { case idle, running, done }
 
     var body: some View {
         if showCamera {
@@ -35,7 +33,7 @@ struct SplashView: View {
                     .scaleEffect(logoScale)
                     .blur(radius: logoBlur)
 
-                // Hard white strobe layer
+                // Soft flash overlay
                 Color.white
                     .ignoresSafeArea()
                     .opacity(flashOpacity)
@@ -48,17 +46,20 @@ struct SplashView: View {
                     .allowsHitTesting(false)
             }
             .onAppear {
-                guard phase == .idle else { return }
-                phase = .running
-                runAnimation()
+                guard animationTask == nil else { return }
+                animationTask = Task { await runAnimation() }
+            }
+            .onDisappear {
+                animationTask?.cancel()
+                animationTask = nil
             }
         }
     }
 
     // MARK: - Animation sequence
 
-    private func runAnimation() {
-
+    @MainActor
+    private func runAnimation() async {
         // ── Single soft flash + logo fades in (0 → 0.25s) ──
         withAnimation(.easeOut(duration: 0.25)) {
             flashOpacity = 0.35
@@ -82,11 +83,14 @@ struct SplashView: View {
             vignetteOpacity = 1.0
         }
 
-        // ── Switch to camera (1.60s) ──
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.60) {
-            withAnimation(.easeIn(duration: 0.2)) {
-                showCamera = true
-            }
+        // ── Switch to camera (1.60s) — cancellable sleep ──
+        do {
+            try await Task.sleep(for: .seconds(1.60))
+        } catch {
+            return  // task was cancelled (e.g. view disappeared)
+        }
+        withAnimation(.easeIn(duration: 0.2)) {
+            showCamera = true
         }
     }
 }
