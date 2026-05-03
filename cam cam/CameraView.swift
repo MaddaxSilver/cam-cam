@@ -3947,6 +3947,16 @@ struct CameraContentView: View {
                     camera.isLongExposure.toggle()
                 }
 
+                TopPill(
+                    icon: "viewfinder",
+                    text: camera.manualFocusEnabled ? "MF" : "AF",
+                    isActive: camera.manualFocusEnabled
+                )
+                .onTapGesture {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    camera.manualFocusEnabled.toggle()
+                }
+
             }
 
             // View options button + dropdown
@@ -4004,7 +4014,6 @@ struct CameraContentView: View {
                                 viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
                                 viewMenuToggle(icon: "level", title: "Level", isOn: $camera.showLevel)
                                 viewMenuToggle(icon: "eye", title: "Peaking", isOn: $camera.showPeaking)
-                                viewMenuToggle(icon: "viewfinder", title: "MF", isOn: $camera.manualFocusEnabled)
                             }
                             .padding(.bottom, 6)
                             .transition(.opacity.combined(with: .move(edge: .top)))
