@@ -4261,6 +4261,28 @@ struct CameraContentView: View {
 
     private var bottomSection: some View {
         VStack(spacing: 16) {
+            // MF focus slider — shown when MF is active (toggled from dropdown)
+            if camera.manualFocusEnabled {
+                HStack(spacing: 6) {
+                    Text("Near")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.5))
+                    Slider(
+                        value: Binding(
+                            get: { camera.manualFocusValue },
+                            set: { camera.setManualFocus($0) }
+                        ),
+                        in: 0...1
+                    )
+                    .tint(.yellow)
+                    Text("Far")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                .padding(.horizontal, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             // Zoom slider (iPhone-style, toggleable)
             if camera.showZoomSlider {
                 VStack(spacing: 6) {
