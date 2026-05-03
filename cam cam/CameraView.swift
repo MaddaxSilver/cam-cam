@@ -340,6 +340,7 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var burstCount: Int = 0
     @Published var currentZoomFactor: CGFloat = 1.0
     @Published var showZoomSlider: Bool = false
+    @Published var zoomSliderValue: Double = 1.0
     @Published var currentMM: Int = 28
     @Published var isFrontCamera: Bool = false
     @Published var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality
@@ -1237,13 +1238,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// Volume-button zoom: steps by ±0.2× and smoothly ramps to the new level
     /// using ramp(toVideoZoomFactor:) — stays on current lens, no snap.
     func stepManualZoom(up: Bool) {
-        let step: CGFloat = 0.2
-        let next = up ? min(currentZoomFactor + step, 10.0)
-                      : max(currentZoomFactor - step, 0.5)
-        // Use the same path as the slider (direct videoZoomFactor assignment)
-        // so it can't be cancelled by competing session operations like ramp() can.
-        setZoomOnCurrentLens(next)
-        currentZoomFactor = next
+        let step = 0.2
+        let next = up ? min(zoomSliderValue + step, 10.0)
+                      : max(zoomSliderValue - step, 0.5)
+        // Drive zoomSliderValue directly — the slider's onChange handles
+        // setZoomOnCurrentLens and the debounced lens swap automatically.
+        zoomSliderValue = next
     }
 
     func setZoomOnCurrentLens(_ factor: CGFloat) {
@@ -3651,9 +3651,6 @@ final class VolumeButtonObserver: ObservableObject {
     }
 
     private func activateSession() {
-        // Don't override the .playAndRecord category if recording is in progress
-        let current = session.category
-        guard current != .playAndRecord else { return }
         try? session.setCategory(.playback, options: .mixWithOthers)
         try? session.setActive(true, options: .notifyOthersOnDeactivation)
     }
@@ -3723,7 +3720,6 @@ struct CameraContentView: View {
     @State private var showFocusIndicator = false
     @State private var showViewMenu = false
     // showZoomSlider lives on camera so volume callbacks can check it
-    @State private var zoomSliderValue: Double = 1.0
     @State private var zoomDebounceWork: DispatchWorkItem? = nil
     @State private var isDraggingZoom = false
     @State private var showCustomSimEditor = false
@@ -4324,7 +4320,7 @@ struct CameraContentView: View {
             // Zoom slider (iPhone-style, toggleable)
             if camera.showZoomSlider {
                 VStack(spacing: 6) {
-                    Text("\(Int(round(26.0 * zoomSliderValue)))mm")
+                    Text("\(Int(round(26.0 * camera.zoomSliderValue)))mm")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundStyle(.yellow)
 
@@ -4332,9 +4328,9 @@ struct CameraContentView: View {
                         Text("0.5x")
                             .font(.system(size: 10))
                             .foregroundStyle(.white.opacity(0.5))
-                        Slider(value: $zoomSliderValue, in: 0.5...10.0)
+                        Slider(value: $camera.zoomSliderValue, in: 0.5...10.0)
                             .tint(.yellow)
-                            .onChange(of: zoomSliderValue) { _, newValue in
+                            .onChange(of: camera.zoomSliderValue) { _, newValue in
                                 // Live update on current lens while dragging
                                 camera.setZoomOnCurrentLens(CGFloat(newValue))
                                 // Debounce lens swap: cancel previous work, schedule new one
@@ -4352,12 +4348,6 @@ struct CameraContentView: View {
                 }
                 .padding(.horizontal, 8)
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
-                .onReceive(camera.$currentZoomFactor) { factor in
-                    let rounded = Double(factor)
-                    if abs(rounded - zoomSliderValue) > 0.05 {
-                        zoomSliderValue = rounded
-                    }
-                }
             }
 
             // Focal length presets
@@ -4596,7 +4586,7 @@ struct CameraContentView: View {
                     camera.showZoomSlider.toggle()
                     if camera.showZoomSlider {
                         camera.syncZoomState()
-                        zoomSliderValue = Double(camera.currentZoomFactor)
+                        camera.zoomSliderValue = Double(camera.currentZoomFactor)
                     }
                 }
             } label: {
