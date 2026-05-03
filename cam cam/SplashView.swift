@@ -29,6 +29,7 @@ struct SplashView: View {
                 Image("SplashLogo")
                     .resizable()
                     .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(72)
                     .opacity(logoOpacity)
                     .scaleEffect(logoScale)
