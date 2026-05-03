@@ -1231,6 +1231,24 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: Smooth Zoom
 
     /// Fast zoom on current lens only — no device swap, safe to call rapidly from slider
+    /// Volume-button zoom: steps by ±0.2× and smoothly ramps to the new level
+    /// using ramp(toVideoZoomFactor:) — stays on current lens, no snap.
+    func stepManualZoom(up: Bool) {
+        let step: CGFloat = 0.2
+        let next = up ? min(currentZoomFactor + step, 10.0)
+                      : max(currentZoomFactor - step, 0.5)
+        guard let device = currentDevice else { return }
+        let baseMM: Double = switch device.deviceType {
+        case .builtInUltraWideCamera: 13.0
+        case .builtInTelephotoCamera: 120.0
+        default: 26.0
+        }
+        let deviceZoom = CGFloat((26.0 * Double(next)) / baseMM)
+        currentZoomFactor = next
+        selectedFocalIndex = -1
+        sessionQueue.async { self.animateZoom(to: deviceZoom, on: device, duration: 0.18) }
+    }
+
     func setZoomOnCurrentLens(_ factor: CGFloat) {
         guard let device = currentDevice else { return }
         let baseMM: Double = switch device.deviceType {
@@ -3805,10 +3823,7 @@ struct CameraContentView: View {
             let opacityStep: Double = 0.1
             volumeObserver.onVolumeUp = {
                 if camera.showZoomSlider {
-                    // Manual zoom mode: volume steps zoom up by 0.2x per press
-                    let next = min(camera.currentZoomFactor + 0.2, 10.0)
-                    camera.setZoom(next)
-                    camera.currentZoomFactor = next
+                    camera.stepManualZoom(up: true)
                 } else if camera.doubleExposureEnabled {
                     camera.doubleExposureOpacity = min(camera.doubleExposureOpacity + opacityStep, 1.0)
                 } else {
@@ -3818,10 +3833,7 @@ struct CameraContentView: View {
             }
             volumeObserver.onVolumeDown = {
                 if camera.showZoomSlider {
-                    // Manual zoom mode: volume steps zoom down by 0.2x per press
-                    let next = max(camera.currentZoomFactor - 0.2, 0.5)
-                    camera.setZoom(next)
-                    camera.currentZoomFactor = next
+                    camera.stepManualZoom(up: false)
                 } else if camera.doubleExposureEnabled {
                     camera.doubleExposureOpacity = max(camera.doubleExposureOpacity - opacityStep, 0.0)
                 } else {
@@ -4249,43 +4261,6 @@ struct CameraContentView: View {
 
     private var bottomSection: some View {
         VStack(spacing: 16) {
-            // MF toggle + slider row
-            HStack(spacing: 12) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        camera.manualFocusEnabled.toggle()
-                    }
-                } label: {
-                    Text("MF")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(camera.manualFocusEnabled ? .black : .white)
-                        .frame(width: 38, height: 30)
-                        .background(Capsule().fill(camera.manualFocusEnabled ? Color.yellow : Color.white.opacity(0.18)))
-                }
-                .buttonStyle(.plain)
-
-                if camera.manualFocusEnabled {
-                    HStack(spacing: 6) {
-                        Text("Near")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.5))
-                        Slider(
-                            value: Binding(
-                                get: { camera.manualFocusValue },
-                                set: { camera.setManualFocus($0) }
-                            ),
-                            in: 0...1
-                        )
-                        .tint(.yellow)
-                        Text("Far")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.5))
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .trailing)))
-                }
-            }
-            .padding(.horizontal, 8)
-
             // Zoom slider (iPhone-style, toggleable)
             if camera.showZoomSlider {
                 VStack(spacing: 6) {
