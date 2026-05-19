@@ -4,47 +4,56 @@ struct SplashView: View {
     @State private var showCamera = false
     @State private var animationTask: Task<Void, Never>? = nil
 
-    // Image
+    // Crisp tube — the actual neon line, near-white hot core
     @State private var logoOpacity: Double = 0
-    @State private var logoScale: Double  = 1.08
-    @State private var logoBlur: Double   = 6
+    @State private var logoScale: Double = 1.0
 
-    // White flash overlay
-    @State private var flashOpacity: Double = 0
+    // Tight halo — the red ring right around the tube (small blur, moderate opacity)
+    @State private var haloOpacity: Double = 0
+    @State private var haloBlur: Double = 4
 
-    // Vignette that closes in at the end
+    // Wide atmospheric bloom — very dim, just enough to feel like light in the room
+    @State private var bloomOpacity: Double = 0
+    @State private var bloomBlur: Double = 28
+
     @State private var vignetteOpacity: Double = 0
 
     var body: some View {
         if showCamera {
             CameraContentView()
-                .transition(.opacity)
         } else {
-            ZStack {
-                Color.black.ignoresSafeArea()
+            GeometryReader { geo in
+                ZStack {
+                    Color.black.ignoresSafeArea()
 
-                // Logo
-                Image("SplashLogo")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(72)
-                    .opacity(logoOpacity)
-                    .scaleEffect(logoScale)
-                    .blur(radius: logoBlur)
+                    // Wide bloom — very subtle, just ambient light in the air
+                    logoImage(geo)
+                        .blur(radius: bloomBlur)
+                        .blendMode(.screen)
+                        .opacity(bloomOpacity)
+                        .scaleEffect(logoScale)
 
-                // Soft flash overlay
-                Color.white
-                    .ignoresSafeArea()
-                    .opacity(flashOpacity)
-                    .allowsHitTesting(false)
+                    // Tight halo — the characteristic red ring of a neon tube
+                    logoImage(geo)
+                        .blur(radius: haloBlur)
+                        .blendMode(.screen)
+                        .opacity(haloOpacity)
+                        .scaleEffect(logoScale)
 
-                // Black fade-out vignette at the end
-                Color.black
-                    .ignoresSafeArea()
-                    .opacity(vignetteOpacity)
-                    .allowsHitTesting(false)
+                    // Crisp core — bright near-white tube, screen blend kills the JPEG black
+                    logoImage(geo)
+                        .blur(radius: 0.6)
+                        .blendMode(.screen)
+                        .opacity(logoOpacity)
+                        .scaleEffect(logoScale)
+
+                    Color.black
+                        .ignoresSafeArea()
+                        .opacity(vignetteOpacity)
+                        .allowsHitTesting(false)
+                }
             }
+            .ignoresSafeArea()
             .onAppear {
                 guard animationTask == nil else { return }
                 animationTask = Task { await runAnimation() }
@@ -56,42 +65,107 @@ struct SplashView: View {
         }
     }
 
-    // MARK: - Animation sequence
+    private func logoImage(_ geo: GeometryProxy) -> some View {
+        Image("SplashLogo")
+            .resizable()
+            .scaledToFit()
+            .frame(width: geo.size.width, height: geo.size.height)
+    }
+
+    // MARK: - Neon sign animation
 
     @MainActor
     private func runAnimation() async {
-        // ── Single soft flash + logo fades in (0 → 0.25s) ──
-        withAnimation(.easeOut(duration: 0.25)) {
-            flashOpacity = 0.35
+        func pause(_ seconds: Double) async -> Bool {
+            do { try await Task.sleep(for: .seconds(seconds)); return true }
+            catch { return false }
+        }
+
+        // ── Zap 1: first spark — tube tries to strike ──
+        withAnimation(.linear(duration: 0.05)) {
+            logoOpacity  = 0.7
+            haloOpacity  = 0.45
+            bloomOpacity = 0.12
+        }
+        guard await pause(0.07) else { return }
+
+        // ── Off ──
+        withAnimation(.linear(duration: 0.04)) {
+            logoOpacity  = 0
+            haloOpacity  = 0
+            bloomOpacity = 0
+        }
+        guard await pause(0.08) else { return }
+
+        // ── Zap 2: stronger, almost holds ──
+        withAnimation(.linear(duration: 0.05)) {
+            logoOpacity  = 0.85
+            haloOpacity  = 0.55
+            bloomOpacity = 0.16
+        }
+        guard await pause(0.09) else { return }
+
+        // ── Drops to near-off ──
+        withAnimation(.linear(duration: 0.04)) {
+            logoOpacity  = 0.05
+            haloOpacity  = 0.04
+            bloomOpacity = 0.02
+        }
+        guard await pause(0.06) else { return }
+
+        // ── Warming up — gas partially ionised, dim flicker ──
+        withAnimation(.easeIn(duration: 0.18)) {
+            logoOpacity  = 0.65
+            haloOpacity  = 0.4
+            haloBlur     = 5
+            bloomOpacity = 0.12
+            bloomBlur    = 32
+        }
+        guard await pause(0.14) else { return }
+
+        // ── Mid-warmup stutter ──
+        withAnimation(.linear(duration: 0.04)) {
+            logoOpacity  = 0.25
+            haloOpacity  = 0.15
+            bloomOpacity = 0.04
+        }
+        guard await pause(0.05) else { return }
+
+        // ── Catches — sign is fully on ──
+        withAnimation(.easeOut(duration: 0.16)) {
             logoOpacity  = 1.0
-            logoScale    = 1.0
-            logoBlur     = 0
+            haloOpacity  = 0.6
+            haloBlur     = 4
+            bloomOpacity = 0.18
+            bloomBlur    = 26
         }
+        guard await pause(0.22) else { return }
 
-        // ── Flash gently fades out (0.25 → 0.55s) ──
-        withAnimation(.easeIn(duration: 0.30).delay(0.25)) {
-            flashOpacity = 0.0
+        // ── Bloom settles outward (tube cools to stable temperature) ──
+        withAnimation(.easeInOut(duration: 0.5)) {
+            haloBlur     = 3.5
+            bloomBlur    = 24
+            bloomOpacity = 0.15
         }
+        guard await pause(0.38) else { return }
 
-        // ── Settle (0.55 → 0.70s) ──
-        withAnimation(.easeOut(duration: 0.15).delay(0.55)) {
-            logoScale = 0.98
-        }
+        // ── Neon hum — two tiny dips in current ──
+        withAnimation(.linear(duration: 0.05)) { logoOpacity = 0.91; haloOpacity = 0.52 }
+        guard await pause(0.07) else { return }
+        withAnimation(.linear(duration: 0.05)) { logoOpacity = 1.0;  haloOpacity = 0.6  }
+        guard await pause(0.09) else { return }
+        withAnimation(.linear(duration: 0.04)) { logoOpacity = 0.94 }
+        guard await pause(0.05) else { return }
+        withAnimation(.linear(duration: 0.04)) { logoOpacity = 1.0  }
 
-        // ── Fade to black (1.10 → 1.55s) ──
-        withAnimation(.easeIn(duration: 0.45).delay(1.10)) {
-            vignetteOpacity = 1.0
-        }
+        // ── Hold ──
+        guard await pause(0.5) else { return }
 
-        // ── Switch to camera (1.60s) — cancellable sleep ──
-        do {
-            try await Task.sleep(for: .seconds(1.60))
-        } catch {
-            return  // task was cancelled (e.g. view disappeared)
-        }
-        withAnimation(.easeIn(duration: 0.2)) {
-            showCamera = true
-        }
+        // ── Fade to black ──
+        withAnimation(.easeIn(duration: 0.5)) { vignetteOpacity = 1.0 }
+        guard await pause(0.55) else { return }
+
+        showCamera = true
     }
 }
 

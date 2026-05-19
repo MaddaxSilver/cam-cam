@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Required bundle keys (build variables are substituted by Xcode at build time) -->
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundleDisplayName</key>
+    <string>cam cam</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <key>CFBundleVersion</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <!-- Permission strings -->
+    <key>NSCameraUsageDescription</key>
+    <string>cam cam applies film simulations to your camera in real time.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>cam cam uses the microphone to record audio with video.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>cam cam saves captured photos to your photo library.</string>
+
+    <!-- Local network access — required for Sony camera WiFi connection (iOS 14+).
+         NSBonjourServices is needed to trigger the permission prompt for TCP connections. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>cam cam connects to your Sony camera over WiFi to download and apply film simulations.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_ssdp._udp</string>
+        <string>_http._tcp</string>
+    </array>
+
+    <!-- App Transport Security: allow plain HTTP to the camera's local API (10.0.0.1:8080) -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+
+    <!-- Scene manifest (required for modern iOS apps) -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+        <key>UISceneConfigurations</key>
+        <dict/>
+    </dict>
+
+    <!-- UI -->
+    <key>UIApplicationSupportsIndirectInputEvents</key>
+    <true/>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+</dict>
+</plist>

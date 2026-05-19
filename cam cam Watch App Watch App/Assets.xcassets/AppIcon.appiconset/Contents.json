@@ -1,9 +1,8 @@
 {
   "images" : [
     {
-      "filename" : "cam cam-iOS-Default-1024x1024@1x.png",
       "idiom" : "universal",
-      "platform" : "ios",
+      "platform" : "watchos",
       "size" : "1024x1024"
     }
   ],
