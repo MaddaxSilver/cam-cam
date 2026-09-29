@@ -6,10 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		5AD4B75E2FAF718A00BFEAB0 /* cam cam Watch App Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 5AD4B73E2FAF718800BFEAB0 /* cam cam Watch App Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-/* End PBXBuildFile section */
-
 /* Begin PBXContainerItemProxy section */
 		5A0E5BB52F85C800003533AC /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -39,28 +35,7 @@
 			remoteGlobalIDString = 5AD4B73D2FAF718800BFEAB0;
 			remoteInfo = "cam cam Watch App Watch App";
 		};
-		5AD4B75C2FAF718A00BFEAB0 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 5A0E5B9F2F85C7FD003533AC /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 5AD4B73D2FAF718800BFEAB0;
-			remoteInfo = "cam cam Watch App Watch App";
-		};
 /* End PBXContainerItemProxy section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		5AD4B7622FAF718A00BFEAB0 /* Embed Watch Content */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
-			dstSubfolderSpec = 16;
-			files = (
-				5AD4B75E2FAF718A00BFEAB0 /* cam cam Watch App Watch App.app in Embed Watch Content */,
-			);
-			name = "Embed Watch Content";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		5A0E5BA72F85C7FD003533AC /* cam cam.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "cam cam.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -186,12 +161,10 @@
 				5A0E5BA32F85C7FD003533AC /* Sources */,
 				5A0E5BA42F85C7FD003533AC /* Frameworks */,
 				5A0E5BA52F85C7FD003533AC /* Resources */,
-				5AD4B7622FAF718A00BFEAB0 /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				5AD4B75D2FAF718A00BFEAB0 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				5A0E5BA92F85C7FD003533AC /* cam cam */,
@@ -485,11 +458,6 @@
 			isa = PBXTargetDependency;
 			target = 5AD4B73D2FAF718800BFEAB0 /* cam cam Watch App Watch App */;
 			targetProxy = 5AD4B7552FAF718A00BFEAB0 /* PBXContainerItemProxy */;
-		};
-		5AD4B75D2FAF718A00BFEAB0 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = 5AD4B73D2FAF718800BFEAB0 /* cam cam Watch App Watch App */;
-			targetProxy = 5AD4B75C2FAF718A00BFEAB0 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 

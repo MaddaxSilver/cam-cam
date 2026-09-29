@@ -13,9 +13,9 @@ import Observation
 import CoreMotion
 import MediaPlayer
 import MetalKit
+import UniformTypeIdentifiers
 
-// MARK: - Orientation-Aware Icon/Text Rotation
-
+// MARK: - Orientation-Aware Icon/Text Rotation BZHNNY
 private struct IconRotation: ViewModifier {
     let angle: Double
     func body(content: Content) -> some View {
@@ -63,6 +63,13 @@ struct CustomSimulation: Codable, Identifiable, Equatable {
     var redBias: Float = 0.0          // -0.05 ... 0.05
     var greenBias: Float = 0.0
     var blueBias: Float = 0.0
+
+    /// Optional .cube LUT filename (in Documents/LUTs/). When non-nil, the
+    /// pipeline applies the LUT and SKIPS the parameter-based color grading
+    /// — the LUT is the entire look. Other effects (grain, vignette, bloom,
+    /// halation, etc.) still apply after the LUT.
+    /// Backward-compatible: existing simulations decode with nil here.
+    var lutFilename: String? = nil
 
     // Quality: 0 = speed, 1 = balanced, 2 = quality (Deep Fusion)
     var quality: Int = 2
@@ -167,7 +174,7 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
     // Experimental / darkroom / alternative process
     case crossProcess, bleachBypass, expiredFilm
     case cyanotype, daguerreotype, duotone
-    case retroChrome, neonNoir
+    case retroChrome, neonNoir, circuitBent, circuitBentHeavy
 
     var id: String { rawValue }
     var label: String {
@@ -234,6 +241,8 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable {
         case .duotone:              return "Duotone"
         case .retroChrome:          return "RetroChrm"
         case .neonNoir:             return "Neon Noir"
+        case .circuitBent:          return "Bent"
+        case .circuitBentHeavy:     return "Bent++"
         case .kodakTmax400:         return "T-Max 400"
         case .leicaMonochrom:       return "Leica Mono"
         case .leicaQ3:              return "Leica Q3"
@@ -432,6 +441,13 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
     var halationEnabled: Bool = false {
         didSet { UserDefaults.standard.set(halationEnabled, forKey: "cc_halationEnabled"); cachedHalationEnabled = halationEnabled }
     }
+    /// DigiCam quality 5...20. Low = crustier (more noise, fewer posterize
+    /// levels, deeper crush). High = cleaner (closer to a modern compact).
+    /// Only relevant when `.digiCam` is the active sim — slider is hidden
+    /// in the menu otherwise.
+    var digiCamQuality: Float = 12 {
+        didSet { UserDefaults.standard.set(digiCamQuality, forKey: "cc_digiCamQuality"); cachedDigiCamQuality = digiCamQuality }
+    }
     var rolloffEnabled: Bool = false {
         didSet { UserDefaults.standard.set(rolloffEnabled, forKey: "cc_rolloffEnabled"); cachedRolloffEnabled = rolloffEnabled }
     }
@@ -499,10 +515,15 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
     @ObservationIgnored nonisolated(unsafe) var cachedCrosstalkAmount: Float = 0.1
     @ObservationIgnored nonisolated(unsafe) var cachedHalationEnabled: Bool = false
     @ObservationIgnored nonisolated(unsafe) var cachedHalationAmount: Float = 0.2
+    @ObservationIgnored nonisolated(unsafe) var cachedDigiCamQuality: Float = 12
     @ObservationIgnored nonisolated(unsafe) var cachedRolloffEnabled: Bool = false
     @ObservationIgnored nonisolated(unsafe) var cachedRolloffThreshold: Float = 0.9
     @ObservationIgnored nonisolated(unsafe) var cachedPushPullEnabled: Bool = false
     @ObservationIgnored nonisolated(unsafe) var cachedPushPullAmount: Float = 0.0
+
+    // Cached rainbow gradient for the circuit-bent thermal LUT. Built once
+    // (CGContext draw is expensive) and reused every frame via CIColorMap.
+    @ObservationIgnored nonisolated(unsafe) var cachedThermalGradient: CIImage? = nil
 
     // Grain preview cache — 8 pre-baked textures cycled per frame so the
     // preview path never generates filter graphs at render time.
@@ -518,6 +539,31 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
 
     // MARK: nonisolated(unsafe) stored properties
     nonisolated(unsafe) let session = AVCaptureSession()
+
+    /// Stop the AVCaptureSession when the iPhone camera isn't being used —
+    /// e.g. while SonyView is presented and the user is shooting via the
+    /// Sony body's WiFi. The capture pipeline drains a real amount of
+    /// battery (multiple watts), so stopping it during Sony mode is a big
+    /// win. AVFoundation requires startRunning/stopRunning off the main
+    /// thread to avoid blocking the UI.
+    @MainActor
+    func pauseForExternalUse() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            if self.session.isRunning { self.session.stopRunning() }
+        }
+    }
+
+    /// Resume the AVCaptureSession after SonyView dismisses. Takes ~1 s for
+    /// the camera to come back up, which is acceptable since the user is
+    /// transitioning back into the phone-camera UI anyway.
+    @MainActor
+    func resumeFromExternalUse() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+        }
+    }
     @ObservationIgnored nonisolated(unsafe) var sessionQueue = DispatchQueue(label: "cam.session", qos: .userInitiated)
     @ObservationIgnored nonisolated(unsafe) var frameOutputQueue = DispatchQueue(label: "cam.frame.output", qos: .userInteractive)
     // Single shared Metal-backed CIContext for all rendering (preview, capture, peaking)
@@ -679,6 +725,7 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
         let showPeaking    = ud.object(forKey: "cc_showPeaking")    != nil ? ud.bool(forKey: "cc_showPeaking")    : nil as Bool?
         let halationOn     = ud.object(forKey: "cc_halationEnabled") != nil ? ud.bool(forKey: "cc_halationEnabled") : nil as Bool?
         let halationAmt    = ud.object(forKey: "cc_halationAmount") != nil ? ud.float(forKey: "cc_halationAmount") : nil as Float?
+        let digiCamQ       = ud.object(forKey: "cc_digiCamQuality") != nil ? ud.float(forKey: "cc_digiCamQuality") : nil as Float?
         let crosstalkOn    = ud.object(forKey: "cc_crosstalkEnabled") != nil ? ud.bool(forKey: "cc_crosstalkEnabled") : nil as Bool?
         let crosstalkAmt   = ud.object(forKey: "cc_crosstalkAmount") != nil ? ud.float(forKey: "cc_crosstalkAmount") : nil as Float?
         let rolloffOn      = ud.object(forKey: "cc_rolloffEnabled") != nil ? ud.bool(forKey: "cc_rolloffEnabled") : nil as Bool?
@@ -712,6 +759,7 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
             if let v = showPeaking    { self.showPeaking = v }
             if let v = halationOn     { self.halationEnabled = v }
             if let v = halationAmt    { self.halationAmount = v }
+            if let v = digiCamQ       { self.digiCamQuality = v }
             if let v = crosstalkOn    { self.crosstalkEnabled = v }
             if let v = crosstalkAmt   { self.crosstalkAmount = v }
             if let v = rolloffOn      { self.rolloffEnabled = v }
@@ -1419,8 +1467,8 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
                 DispatchQueue.main.async { self.isFocusing = adjusting }
                 if !adjusting {
                     // Lens has settled — schedule return to continuous after a brief hold
-                    let work = DispatchWorkItem { [weak self, weak dev] in
-                        guard let self, let dev else { return }
+                    let work = DispatchWorkItem { [weak self, dev] in
+                        guard let self else { return }
                         self.tapFocusActive = false
                         self.sessionQueue.async {
                             do {
@@ -1444,8 +1492,8 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
             }
 
             // Safety cap — return to continuous after 3 s regardless
-            let safetyCap = DispatchWorkItem { [weak self, weak device] in
-                guard let self, let device else { return }
+            let safetyCap = DispatchWorkItem { [weak self, device] in
+                guard let self else { return }
                 self.tapFocusActive = false
                 self.focusObservation?.invalidate()
                 self.focusObservation = nil
@@ -2776,7 +2824,19 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
         case .none:  isDigiCam = pendingSim == .digiCam
         case .some:  isDigiCam = false
         }
-        if pendingGrainEnabled && pendingGrain > 0 {
+        // Circuit-bent sims repurpose the grain toggle to mean "glitches" —
+        // no film/CCD grain is laid down for them. Detect here so the grain
+        // block skips them; the glitch pass below handles the toggle instead.
+        let isCircuitBentSim: Bool
+        switch pendingCustomSim {
+        case .none:  isCircuitBentSim = pendingSim == .circuitBent || pendingSim == .circuitBentHeavy
+        case .some:  isCircuitBentSim = false
+        }
+        // DigiCam and circuit-bent sims handle their own noise/glitches
+        // elsewhere (DigiCam noise is baked into its sim case scaled by the
+        // grain slider; circuit-bent uses the glitch pass). Skip them here so
+        // grain isn't applied on top.
+        if pendingGrainEnabled && pendingGrain > 0 && !isCircuitBentSim && !isDigiCam {
             let pushExtra: Float = pendingPushPullEnabled ? max(0, pendingPushPullAmount * 0.08) : 0
             var grainAmt = pendingGrain + pushExtra
 
@@ -2801,14 +2861,34 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
                 }
             }
 
-            if isDigiCam {
-                image = addDigitalNoise(input: image, amount: grainAmt)
-            } else {
-                image = addGrain(input: image, amount: grainAmt)
-            }
-        } else if pendingPushPullEnabled && pendingPushPullAmount > 0 {
+            image = addGrain(input: image, amount: grainAmt)
+        } else if pendingPushPullEnabled && pendingPushPullAmount > 0 && !isDigiCam {
             // Even with grain off, push adds a small amount of grain
             image = addGrain(input: image, amount: pendingPushPullAmount * 0.06)
+        }
+
+        // DigiCam scanlines. The context-aware button doubles as a "lines"
+        // toggle for DigiCam — overlays subtle horizontal interlacing lines
+        // like an old camcorder/CCD readout. Only when DigiCam is active and
+        // its quality isn't Off.
+        if isDigiCam && pendingContextAwareGrain && cachedDigiCamQuality >= 1 {
+            image = applyScanlines(input: image)
+        }
+
+        // Circuit-bent random glitches. The grain toggle drives these instead
+        // of laying down film grain (skipped above). Per-frame random band
+        // displacement, channel jumps, scanline dropouts. Context-aware grain
+        // additionally randomizes light + color each frame — the "broken
+        // sensor that drifts" feel.
+        if isCircuitBentSim && pendingGrainEnabled && pendingGrain > 0 {
+            let isCircuitHeavy = (pendingSim == .circuitBentHeavy)
+            // Grain slider doubles as a "weirdness" dial for bent sims:
+            // 0…0.5 → 0…1 intensity scaling the glitch magnitude/frequency.
+            let weirdness = min(1.0, pendingGrain / 0.5)
+            image = circuitBentGlitch(image,
+                                      heavy: isCircuitHeavy,
+                                      wild: pendingContextAwareGrain,
+                                      intensity: CGFloat(weirdness))
         }
 
         // Anamorphic flares
@@ -2859,6 +2939,12 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
     func applySimAndGrainDirect(to input: CIImage,
                                  sim: FilmSimulation,
                                  custom: CustomSimulation?) -> CIImage {
+        // LUT short-circuit: if the active custom sim references a .cube
+        // file, apply the LUT and skip the parameter-based grading
+        // pipeline. The LUT IS the entire look.
+        if let custom, let lutFilename = custom.lutFilename {
+            return LUTManager.shared.apply(filename: lutFilename, to: input)
+        }
         // Snapshot only the properties we need; use defaults for everything else.
         let savedSim          = pendingSim;          pendingSim          = sim
         let savedCustom       = pendingCustomSim;    pendingCustomSim     = custom
@@ -3084,25 +3170,56 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
             // DigiCam: early 2000s digital look — crushed shadows, slightly magenta white
             // balance, baked-in CCD noise, and a touch of edge softness (NOT haze).
             // Sharpened via clarity to keep crisp pixel-level detail like an old CCD sensor.
+            //
+            // Quality slider 0..20 maps to:
+            //   q=0  → OFF: pass image through untouched. Lets the user keep
+            //          DigiCam "selected" in the strip but bypass it on the fly.
+            //   q=5  → heavy noise (~0.32), 4 posterize levels, crushed shadows (cheapest disposable)
+            //   q=12 → moderate noise (~0.16), 8 posterize levels (early-2000s point-and-shoot, default)
+            //   q=20 → minimal noise (~0.04), 16 posterize levels (mid-2000s prosumer compact)
+            if cachedDigiCamQuality < 1 { return image }
+            let q = max(5, min(20, cachedDigiCamQuality))
+            let qNorm = (q - 5) / 15.0                                // 0 = worst, 1 = best
+            let noiseAmt: Float    = 0.32 - 0.28 * qNorm              // 0.32 → 0.04
+            let posterLevels: Int  = Int(4 + round(12 * Double(qNorm))) // 4 → 16
+            let shadowCrush: Float = 0.06 + 0.04 * (1 - qNorm)        // crush more on low quality
+
             let cc = CIFilter.colorControls()
             cc.inputImage = image
             cc.saturation = 0.82
             cc.contrast = 1.22
-            cc.brightness = 0.0          // was 0.03 — was making it look washed
+            cc.brightness = 0.0
             let tint = CIFilter.temperatureAndTint()
             tint.inputImage = cc.outputImage
             tint.neutral = CIVector(x: 6500, y: 0)
-            tint.targetNeutral = CIVector(x: 7000, y: 12)   // less aggressive cool/magenta
-            let crushed = toneCurve(input: tint.outputImage ?? image, shadows: 0.06, mid: 0.0, highlights: -0.05)
+            tint.targetNeutral = CIVector(x: 7000, y: 12)
+            var staged: CIImage = tint.outputImage ?? image
+            // Quality-driven posterize — fewer levels = more visible color banding,
+            // mimicking older sensors' lower bit depth.
+            if let poster = CIFilter(name: "CIColorPosterize") {
+                poster.setValue(staged, forKey: kCIInputImageKey)
+                poster.setValue(posterLevels, forKey: "inputLevels")
+                staged = poster.outputImage ?? staged
+            }
+            let crushed = toneCurve(input: staged, shadows: shadowCrush, mid: 0.0, highlights: -0.05)
             // Tiny edge softness — old digital sensor lowpass, NOT a hazy blur
             let blur = CIFilter.gaussianBlur()
             blur.inputImage = crushed
-            blur.radius = 0.6   // was 2.5 — that was causing the haze
+            blur.radius = 0.6
             let blurred = blur.outputImage?.cropped(to: image.extent) ?? crushed
             // Re-add micro-contrast so the result still feels crisp, not soft
             let crisped = claritySharpen(input: blurred)
-            // Baked-in CCD baseline noise — always present, distinct from film grain
-            return addDigitalNoise(input: crisped, amount: 0.16)
+            // CCD noise — quality sets the *character* (noiseAmt), the grain
+            // slider acts as the master amount. At grain-min (or grain off)
+            // the DigiCam look is clean: posterize + crush + tint, zero CCD
+            // speckle. As the grain slider climbs, the quality-shaped noise
+            // fades in. This is the SOLE source of DigiCam noise — the grain
+            // block below skips DigiCam so it's never applied twice.
+            if pendingGrainEnabled && pendingGrain > 0 {
+                let mult = min(1.0, pendingGrain / 0.5)   // grain 0…0.5 → 0…1
+                return addDigitalNoise(input: crisped, amount: noiseAmt * mult)
+            }
+            return crisped
 
         case .nightShot:
             // Night shot: warm point-and-shoot flash look — punchy contrast, warm skin,
@@ -3932,6 +4049,17 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
             matrix.biasVector = CIVector(x: 0.0, y: 0.0, z: 0.02, w: 0)
             return toneCurve(input: matrix.outputImage ?? image, shadows: -0.08, mid: 0.0, highlights: -0.01)
 
+        case .circuitBent:
+            // Circuit-Bent — infrared/thermal false-color look. The grain
+            // slider drives the speckle amount (0 when grain off → clean
+            // gradient; up to full as the slider climbs).
+            return circuitBend(image, heavy: false, speckleScale: bentSpeckleScale)
+
+        case .circuitBentHeavy:
+            // Circuit-Bent Heavy — same recipe, cranked. Grain slider drives
+            // the speckle the same way.
+            return circuitBend(image, heavy: true, speckleScale: bentSpeckleScale)
+
         // MARK: - Fujifilm additions
 
         case .fujiReala100:
@@ -4284,6 +4412,14 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
     // MARK: Custom Sim Processing
 
     nonisolated func applyCustomSim(to image: CIImage, sim: CustomSimulation) -> CIImage {
+        // LUT short-circuit: if this sim is backed by a .cube file, apply
+        // the LUT and skip parameter-based grading. The LUT IS the look.
+        // This branch runs from the live preview's nonisolated callback,
+        // which is why LUTManager is non-isolated and thread-safe.
+        if let lutFilename = sim.lutFilename {
+            return LUTManager.shared.apply(filename: lutFilename, to: image)
+        }
+
         var result = image
 
         // 1. Brightness / Contrast / Saturation
@@ -4487,6 +4623,429 @@ nonisolated enum LongExposureMode: String, CaseIterable, Identifiable, Sendable 
         filter.intensity = 0.6
         filter.radius = 1.5
         return filter.outputImage ?? input
+    }
+
+    /// Isolate one of R/G/B as its own grayscale-in-channel image. Used by
+    /// circuitBend to separate planes before shifting them spatially.
+    nonisolated private func isolateChannel(_ image: CIImage, channel: Int) -> CIImage {
+        let m = CIFilter.colorMatrix()
+        m.inputImage = image
+        let zero = CIVector(x: 0, y: 0, z: 0, w: 0)
+        let rOn  = CIVector(x: 1, y: 0, z: 0, w: 0)
+        let gOn  = CIVector(x: 0, y: 1, z: 0, w: 0)
+        let bOn  = CIVector(x: 0, y: 0, z: 1, w: 0)
+        m.rVector = channel == 0 ? rOn : zero
+        m.gVector = channel == 1 ? gOn : zero
+        m.bVector = channel == 2 ? bOn : zero
+        m.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
+        return m.outputImage ?? image
+    }
+
+    /// Circuit-bent digicam look. Built from stock CIFilters so it works at
+    /// live-preview rate. The signature elements:
+    ///   • RGB plane separation (red shifts right, blue shifts left) — gives
+    ///     the chromatic-fringe glitch reads as "wrong sensor readout"
+    ///   • Posterize to a few levels per channel — fakes a broken DAC's stepped
+    ///     output, the source of the banded color smears on real bent cams
+    ///   • Saturation/contrast crank + magenta hue shift — pushes the palette
+    ///     into the impossible-color zone these mods produce
+    ///   • Crushed shadows + highlight clip — matches the under-bias that
+    ///     bent sensors usually drift to
+    ///   • `heavy: true` cranks all knobs and overlays hard scan lines for
+    ///     a more outright-broken read.
+    /// Single-pass Metal warp kernel for the ripple glitch. Loaded lazily
+    /// from the app's default.metallib (Ripple.ci.metal compiles into it with
+    /// the CIKernel flags applied automatically by the `.ci.metal` suffix).
+    /// Double-optional: nil = not yet attempted, .some(nil) = attempted &
+    /// unavailable (→ caller falls back to the composite ripple, so the effect
+    /// still works even if the metallib is somehow missing).
+    @ObservationIgnored nonisolated(unsafe) static var _rippleKernel: CIWarpKernel?? = nil
+    nonisolated static func rippleKernel() -> CIWarpKernel? {
+        if let attempted = _rippleKernel { return attempted }
+        var loaded: CIWarpKernel? = nil
+        if let url = Bundle.main.url(forResource: "default", withExtension: "metallib"),
+           let data = try? Data(contentsOf: url) {
+            loaded = try? CIWarpKernel(functionName: "rippleWarp", fromMetalLibraryData: data)
+        }
+        _rippleKernel = .some(loaded)
+        return loaded
+    }
+
+    /// Speckle amount for the circuit-bent base look, driven by the grain
+    /// slider. 0 when grain is off (clean gradient); ramps to 1 at the top of
+    /// the slider. Same dial that drives the glitch "weirdness", so one grain
+    /// control governs all the bent chaos.
+    nonisolated var bentSpeckleScale: CGFloat {
+        guard pendingGrainEnabled else { return 0 }
+        return min(1.0, CGFloat(pendingGrain) / 0.5)
+    }
+
+    /// Build (and cache) the rainbow gradient LUT used by the circuit-bent
+    /// thermal map. A 256×1 horizontal gradient sweeping the full spectrum;
+    /// CIColorMap indexes pixel luminance into it. Cached because the
+    /// CGContext draw is too expensive to repeat every frame.
+    nonisolated func thermalGradient() -> CIImage {
+        if let g = cachedThermalGradient { return g }
+        let width = 256, height = 1
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: width, height: height,
+                                  bitsPerComponent: 8, bytesPerRow: width * 4,
+                                  space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return CIImage.empty() }
+
+        // INTERLEAVED circuit-bend palette — warm and cool colours alternate
+        // so that even if the index concentrates in one region, it spans
+        // contrasting hues instead of a single family. No colour dominates.
+        // (A monotonic rainbow made whatever sat at mid-luminance take over —
+        // magenta, then green; interleaving breaks that.)
+        let stops: [(CGFloat, UIColor)] = [
+            (0.00, UIColor(red: 0.03, green: 0.0,  blue: 0.08, alpha: 1)), // near-black
+            (0.10, UIColor(red: 0.0,  green: 0.35, blue: 1.0,  alpha: 1)), // blue
+            (0.20, UIColor(red: 1.0,  green: 0.55, blue: 0.0,  alpha: 1)), // orange
+            (0.30, UIColor(red: 0.0,  green: 1.0,  blue: 0.55, alpha: 1)), // green
+            (0.40, UIColor(red: 1.0,  green: 0.0,  blue: 0.7,  alpha: 1)), // magenta
+            (0.50, UIColor(red: 0.0,  green: 0.85, blue: 1.0,  alpha: 1)), // cyan
+            (0.60, UIColor(red: 1.0,  green: 0.85, blue: 0.0,  alpha: 1)), // yellow
+            (0.70, UIColor(red: 0.45, green: 0.0,  blue: 1.0,  alpha: 1)), // violet
+            (0.80, UIColor(red: 1.0,  green: 0.15, blue: 0.15, alpha: 1)), // red
+            (0.90, UIColor(red: 0.1,  green: 0.7,  blue: 1.0,  alpha: 1)), // sky blue
+            (1.00, UIColor(red: 1.0,  green: 1.0,  blue: 1.0,  alpha: 1)), // white hot
+        ]
+        let cgColors = stops.map { $0.1.cgColor } as CFArray
+        let locations = stops.map { $0.0 }
+        guard let grad = CGGradient(colorsSpace: cs, colors: cgColors, locations: locations) else {
+            return CIImage.empty()
+        }
+        ctx.drawLinearGradient(grad,
+                               start: CGPoint(x: 0, y: 0),
+                               end: CGPoint(x: width, y: 0),
+                               options: [])
+        guard let cg = ctx.makeImage() else { return CIImage.empty() }
+        let ci = CIImage(cgImage: cg)
+        cachedThermalGradient = ci
+        return ci
+    }
+
+    /// - Parameter speckleScale: 0…1 grain amount from the slider. 0 = no
+    ///   speckle (clean thermal gradient); 1 = full thermal-photo grain.
+    nonisolated func circuitBend(_ image: CIImage, heavy: Bool = false, speckleScale: CGFloat = 1.0) -> CIImage {
+        let extent = image.extent
+
+        // Circuit-bend look: a CONTROLLED rainbow palette (so no single colour
+        // dominates) driven by brightness, but scrambled by a low-frequency
+        // CHAOS field so the colour mapping is non-uniform and broken across
+        // the frame — not a clean linear sweep. Original luminance is blended
+        // back so detail/structure always survives.
+        let posterLevels: Int    = heavy ? 8 : 12       // colour bands
+        let preContrast: Float   = heavy ? 1.35 : 1.20
+        // Two chaos octaves so the frame is ALWAYS richly multi-coloured —
+        // big blobs set broad colour regions, fine blobs break them up. This
+        // is what stops a uniform scene from bathing in a single flat colour.
+        // Higher chaos amplitude spreads the colour INDEX across the whole
+        // gradient (instead of piling up at mid-luminance, which made one
+        // colour family — magenta — dominate). The index is mostly chaos-
+        // driven now, so colour varies by region rather than tracking the
+        // scene's (usually mid) brightness.
+        let chaosCoarse: CGFloat = heavy ? 1.30 : 1.10  // broad colour regions
+        let chaosFine: CGFloat   = heavy ? 0.60 : 0.50  // finer break-up
+        let sigmaCoarse: Double  = heavy ? 18 : 26
+        let sigmaFine: Double    = heavy ? 5  : 8
+        let postSat: Float       = heavy ? 1.45 : 1.25
+        let speckleAmp: CGFloat  = (heavy ? 0.10 : 0.06) * max(0, speckleScale)
+        let fringeShift: CGFloat = heavy ? 6 : 3
+
+        // ── 1. Grayscale luminance (keep a clean copy for detail) ───────
+        let gray = CIFilter.colorControls()
+        gray.inputImage = image
+        gray.saturation = 0.0
+        gray.contrast = preContrast
+        gray.brightness = -0.02
+        let origLuma = (gray.outputImage ?? image).cropped(to: extent)
+        var index = origLuma
+
+        // ── 2. CHAOS: two octaves of blurred-noise offset to the INDEX ──
+        // Each octave pushes regions to different gradient positions, so the
+        // brightness→colour mapping is non-uniform across the frame and the
+        // result is always full of varied colour — never one flat hue. THIS
+        // is the look; it does NOT need the context-aware wild animator.
+        func addChaosOctave(_ amp: CGFloat, _ sigma: Double, _ seedShift: CGFloat) {
+            guard amp > 0, let rnd = CIFilter(name: "CIRandomGenerator"),
+                  let raw = rnd.outputImage else { return }
+            // seedShift samples a different region of the (infinite) noise so
+            // the two octaves don't correlate.
+            let blobs = raw.transformed(by: CGAffineTransform(translationX: seedShift, y: seedShift))
+                .cropped(to: extent)
+                .applyingGaussianBlur(sigma: sigma).cropped(to: extent)
+            let mono = CIFilter.colorControls()
+            mono.inputImage = blobs
+            mono.saturation = 0.0
+            let scale = CIFilter.colorMatrix()
+            scale.inputImage = mono.outputImage
+            scale.rVector = CIVector(x: amp, y: 0, z: 0, w: 0)
+            scale.gVector = CIVector(x: 0, y: amp, z: 0, w: 0)
+            scale.bVector = CIVector(x: 0, y: 0, z: amp, w: 0)
+            scale.biasVector = CIVector(x: -amp / 2, y: -amp / 2, z: -amp / 2, w: 0)
+            let add = CIFilter.additionCompositing()
+            add.inputImage = scale.outputImage
+            add.backgroundImage = index
+            index = (add.outputImage ?? index).cropped(to: extent)
+        }
+        addChaosOctave(chaosCoarse, sigmaCoarse, 0)
+        addChaosOctave(chaosFine, sigmaFine, 1024)
+
+        // ── 3. Speckle: fine noise into the index (grain slider) ────────
+        if speckleAmp > 0, let rnd = CIFilter(name: "CIRandomGenerator"),
+           let raw = rnd.outputImage {
+            let mono = CIFilter.colorControls()
+            mono.inputImage = raw.cropped(to: extent)
+            mono.saturation = 0.0
+            let scale = CIFilter.colorMatrix()
+            scale.inputImage = mono.outputImage
+            scale.rVector = CIVector(x: speckleAmp, y: 0, z: 0, w: 0)
+            scale.gVector = CIVector(x: 0, y: speckleAmp, z: 0, w: 0)
+            scale.bVector = CIVector(x: 0, y: 0, z: speckleAmp, w: 0)
+            scale.biasVector = CIVector(x: -speckleAmp / 2, y: -speckleAmp / 2, z: -speckleAmp / 2, w: 0)
+            let add = CIFilter.additionCompositing()
+            add.inputImage = scale.outputImage
+            add.backgroundImage = index
+            index = (add.outputImage ?? index).cropped(to: extent)
+        }
+
+        // ── 4. Posterize the index into discrete bands ──────────────────
+        if let poster = CIFilter(name: "CIColorPosterize") {
+            poster.setValue(index, forKey: kCIInputImageKey)
+            poster.setValue(posterLevels, forKey: "inputLevels")
+            index = poster.outputImage ?? index
+        }
+
+        // ── 5. Index → colour via the balanced rainbow gradient LUT ─────
+        var colorRGB = index
+        if let map = CIFilter(name: "CIColorMap") {
+            map.setValue(index, forKey: kCIInputImageKey)
+            map.setValue(thermalGradient(), forKey: "inputGradientImage")
+            colorRGB = map.outputImage ?? index
+        }
+
+        // ── 6. Restore ORIGINAL luminance for detail (colour blend) ─────
+        // CIColorBlendMode = luminosity of backdrop + hue/sat of source.
+        let cblend = CIFilter.colorBlendMode()
+        cblend.inputImage = colorRGB           // wild colour
+        cblend.backgroundImage = origLuma      // real detail/structure
+        var result = (cblend.outputImage ?? colorRGB).cropped(to: extent)
+
+        // ── 7. Polish: saturation ───────────────────────────────────────
+        let polish = CIFilter.colorControls()
+        polish.inputImage = result
+        polish.saturation = postSat
+        result = (polish.outputImage ?? result).cropped(to: extent)
+
+        // ── D. Subtle channel offset for the glitchy chromatic fringe. ──
+        // clampedToExtent() so the shifted channels smear their edge pixels
+        // instead of leaving a transparent gap (which flattens to a black
+        // line in the saved photo).
+        let red  = isolateChannel(result, channel: 0).clampedToExtent()
+            .transformed(by: CGAffineTransform(translationX: fringeShift, y: 0))
+        let grn  = isolateChannel(result, channel: 1)
+        let blue = isolateChannel(result, channel: 2).clampedToExtent()
+            .transformed(by: CGAffineTransform(translationX: -fringeShift, y: 0))
+        let a = CIFilter.additionCompositing(); a.inputImage = red; a.backgroundImage = grn
+        let b = CIFilter.additionCompositing(); b.inputImage = a.outputImage ?? grn; b.backgroundImage = blue
+        result = (b.outputImage ?? result).cropped(to: extent)
+
+        // ── E. Heavy mode only: hard horizontal scan lines on top ───────
+        if heavy {
+            let stripes = CIFilter.checkerboardGenerator()
+            stripes.color0 = CIColor(red: 1, green: 1, blue: 1, alpha: 1)
+            stripes.color1 = CIColor(red: 0.35, green: 0.35, blue: 0.4, alpha: 1)
+            stripes.width = 3
+            stripes.center = CGPoint(x: 0, y: 0)
+            let stripPattern = (stripes.outputImage ?? CIImage.empty())
+                .transformed(by: CGAffineTransform(scaleX: 9999, y: 1))
+                .cropped(to: extent)
+            let mult = CIFilter.multiplyCompositing()
+            mult.inputImage = stripPattern
+            mult.backgroundImage = result
+            result = (mult.outputImage ?? result).cropped(to: extent)
+        }
+
+        return result.cropped(to: extent)
+    }
+
+    /// Horizontal interlacing scanlines — the old-camcorder / CCD-readout
+    /// look. Static (not random): a fixed-period dark stripe pattern
+    /// multiplied over the image. Used by DigiCam when its context-aware
+    /// "lines" toggle is on. Deliberately subtle so it reads as a CRT/LCD
+    /// artifact, not a glitch.
+    nonisolated func applyScanlines(input: CIImage) -> CIImage {
+        let extent = input.extent
+        guard extent.height > 1 else { return input }
+        // 2px-on / 2px-off dark lines — clearly visible interlacing.
+        let stripes = CIFilter.checkerboardGenerator()
+        stripes.color0 = CIColor(red: 1, green: 1, blue: 1, alpha: 1)
+        stripes.color1 = CIColor(red: 0.6, green: 0.6, blue: 0.66, alpha: 1)
+        stripes.width = 2
+        stripes.center = CGPoint(x: 0, y: 0)
+        let pattern = (stripes.outputImage ?? CIImage.empty())
+            .transformed(by: CGAffineTransform(scaleX: 9999, y: 1))   // horizontal-only
+            .cropped(to: extent)
+        let mult = CIFilter.multiplyCompositing()
+        mult.inputImage = pattern
+        mult.backgroundImage = input
+        return (mult.outputImage ?? input).cropped(to: extent)
+    }
+
+    /// Per-frame random glitch overlay for the circuit-bent sims. Called only
+    /// when grain is enabled. Each invocation rolls fresh randomness so the
+    /// glitches flicker and jump frame-to-frame like a genuinely faulty board.
+    ///   • `heavy`: bigger ceilings on displacement, harder dropouts
+    ///   • `wild` (context-aware grain on): also randomize hue, exposure and
+    ///     color cast each frame — the sensor "drifts" unpredictably
+    ///   • `intensity` 0…1: the "weirdness" dial driven by the grain slider.
+    ///     Scales band count, shift magnitude, glitch probability and the
+    ///     wild-mode swing ranges. Near 0 = barely-there occasional twitch;
+    ///     1 = full chaos.
+    /// All built from stock CIFilters so it survives at live-preview rate.
+    nonisolated func circuitBentGlitch(_ image: CIImage, heavy: Bool, wild: Bool, intensity: CGFloat = 1.0) -> CIImage {
+        let extent = image.extent
+        guard extent.width > 1, extent.height > 1 else { return image }
+        let t = max(0.0, min(1.0, intensity))            // clamp the dial
+        let tF = Float(t)
+
+        // FLATTEN the incoming image to pixels first. The base circuit-bend
+        // sim is already a deep filter graph (two blurs, colour-map, blend);
+        // stacking the glitch's many composite passes on top at full capture
+        // resolution (48MP) overflowed Core Image and rendered BLACK. Baking
+        // the base to a CGImage here gives the glitch a shallow, bounded graph
+        // so it renders reliably at any resolution.
+        var img: CIImage
+        if let cg = ciContext.createCGImage(image, from: extent) {
+            img = CIImage(cgImage: cg)
+        } else {
+            img = image
+        }
+
+        // ── 1. Signal RIPPLE: rows shifted by a smooth wave ─────────────
+        // Real bent-camera/databending tearing = each row displaced by a
+        // value that varies CONTINUOUSLY down the frame, so the image ripples
+        // and tears organically. Two sine octaves + a little per-strip noise
+        // give a wobble that reads as genuine signal corruption — not random
+        // hard bands and never fake black lines. Strip count kept modest so
+        // the composite graph stays shallow (no Metal kernel dependency).
+        // Bent++ ripples much harder than Bent — bigger amplitude and more
+        // wave cycles so the whole frame churns instead of gently wobbling.
+        let rippleAmp: CGFloat = (heavy ? 130 : 28) * t
+        if rippleAmp > 0.5 {
+            let freq1 = heavy ? Float.random(in: 3...6)  : Float.random(in: 1.5...3.5)
+            let freq2 = heavy ? Float.random(in: 9...18) : Float.random(in: 5...11)
+            let phase = Float.random(in: 0...(2 * .pi))
+            if let kernel = CameraManager.rippleKernel() {
+                // Fast path: single-pass Metal warp — per-pixel smooth ripple.
+                let maxShift = rippleAmp * 1.2 + 5
+                if let warped = kernel.apply(
+                    extent: extent,
+                    roiCallback: { _, rect in rect.insetBy(dx: -maxShift, dy: 0) },
+                    image: img.clampedToExtent(),
+                    arguments: [Float(rippleAmp), freq1, freq2, phase, Float(extent.height)]
+                ) {
+                    img = warped.cropped(to: extent)
+                }
+            } else {
+                // Fallback: composite strip ripple (no Metal kernel available).
+                let cf1 = CGFloat(freq1), cf2 = CGFloat(freq2), cph = CGFloat(phase)
+                let stripCount = heavy ? 22 : 16
+                let stripH = max(1, extent.height / CGFloat(stripCount))
+                for i in 0..<stripCount {
+                    let y0 = extent.minY + CGFloat(i) * stripH
+                    let f = CGFloat(i) / CGFloat(stripCount)
+                    let wave = sin(f * cf1 * 2 * .pi + cph) * 0.7
+                             + sin(f * cf2 * 2 * .pi + cph * 1.7) * 0.3
+                    let shift = wave * rippleAmp + CGFloat.random(in: -rippleAmp * 0.1...rippleAmp * 0.1)
+                    let rect = CGRect(x: extent.minX, y: y0 - 0.5, width: extent.width, height: stripH + 1)
+                    let strip = img.clampedToExtent()
+                        .transformed(by: CGAffineTransform(translationX: shift, y: 0))
+                        .cropped(to: rect)
+                    let over = CIFilter.sourceOverCompositing()
+                    over.inputImage = strip
+                    over.backgroundImage = img
+                    img = (over.outputImage ?? img).cropped(to: extent)
+                }
+            }
+        }
+
+        // ── 2. Occasional big "data jump" tears on top of the ripple ────
+        // A few rows yanked far sideways = the moment the signal glitches
+        // hard. Sparse; scales with weirdness.
+        let jumpBands = Int((CGFloat(heavy ? 5 : 3) * t).rounded())
+        for _ in 0..<max(0, jumpBands) {
+            let bandH = CGFloat.random(in: 4...(heavy ? 36 : 20))
+            let bandY = CGFloat.random(in: extent.minY...max(extent.minY, extent.maxY - bandH))
+            let shift = CGFloat.random(in: -1...1) * (heavy ? 150 : 80) * t
+            let rect = CGRect(x: extent.minX, y: bandY, width: extent.width, height: bandH)
+            let band = img.clampedToExtent()
+                .transformed(by: CGAffineTransform(translationX: shift, y: 0))
+                .cropped(to: rect)
+            let over = CIFilter.sourceOverCompositing()
+            over.inputImage = band
+            over.backgroundImage = img
+            img = (over.outputImage ?? img).cropped(to: extent)
+        }
+
+        // ── 3. Chromatic channel desync (looks like real signal bleed) ──
+        if CGFloat.random(in: 0...1) < t * 0.9 {
+            let jumpMax: CGFloat = (heavy ? 70 : 36) * t
+            let jump = CGFloat.random(in: (jumpMax * 0.3)...max(jumpMax * 0.3 + 0.1, jumpMax))
+            let red  = isolateChannel(img, channel: 0).clampedToExtent()
+                .transformed(by: CGAffineTransform(translationX: jump, y: 0))
+            let gb   = isolateChannel(img, channel: 1)
+            let blue = isolateChannel(img, channel: 2).clampedToExtent()
+                .transformed(by: CGAffineTransform(translationX: -jump, y: 0))
+            let a = CIFilter.additionCompositing(); a.inputImage = red; a.backgroundImage = gb
+            let b = CIFilter.additionCompositing(); b.inputImage = a.outputImage ?? gb; b.backgroundImage = blue
+            img = (b.outputImage ?? img).cropped(to: extent)
+        }
+
+        // ── 4. Wild mode: randomize light + color each frame ────────────
+        // Swing ranges scale with weirdness so low t drifts gently.
+        if wild {
+            // Exposure swing — kept moderate so the frame doesn't blow out to
+            // a flat color. Centered with a tighter range; the base sim is
+            // already very bright/saturated so a little goes a long way.
+            let exp = CIFilter.exposureAdjust()
+            exp.inputImage = img
+            exp.ev = Float.random(in: -0.9...0.9) * tF
+            img = exp.outputImage ?? img
+
+            // Hue can spin a full half-turn each frame at max — this is the
+            // big chaos lever and it's safe (rotation never collapses values).
+            let hue = CIFilter.hueAdjust()
+            hue.inputImage = img
+            hue.angle = Float.random(in: -3.14...3.14) * tF
+            img = hue.outputImage ?? img
+
+            // Color cast — moderate so it tints rather than floods.
+            let castRange = 0.18 * t
+            let m = CIFilter.colorMatrix()
+            m.inputImage = img
+            m.rVector = CIVector(x: 1, y: 0, z: 0, w: 0)
+            m.gVector = CIVector(x: 0, y: 1, z: 0, w: 0)
+            m.bVector = CIVector(x: 0, y: 0, z: 1, w: 0)
+            m.biasVector = CIVector(x: CGFloat.random(in: -castRange...castRange),
+                                    y: CGFloat.random(in: -castRange...castRange),
+                                    z: CGFloat.random(in: -castRange...castRange),
+                                    w: 0)
+            img = m.outputImage ?? img
+
+            // Saturation kick — never below 0.6 (so it doesn't gray out) and
+            // capped so it doesn't push an already-saturated frame to a flat
+            // primary.
+            let cc = CIFilter.colorControls()
+            cc.inputImage = img
+            cc.saturation = 1.0 + (Float.random(in: -0.4...0.7)) * tF
+            img = cc.outputImage ?? img
+        }
+
+        return img.cropped(to: extent)
     }
 
     /// Builds 8 fully-rasterised grain textures at `extent` on a background queue.
@@ -5135,6 +5694,22 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             pendingSim = cachedSim
             filtered = applyFilmSim(to: scaled)
             pendingSim = prevPending
+
+            // DigiCam scanlines — the context-aware "lines" toggle. Mirrors
+            // the capture pipeline so the live preview actually shows them.
+            if cachedSim == .digiCam && cachedContextAwareGrain && cachedDigiCamQuality >= 1 {
+                filtered = applyScanlines(input: filtered)
+            }
+            // Circuit-bent per-frame glitches — only when grain is on; the
+            // grain slider scales the weirdness, context-aware = wild drift.
+            if (cachedSim == .circuitBent || cachedSim == .circuitBentHeavy)
+                && cachedGrainEnabled && cachedGrainAmount > 0 {
+                let heavy = (cachedSim == .circuitBentHeavy)
+                let weirdness = min(1.0, CGFloat(cachedGrainAmount) / 0.5)
+                filtered = circuitBentGlitch(filtered, heavy: heavy,
+                                             wild: cachedContextAwareGrain,
+                                             intensity: weirdness)
+            }
         }
         // Apply live effects so preview matches saved output
         if cachedCrosstalkEnabled {
@@ -6133,6 +6708,15 @@ final class VolumeButtonObserver {
     var onVolumeUp: (() -> Void)?
     var onVolumeDown: (() -> Void)?
 
+    /// When non-nil, ALL instances of this observer reroute their callbacks
+    /// to these closures instead of firing onVolumeUp/onVolumeDown.
+    /// Used by SonyView to take exclusive control of the volume buttons
+    /// (so they cycle film sims instead of triggering the underlying
+    /// CameraView's zoom). SonyView sets these on .onAppear and clears
+    /// them on .onDisappear.
+    nonisolated(unsafe) static var overrideOnUp:   (() -> Void)? = nil
+    nonisolated(unsafe) static var overrideOnDown: (() -> Void)? = nil
+
     // MPVolumeView owned here and added directly to the key window —
     // this is the only reliable way to suppress the system volume HUD.
     private var mpView: MPVolumeView?
@@ -6224,8 +6808,13 @@ final class VolumeButtonObserver {
     }
 
     private func activateSession() {
+        // AVAudioSession.setActive can block briefly while CoreAudio reconfigures
+        // routes. Apple specifically warns against calling it on main — kick it
+        // to a background queue. Category change is cheap and stays on main.
         try? session.setCategory(.playback, options: .mixWithOthers)
-        try? session.setActive(true, options: .notifyOthersOnDeactivation)
+        DispatchQueue.global(qos: .userInitiated).async { [session] in
+            try? session.setActive(true, options: .notifyOthersOnDeactivation)
+        }
     }
 
     private func startObserving() {
@@ -6238,7 +6827,12 @@ final class VolumeButtonObserver {
             guard let oldVal = change.oldValue, let newVal = change.newValue, oldVal != newVal else { return }
             let wentUp = newVal > oldVal
             DispatchQueue.main.async {
-                if wentUp {
+                // If a global override is installed (e.g. SonyView is up),
+                // route presses there INSTEAD of our local callbacks.
+                if let up = VolumeButtonObserver.overrideOnUp,
+                   let down = VolumeButtonObserver.overrideOnDown {
+                    if wentUp { up() } else { down() }
+                } else if wentUp {
                     self.onVolumeUp?()
                 } else {
                     self.onVolumeDown?()
@@ -6282,6 +6876,44 @@ struct CameraContentView: View {
     @State private var localZoom: Double = 1.0
     @State private var showCustomSimEditor = false
     @State private var showSonyView = false
+    @State private var showLUTImporter = false
+
+    /// Film-sim strip category filter. With many custom sims + LUTs the
+    /// single horizontal scroll becomes a mess; these chips let you focus
+    /// on one source at a time. "All" preserves the original behavior.
+    /// Persisted across launches so you stay in whichever view you used last.
+    @AppStorage("cc_simCategory") private var simCategoryRaw: String = SimCategory.all.rawValue
+    private var simCategory: SimCategory {
+        get { SimCategory(rawValue: simCategoryRaw) ?? .all }
+    }
+    private enum SimCategory: String, CaseIterable, Identifiable {
+        case all, builtIn, custom, luts
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .all:     return "All"
+            case .builtIn: return "Built-in"
+            case .custom:  return "Custom"
+            case .luts:    return "LUTs"
+            }
+        }
+        var icon: String {
+            switch self {
+            case .all:     return "square.grid.2x2.fill"
+            case .builtIn: return "film.fill"      // film reel
+            case .custom:  return "wrench.fill"    // wrench for hand-tuned
+            case .luts:    return "cube.fill"      // cube for 3D LUT
+            }
+        }
+        var accent: Color {
+            switch self {
+            case .all:     return .white
+            case .builtIn: return .yellow
+            case .custom:  return .cyan
+            case .luts:    return .orange
+            }
+        }
+    }
     @State private var editingSim: CustomSimulation?
     @State private var sectionOverlaysExpanded = true
     @State private var sectionFilmEffectsExpanded = true
@@ -6768,7 +7400,7 @@ struct CameraContentView: View {
 
                     // OVERLAYS section
                     VStack(alignment: .leading, spacing: 8) {
-                        sectionHeader("OVERLAYS", isExpanded: $sectionOverlaysExpanded)
+                        sectionHeader("OVERLAYS", isExpanded: $sectionOverlaysExpanded, accent: .cyan)
                         if sectionOverlaysExpanded {
                             HStack(spacing: 10) {
                                 viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
@@ -6784,20 +7416,73 @@ struct CameraContentView: View {
 
                     // FILM EFFECTS section
                     VStack(alignment: .leading, spacing: 8) {
-                        sectionHeader("FILM EFFECTS", isExpanded: $sectionFilmEffectsExpanded)
+                        sectionHeader("FILM EFFECTS", isExpanded: $sectionFilmEffectsExpanded, accent: .purple)
                         if sectionFilmEffectsExpanded {
                             HStack(spacing: 8) {
-                                viewMenuToggle(icon: "drop.fill", title: "Halation", isOn: $camera.halationEnabled)
-                                viewMenuToggle(icon: "paintpalette", title: "Crosstalk", isOn: $camera.crosstalkEnabled)
-                                viewMenuToggle(icon: "waveform", title: "Rolloff", isOn: $camera.rolloffEnabled)
+                                // Halation = red bloom around highlights on film stock
+                                viewMenuToggle(icon: "drop.fill", title: "Halation",
+                                               isOn: $camera.halationEnabled, accent: .red)
+                                // Crosstalk = channels bleeding into each other → purple
+                                viewMenuToggle(icon: "paintpalette", title: "Crosstalk",
+                                               isOn: $camera.crosstalkEnabled, accent: .purple)
+                                // Rolloff = highlight shoulder → cool blue
+                                viewMenuToggle(icon: "waveform", title: "Rolloff",
+                                               isOn: $camera.rolloffEnabled, accent: .blue)
                             }
                             HStack(spacing: 8) {
-                                viewMenuToggle(icon: "aqi.medium", title: "Flares", isOn: $camera.anamorphicFlareEnabled)
-                                viewMenuToggle(icon: "light.beacon.max", title: "Light Leaks", isOn: $camera.lightArtifactsEnabled)
-                                viewMenuToggle(icon: "line.diagonal", title: "Scratches", isOn: $camera.filmScratchesEnabled)
+                                // Anamorphic flares are classic cyan streaks
+                                viewMenuToggle(icon: "aqi.medium", title: "Flares",
+                                               isOn: $camera.anamorphicFlareEnabled, accent: .cyan)
+                                // Light leaks = warm orange exposure
+                                viewMenuToggle(icon: "light.beacon.max", title: "Light Leaks",
+                                               isOn: $camera.lightArtifactsEnabled, accent: .orange)
+                                // Scratches = chemical decay green tint
+                                viewMenuToggle(icon: "line.diagonal", title: "Scratches",
+                                               isOn: $camera.filmScratchesEnabled, accent: .green)
                             }
                             HStack(spacing: 8) {
-                                viewMenuToggle(icon: "dice", title: "Randomize", isOn: $camera.filmRandomizationEnabled)
+                                // Randomize = chaos → pink
+                                viewMenuToggle(icon: "dice", title: "Randomize",
+                                               isOn: $camera.filmRandomizationEnabled, accent: .pink)
+                            }
+                            // DigiCam quality — only visible when DigiCam is the
+                            // active sim. 5 = crustiest disposable, 20 = clean
+                            // mid-2000s compact. Linear interpolation between.
+                            if camera.selectedSim == .digiCam {
+                                // Magenta accent — distinct from the rest of FILM EFFECTS
+                                // (which use red/purple/blue/cyan/green/pink toggles)
+                                // and signals "this is a digital glitch control, not film."
+                                let digiAccent = Color(red: 1.0, green: 0.32, blue: 0.78)
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "camera.aperture")
+                                            .font(.system(size: 12))
+                                        Text(camera.digiCamQuality < 1
+                                             ? "DigiCam Quality: Off"
+                                             : "DigiCam Quality: \(Int(camera.digiCamQuality))")
+                                            .font(.system(size: 12, weight: .medium))
+                                    }
+                                    .foregroundStyle(camera.digiCamQuality < 1 ? .white.opacity(0.5) : digiAccent)
+                                    HStack(spacing: 8) {
+                                        Text("Off")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.white.opacity(0.5))
+                                        Slider(
+                                            value: Binding(
+                                                get: { Double(camera.digiCamQuality) },
+                                                set: { camera.digiCamQuality = Float($0) }
+                                            ),
+                                            in: 0...20,
+                                            step: 1
+                                        )
+                                        .tint(digiAccent)
+                                        Text("20")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.white.opacity(0.5))
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
                             }
                             // Push / Pull
                             VStack(alignment: .leading, spacing: 6) {
@@ -6844,7 +7529,7 @@ struct CameraContentView: View {
 
                     // SHOOTING section
                     VStack(alignment: .leading, spacing: 8) {
-                        sectionHeader("SHOOTING", isExpanded: $sectionShootingExpanded)
+                        sectionHeader("SHOOTING", isExpanded: $sectionShootingExpanded, accent: .orange)
                         if sectionShootingExpanded {
                             HStack(spacing: 10) {
                                 viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
@@ -6877,7 +7562,7 @@ struct CameraContentView: View {
                     if camera.doubleExposureEnabled {
                         Divider().background(Color.white.opacity(0.2))
                         VStack(alignment: .leading, spacing: 8) {
-                            sectionHeader("DOUBLE EXPOSURE MASK", isExpanded: $sectionDoubleExpExpanded)
+                            sectionHeader("DOUBLE EXPOSURE MASK", isExpanded: $sectionDoubleExpExpanded, accent: .pink)
                             if sectionDoubleExpExpanded {
                                 HStack(spacing: 10) {
                                     viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
@@ -6895,7 +7580,7 @@ struct CameraContentView: View {
 
                     // PHOTO QUALITY section
                     VStack(alignment: .leading, spacing: 6) {
-                        sectionHeader("PHOTO QUALITY", isExpanded: $sectionQualityExpanded)
+                        sectionHeader("PHOTO QUALITY", isExpanded: $sectionQualityExpanded, accent: .mint)
                         if sectionQualityExpanded {
                             HStack(spacing: 6) {
                                 ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
@@ -7039,20 +7724,59 @@ struct CameraContentView: View {
         }
     }
 
-    @ViewBuilder
-    private func sectionHeader(_ title: String, isExpanded: Binding<Bool>) -> some View {
+    /// Handle a .cube LUT file selected via the fileImporter. Copies it to
+    /// the app's LUT directory, validates it parses, creates a CustomSimulation
+    /// entry referencing the file, and auto-selects it as the active sim.
+    private func handleLUTImport(result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            do {
+                let filename = try LUTManager.shared.importLUT(from: url)
+                var sim = CustomSimulation()
+                sim.name = filename
+                    .replacingOccurrences(of: ".cube", with: "",
+                                          options: String.CompareOptions.caseInsensitive)
+                    .replacingOccurrences(of: "_", with: " ")
+                sim.lutFilename = filename
+                customSimStore.simulations.append(sim)
+                customSimStore.save()
+                customSimStore.activeCustomSimID = sim.id
+                camera.activeCustomSim = sim
+                camera.selectedSim = .none
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } catch {
+                // Show a brief save-error message if available; otherwise silent fail
+                camera.saveErrorMessage = "LUT import failed: \(error.localizedDescription)"
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+        case .failure:
+            break   // user cancelled the picker
+        }
+    }
+
+    /// Section-header pill. `accent` colors the title text + chevron so each
+    /// section in the View menu reads as visually distinct at a glance —
+    /// Display=cyan, Film Effects=purple, Shooting=orange, etc.
+    private func sectionHeader(_ title: String, isExpanded: Binding<Bool>, accent: Color = .white) -> some View {
         Button {
             withAnimation(.easeInOut(duration: 0.2)) { isExpanded.wrappedValue.toggle() }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         } label: {
-            HStack {
+            HStack(spacing: 6) {
+                // Small accent dot before the title — strong visual anchor
+                // that survives even with the dim text below.
+                Circle()
+                    .fill(accent)
+                    .frame(width: 5, height: 5)
                 Text(title)
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.4))
+                    .foregroundStyle(accent.opacity(0.85))
+                    .tracking(0.6)
                 Spacer()
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.3))
+                    .foregroundStyle(accent.opacity(0.5))
                     .rotationEffect(.degrees(isExpanded.wrappedValue ? 180 : 0))
                     .animation(.easeInOut(duration: 0.2), value: isExpanded.wrappedValue)
             }
@@ -7061,8 +7785,12 @@ struct CameraContentView: View {
         .buttonStyle(.plain)
     }
 
+    /// Toggle pill. The `accent` param lets each toggle pick its own active
+    /// color — e.g. halation=red (its on-film color), crosstalk=purple,
+    /// scratches=green. Inactive state stays neutral white so the active
+    /// ones really pop.
     @ViewBuilder
-    private func viewMenuToggle(icon: String, title: String, isOn: Binding<Bool>) -> some View {
+    private func viewMenuToggle(icon: String, title: String, isOn: Binding<Bool>, accent: Color = .yellow) -> some View {
         Button {
             isOn.wrappedValue.toggle()
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -7071,9 +7799,14 @@ struct CameraContentView: View {
                 Image(systemName: icon).font(.system(size: 12))
                 Text(title).font(.system(size: 12, weight: isOn.wrappedValue ? .bold : .regular))
             }
-            .foregroundStyle(isOn.wrappedValue ? .yellow : .white)
+            .foregroundStyle(isOn.wrappedValue ? accent : .white)
             .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(Capsule().fill(isOn.wrappedValue ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
+            .background(
+                Capsule().fill(isOn.wrappedValue ? accent.opacity(0.22) : Color.white.opacity(0.1))
+            )
+            .overlay(
+                Capsule().stroke(isOn.wrappedValue ? accent.opacity(0.4) : Color.clear, lineWidth: 0.5)
+            )
         }
         .buttonStyle(.plain)
     }
@@ -7232,67 +7965,185 @@ struct CameraContentView: View {
 
             }
 
-            // Film simulation scroll — hidden in clean mode
-            if !cleanMode { ScrollView(.horizontal, showsIndicators: false) {
+            // Sim category chips + sim strip — hidden in clean mode.
+            // The category row is only shown when there are customs/LUTs
+            // (otherwise it's just clutter for the built-in-only case).
+            if !cleanMode {
+                let hasCustomsOrLUTs = !customSimStore.simulations.isEmpty
+                let cat = simCategory
+                // Partition the custom sims once so the strip doesn't re-walk twice.
+                let customSims = customSimStore.simulations.filter { $0.lutFilename == nil }
+                let lutSims    = customSimStore.simulations.filter { $0.lutFilename != nil }
+                // What goes in the strip for the current category.
+                let showBuiltIns = cat == .all || cat == .builtIn
+                let showCustoms  = cat == .all || cat == .custom
+                let showLUTs     = cat == .all || cat == .luts
+
+                ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
-                    // Built-in sims
-                    ForEach(FilmSimulation.allCases) { sim in
-                        let isSelected = camera.selectedSim == sim && customSimStore.activeCustomSimID == nil
-                        Button {
-                            camera.selectedSim = sim
-                            customSimStore.activeCustomSimID = nil
-                            camera.activeCustomSim = nil
-                        } label: {
-                            Text(sim.label)
-                                .font(.system(size: 13, weight: isSelected ? .bold : .regular))
-                                .foregroundStyle(isSelected ? .black : .white)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(Capsule().fill(isSelected ? Color.yellow : Color.white.opacity(0.18)))
+                    // ── Category tabs inline, same pill style as sims below.
+                    // Icon + label, accent-colored when active. Followed by a
+                    // thin divider so the sims feel like a separate visual
+                    // group while still scrolling as one row.
+                    if hasCustomsOrLUTs {
+                        ForEach(SimCategory.allCases) { c in
+                            let isActive = c == cat
+                            let count: Int = {
+                                switch c {
+                                case .all:     return FilmSimulation.allCases.count + customSimStore.simulations.count
+                                case .builtIn: return FilmSimulation.allCases.count
+                                case .custom:  return customSims.count
+                                case .luts:    return lutSims.count
+                                }
+                            }()
+                            if c == .all || count > 0 {
+                                Button {
+                                    simCategoryRaw = c.rawValue
+                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: c.icon)
+                                            .font(.system(size: 10))
+                                        Text(c.label)
+                                            .font(.system(size: 13, weight: isActive ? .bold : .regular))
+                                    }
+                                    .foregroundStyle(isActive ? .black : c.accent)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        Capsule().fill(isActive ? c.accent : c.accent.opacity(0.15))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
-                        .buttonStyle(.plain)
+                        // Thin divider between tabs and the sims that follow
+                        Rectangle()
+                            .fill(Color.white.opacity(0.25))
+                            .frame(width: 1, height: 24)
+                            .padding(.horizontal, 2)
+                    }
+                    // Built-in sims
+                    if showBuiltIns {
+                        ForEach(FilmSimulation.allCases) { sim in
+                            let isSelected = camera.selectedSim == sim && customSimStore.activeCustomSimID == nil
+                            Button {
+                                camera.selectedSim = sim
+                                customSimStore.activeCustomSimID = nil
+                                camera.activeCustomSim = nil
+                            } label: {
+                                Text(sim.label)
+                                    .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                                    .foregroundStyle(isSelected ? .black : .white)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Capsule().fill(isSelected ? Color.yellow : Color.white.opacity(0.18)))
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
 
-                    // Divider
-                    if !customSimStore.simulations.isEmpty {
+                    // Divider — only show in "All" view between built-ins and customs.
+                    if cat == .all && hasCustomsOrLUTs {
                         Rectangle()
                             .fill(Color.white.opacity(0.2))
                             .frame(width: 1, height: 24)
                     }
 
-                    // Custom sims
-                    ForEach(customSimStore.simulations) { sim in
-                        let isSelected = customSimStore.activeCustomSimID == sim.id
-                        Button {
-                            customSimStore.activeCustomSimID = sim.id
-                            camera.activeCustomSim = sim
-                            camera.selectedSim = .none
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "paintbrush.fill")
-                                    .font(.system(size: 9))
-                                Text(sim.name)
-                                    .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                    // Custom (param-based) sims
+                    if showCustoms {
+                        ForEach(customSims) { sim in
+                            let isSelected = customSimStore.activeCustomSimID == sim.id
+                            Button {
+                                customSimStore.activeCustomSimID = sim.id
+                                camera.activeCustomSim = sim
+                                camera.selectedSim = .none
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "paintbrush.fill")
+                                        .font(.system(size: 9))
+                                    Text(sim.name)
+                                        .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                                }
+                                .foregroundStyle(isSelected ? .black : .cyan)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Capsule().fill(isSelected ? Color.cyan : Color.cyan.opacity(0.15)))
                             }
-                            .foregroundStyle(isSelected ? .black : .cyan)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Capsule().fill(isSelected ? Color.cyan : Color.cyan.opacity(0.15)))
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // LUT-based sims
+                    if showLUTs {
+                        ForEach(lutSims) { sim in
+                            let isSelected = customSimStore.activeCustomSimID == sim.id
+                            Button {
+                                customSimStore.activeCustomSimID = sim.id
+                                camera.activeCustomSim = sim
+                                camera.selectedSim = .none
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "cube.fill")
+                                        .font(.system(size: 9))
+                                    Text(sim.name)
+                                        .font(.system(size: 13, weight: isSelected ? .bold : .regular))
+                                }
+                                .foregroundStyle(isSelected ? .black : .orange)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Capsule().fill(isSelected ? Color.orange : Color.orange.opacity(0.15)))
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    if let name = sim.lutFilename {
+                                        LUTManager.shared.deleteLUT(filename: name)
+                                    }
+                                    customSimStore.delete(sim)
+                                    if customSimStore.activeCustomSimID == sim.id {
+                                        camera.activeCustomSim = nil
+                                    }
+                                } label: {
+                                    Label("Delete LUT", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+
+                    // Create custom sim button — only in All or Custom
+                    if cat == .all || cat == .custom {
+                        Button {
+                            showCustomSimEditor = true
+                        } label: {
+                            Image(systemName: "plus.circle")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.cyan)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
                         }
                         .buttonStyle(.plain)
                     }
 
-                    // Create/edit custom sims button
-                    Button {
-                        showCustomSimEditor = true
-                    } label: {
-                        Image(systemName: "plus.circle")
-                            .font(.system(size: 18))
-                            .foregroundStyle(.cyan)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
+                    // Import LUT button — only in All or LUTs
+                    if cat == .all || cat == .luts {
+                        Button {
+                            showLUTImporter = true
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "plus.square.dashed")
+                                    .font(.system(size: 11))
+                                Text("LUT")
+                                    .font(.system(size: 13))
+                            }
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Capsule().stroke(Color.orange.opacity(0.5), lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 32)
             }
@@ -7303,6 +8154,16 @@ struct CameraContentView: View {
             .fullScreenCover(isPresented: $showSonyView) {
                 SonyView(camera: camera)
                     .preferredColorScheme(.dark)
+            }
+            .fileImporter(
+                isPresented: $showLUTImporter,
+                allowedContentTypes: [
+                    UTType(filenameExtension: "cube") ?? .data,
+                    .data
+                ],
+                allowsMultipleSelection: false
+            ) { result in
+                handleLUTImport(result: result)
             }
             } // end if !cleanMode (film sim strip)
 
@@ -7328,12 +8189,24 @@ struct CameraContentView: View {
                             .font(.system(size: 14))
                             .foregroundStyle(.white.opacity(0.6))
 
-                        // Context-aware grain button — only active when grain is on
+                        // Context-aware grain button — only active when grain is on.
+                        // Repurposed per active sim:
+                        //   • DigiCam → "lines" (CCD scanline overlay)
+                        //   • Circuit-bent → "wild" (random light/color drift)
+                        //   • everything else → context-aware grain (luma-scaled)
+                        let isDigiCamActive = camera.selectedSim == .digiCam
+                            && customSimStore.activeCustomSimID == nil
+                        let ctxIcon: String = {
+                            if isDigiCamActive {
+                                return camera.contextAwareGrainEnabled ? "lines.measurement.horizontal" : "line.3.horizontal"
+                            }
+                            return camera.contextAwareGrainEnabled ? "waveform.badge.magnifyingglass" : "waveform"
+                        }()
                         Button {
                             camera.contextAwareGrainEnabled.toggle()
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                         } label: {
-                            Image(systemName: camera.contextAwareGrainEnabled ? "waveform.badge.magnifyingglass" : "waveform")
+                            Image(systemName: ctxIcon)
                                 .font(.system(size: 14))
                                 .iconRotation(motion.iconAngle)
                                 .foregroundStyle(camera.contextAwareGrainEnabled ? .yellow : .white.opacity(0.5))

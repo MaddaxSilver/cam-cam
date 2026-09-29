@@ -1,0 +1,33 @@
+# ── Xcode ──────────────────────────────────────────────
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# ── Swift Package Manager ──────────────────────────────
+.build/
+.swiftpm/
+Packages/
+
+# ── macOS ──────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# ── Separate project living in this folder (not cam cam) ─
+CharacterChat/
+
+# ── Local scratch / secrets ────────────────────────────
+*.log

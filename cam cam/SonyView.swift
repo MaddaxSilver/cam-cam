@@ -10,6 +10,7 @@
 
 import SwiftUI
 import Photos
+import UniformTypeIdentifiers
 
 struct SonyView: View {
     @State private var sony = SonyConnector()
@@ -29,12 +30,21 @@ struct SonyView: View {
     @State private var showViewMenu = false
     @State private var cleanMode = false
     @State private var showGrid = false
-    /// When true, the SonyView UI ignores device tilt: icons stay put and the
-    /// live view doesn't rotate. Persisted across app launches.
-    @AppStorage("cc_sonyRotationLocked") private var rotationLocked: Bool = false
+    /// When true, Sony mode pins iOS to portrait orientation. Icons and the
+    /// live view manually rotate via motion to stay upright relative to
+    /// gravity — same model as a pro camera app. Default ON for Sony mode
+    /// because a tethered shoot typically has the phone held in a fixed
+    /// hand position; iOS auto-rotation tends to be a nuisance there.
+    /// User can toggle via the lock button in the top bar.
+    /// Persisted across app launches.
+    @AppStorage("cc_sonyRotationLocked") private var rotationLocked: Bool = true
     /// When true, the diagnostic log overlay is visible. Useful since the
     /// phone is on the camera's WiFi and not reachable from Xcode.
     @State private var showDebugLog = false
+    /// File picker presentation for .cube LUT import.
+    @State private var showLUTImporter = false
+    /// Last LUT import error message — shown briefly in shutterStatus if set.
+    @State private var lutImportError: String? = nil
 
     /// Identifies which setting picker (if any) is open. nil = none.
     enum SettingPicker: Identifiable {
@@ -79,6 +89,95 @@ struct SonyView: View {
 
     /// Push our desired orientation mask to AppDelegate and ask iOS to apply
     /// it. Called when the view appears and whenever the lock toggles.
+    /// Combined ordered list of all selectable sims: None → built-ins → customs.
+    /// Used to know where we are when cycling via volume buttons.
+    private enum SimSlot: Equatable {
+        case builtin(FilmSimulation)
+        case custom(CustomSimulation)
+    }
+    private var allSimSlots: [SimSlot] {
+        var slots: [SimSlot] = FilmSimulation.allCases.map(SimSlot.builtin)
+        slots += customSimStore.simulations.map(SimSlot.custom)
+        return slots
+    }
+    /// Index of the currently-active sim in allSimSlots (0 = None).
+    private var currentSimIndex: Int {
+        if let active = camera.activeCustomSim,
+           let i = allSimSlots.firstIndex(where: {
+               if case .custom(let s) = $0 { return s.id == active.id }
+               return false
+           }) {
+            return i
+        }
+        if let i = allSimSlots.firstIndex(where: {
+            if case .builtin(let s) = $0 { return s == camera.selectedSim }
+            return false
+        }) {
+            return i
+        }
+        return 0
+    }
+    /// Volume-button driver. Vol-Up = forward, Vol-Down = backward.
+    /// Wraps around end-to-end so you can hold the button and cycle.
+    private func cycleSim(forward: Bool) {
+        let list = allSimSlots
+        guard !list.isEmpty else { return }
+        let n = list.count
+        let next = ((currentSimIndex + (forward ? 1 : -1)) % n + n) % n
+        let slot = list[next]
+        switch slot {
+        case .builtin(let sim):
+            camera.selectedSim = sim
+            camera.activeCustomSim = nil
+            customSimStore.activeCustomSimID = nil
+            sony.selectedSim = sim
+            sony.activeCustomSim = nil
+        case .custom(let sim):
+            customSimStore.activeCustomSimID = sim.id
+            camera.activeCustomSim = sim
+            camera.selectedSim = .none
+            sony.activeCustomSim = sim
+            sony.selectedSim = .none
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    /// Handle the result of the .fileImporter for LUTs. Copies the .cube file
+    /// into the app's LUT directory, validates it parses, then creates a new
+    /// CustomSimulation entry referencing the file so it shows up in the
+    /// film sim strip alongside the param-based customs.
+    private func handleLUTImport(result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            do {
+                let filename = try LUTManager.shared.importLUT(from: url)
+                // Build a CustomSimulation referencing this LUT.
+                var sim = CustomSimulation()
+                sim.name = filename
+                    .replacingOccurrences(of: ".cube", with: "",
+                                          options: String.CompareOptions.caseInsensitive)
+                    .replacingOccurrences(of: "_", with: " ")
+                sim.lutFilename = filename
+                customSimStore.simulations.append(sim)
+                customSimStore.save()
+                // Auto-activate the freshly imported LUT
+                customSimStore.activeCustomSimID = sim.id
+                camera.activeCustomSim = sim
+                camera.selectedSim = .none
+                sony.activeCustomSim = sim
+                sony.selectedSim = .none
+                sony.shutterStatus = "✅ Imported LUT: \(sim.name)"
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } catch {
+                sony.shutterStatus = "❌ LUT import failed: \(error.localizedDescription)"
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
+        case .failure(let err):
+            sony.shutterStatus = "❌ \(err.localizedDescription)"
+        }
+    }
+
     private func applyOrientationLock() {
         let mask: UIInterfaceOrientationMask = rotationLocked ? .portrait : .all
         AppDelegate.orientationLock = mask
@@ -117,13 +216,15 @@ struct SonyView: View {
             motion.startUpdates()
             customSimStore.load()
             applyOrientationLock()
+            // Pause the iPhone camera capture session — we're using the Sony
+            // body for live view + capture, so keeping AVCaptureSession alive
+            // would just drain battery for nothing.
+            camera.pauseForExternalUse()
             sony.applySimClosure = { [weak camera] image, sim, custom in
                 guard let camera else { return image }
                 return camera.applySimAndGrainDirect(to: image, sim: sim, custom: custom)
             }
             sony.onPhotoProcessed = { processed in
-                // Saving is handled inside SonyConnector.downloadAndProcess (with error logging).
-                // This closure is UI-only: show the toast and update the thumbnail strip.
                 withAnimation { showSavedToast = true }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                     withAnimation { showSavedToast = false }
@@ -131,9 +232,19 @@ struct SonyView: View {
                 recentPhotos.insert(processed, at: 0)
                 if recentPhotos.count > 12 { recentPhotos = Array(recentPhotos.prefix(12)) }
             }
+            // Take exclusive control of volume buttons while SonyView is up:
+            // Vol Up → next film sim, Vol Down → previous.  Routes through
+            // CameraView's existing observer instead of creating our own.
+            VolumeButtonObserver.overrideOnUp   = { cycleSim(forward: true) }
+            VolumeButtonObserver.overrideOnDown = { cycleSim(forward: false) }
         }
         .onDisappear {
             motion.stopUpdates()
+            // Restore CameraView's default volume-button behavior
+            VolumeButtonObserver.overrideOnUp   = nil
+            VolumeButtonObserver.overrideOnDown = nil
+            // Resume the iPhone capture session for the underlying CameraView.
+            camera.resumeFromExternalUse()
             // Restore the app's default portrait lock when leaving SonyView so
             // CameraView (which assumes portrait) keeps working correctly.
             AppDelegate.orientationLock = .portrait
@@ -146,6 +257,16 @@ struct SonyView: View {
         }
         .sheet(item: $selectedPhoto) { wrapped in
             photoViewer(wrapped.image)
+        }
+        .fileImporter(
+            isPresented: $showLUTImporter,
+            allowedContentTypes: [
+                UTType(filenameExtension: "cube") ?? .data,
+                .data
+            ],
+            allowsMultipleSelection: false
+        ) { result in
+            handleLUTImport(result: result)
         }
         .sheet(item: $openPicker) { picker in
             settingPickerSheet(picker)
@@ -176,13 +297,20 @@ struct SonyView: View {
                 // rotationEffect spins the image to follow device orientation
                 // so the camera's "up" stays at the top of the phone.
                 if let frame = sony.liveViewImage {
-                    // Dimension swap when phone is sideways: size the image's
-                    // pre-rotation frame as H×W so that after the 90° rotation
-                    // it occupies the screen's "landscape" rectangle. This makes
-                    // a 16:9 image fill nearly the whole screen in landscape
-                    // (instead of becoming a tiny strip), while staying as a
-                    // strip in portrait — no crop in either case.
-                    let isSideways = Int(effectiveAngle.rounded()) % 180 != 0
+                    // Dimension swap so the 16:9 image fills the screen's
+                    // visual landscape rectangle when the phone is held
+                    // sideways. Drive isSideways from the DISCRETE
+                    // motion.isLandscape Bool, NOT from the animated
+                    // effectiveAngle — otherwise the swap would flicker
+                    // through intermediate values during the 0.3 s rotation
+                    // animation, causing a visible jump.
+                    //
+                    // Only swap when we're actually in lock-on + landscape:
+                    //   • rotationLocked + landscape → swap (we provide the rotation)
+                    //   • rotationLocked + portrait  → no swap
+                    //   • unlocked                   → iOS rotates the whole view,
+                    //                                  no swap needed
+                    let isSideways = rotationLocked && motion.isLandscape
                     Image(uiImage: frame)
                         .resizable()
                         .scaledToFit()
@@ -281,6 +409,25 @@ struct SonyView: View {
                                     .multilineTextAlignment(.center)
                                     .padding(.horizontal, 24)
                                     .transition(.opacity)
+                            }
+                            if sony.downloadQueueDepth > 0 {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "tray.and.arrow.down.fill")
+                                        .font(.system(size: 10))
+                                    Text("\(sony.downloadQueueDepth) queued")
+                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                }
+                                .foregroundStyle(Color.orange.opacity(0.9))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule().fill(Color.orange.opacity(0.12))
+                                )
+                                .overlay(
+                                    Capsule().stroke(Color.orange.opacity(0.35), lineWidth: 0.5)
+                                )
+                                .transition(.scale.combined(with: .opacity))
+                                .animation(.easeInOut(duration: 0.2), value: sony.downloadQueueDepth)
                             }
                             sonyShutterRow
                                 .padding(.bottom, 8)
@@ -742,9 +889,10 @@ struct SonyView: View {
                         .frame(width: 1, height: 24)
                 }
 
-                // Custom sims
+                // Custom sims (param-based + LUT-based both show here)
                 ForEach(customSimStore.simulations) { sim in
                     let isActive = customSimStore.activeCustomSimID == sim.id
+                    let isLUT = sim.lutFilename != nil
                     Button {
                         customSimStore.activeCustomSimID = sim.id
                         camera.activeCustomSim = sim
@@ -754,17 +902,50 @@ struct SonyView: View {
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "paintbrush.fill")
+                            Image(systemName: isLUT ? "cube.fill" : "paintbrush.fill")
                                 .font(.system(size: 9))
                             Text(sim.name)
                                 .font(.system(size: 13, weight: isActive ? .bold : .regular))
                         }
-                        .foregroundStyle(isActive ? .black : .cyan)
+                        .foregroundStyle(isActive ? .black : (isLUT ? .orange : .cyan))
                         .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(Capsule().fill(isActive ? Color.cyan : Color.cyan.opacity(0.15)))
+                        .background(Capsule().fill(
+                            isActive
+                                ? (isLUT ? Color.orange : Color.cyan)
+                                : (isLUT ? Color.orange.opacity(0.15) : Color.cyan.opacity(0.15))
+                        ))
                     }
                     .buttonStyle(.plain)
+                    .contextMenu {
+                        if isLUT {
+                            Button(role: .destructive) {
+                                if let name = sim.lutFilename {
+                                    LUTManager.shared.deleteLUT(filename: name)
+                                }
+                                customSimStore.delete(sim)
+                            } label: {
+                                Label("Delete LUT", systemImage: "trash")
+                            }
+                        }
+                    }
                 }
+
+                // "Import LUT" button — always at end of strip
+                Button {
+                    showLUTImporter = true
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus.square.dashed")
+                            .font(.system(size: 11))
+                        Text("LUT")
+                            .font(.system(size: 13, weight: .regular))
+                    }
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Capsule().stroke(Color.orange.opacity(0.5), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 8)
         }
@@ -1021,8 +1202,13 @@ struct SonyView: View {
                 .padding(.leading, evAlignment == .leading ? 8 : 0)
                 .animation(.easeInOut(duration: 0.25), value: evAlignment)
 
-            // Recent photos thumbnail / placeholder
-            Group {
+            // Recent photos thumbnail / placeholder.
+            // Wrapped in ZStack so the rotation is applied to a fixed-size
+            // 54x54 box (instead of the variable Group container), giving
+            // the rotation a stable visual pivot. Animation tied explicitly
+            // to effectiveAngle so the thumbnail eases through rotation
+            // changes in sync with the rest of the chrome.
+            ZStack {
                 if let last = recentPhotos.first {
                     Image(uiImage: last)
                         .resizable()
@@ -1040,7 +1226,9 @@ struct SonyView: View {
                         .frame(width: 54, height: 54)
                 }
             }
-            .iconRotation(effectiveAngle)
+            .frame(width: 54, height: 54)
+            .rotationEffect(.degrees(effectiveAngle))
+            .animation(.easeInOut(duration: 0.3), value: effectiveAngle)
             .frame(maxWidth: .infinity, alignment: thumbAlignment)
             .padding(.leading, thumbAlignment == .leading ? 12 : 0)
             .padding(.trailing, thumbAlignment == .trailing ? 12 : 0)
