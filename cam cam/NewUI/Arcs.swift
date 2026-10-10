@@ -366,7 +366,7 @@ struct LensPill: View {
         HStack(spacing: 1) {
             if scrubbing {
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text("\(liveMM)").font(.system(size: 22, weight: .semibold).monospacedDigit())
+                    Text("\(liveMM)").font(.system(size: 22, weight: .bold).monospacedDigit())
                         .foregroundStyle(.yellow)
                         .contentTransition(.numericText())
                     Text("mm").font(.system(size: 12, weight: .semibold))
@@ -381,9 +381,9 @@ struct LensPill: View {
                     let hot = on || (selectedIndex < 0 && i == nearestIndex)
                     Button { onTap(i) } label: {
                         Text(label)
-                            .font(.system(size: hot ? 13 : 11, weight: .semibold).monospacedDigit())
+                            .font(.system(size: hot ? 16 : 14, weight: .bold).monospacedDigit())
                             .foregroundStyle(hot ? Color.yellow : .white)
-                            .frame(width: 36, height: 36)
+                            .frame(width: 38, height: 38)
                             .background(Circle().fill(hot ? Color.black.opacity(0.45) : .clear))
                     }
                     .buttonStyle(.plain)
