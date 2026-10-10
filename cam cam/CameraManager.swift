@@ -522,6 +522,31 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) private var rawStash: [Int64: Data] = [:]
     @ObservationIgnored private let rawStashLock = NSLock()
 
+    /// Per-shot settings, applied when that shot's render starts.
+    @ObservationIgnored nonisolated(unsafe) private var shotSettings: [Int64: (apply: @Sendable () -> Void, portrait: Bool)] = [:]
+    @ObservationIgnored nonisolated(unsafe) private var shotsRendering = 0
+
+    nonisolated var hasShotsInFlight: Bool {
+        rawStashLock.lock(); defer { rawStashLock.unlock() }
+        return !shotSettings.isEmpty || shotsRendering > 0
+    }
+
+    nonisolated func registerShot(id: Int64, apply: @escaping @Sendable () -> Void, portrait: Bool) {
+        rawStashLock.lock(); shotSettings[id] = (apply, portrait); rawStashLock.unlock()
+    }
+
+    /// Take a delivered shot's settings and count it as rendering.
+    nonisolated func takeShot(id: Int64) -> (apply: @Sendable () -> Void, portrait: Bool)? {
+        rawStashLock.lock(); defer { rawStashLock.unlock() }
+        guard let s = shotSettings.removeValue(forKey: id) else { return nil }
+        shotsRendering += 1
+        return s
+    }
+
+    nonisolated func shotRendered() {
+        rawStashLock.lock(); shotsRendering = max(0, shotsRendering - 1); rawStashLock.unlock()
+    }
+
     nonisolated func stashRAW(_ data: Data, id: Int64) {
         rawStashLock.lock()
         if rawStash.count > 6, let oldest = rawStash.keys.min() { rawStash[oldest] = nil }
@@ -1708,38 +1733,71 @@ import CoreLocation
             return
         }
         isCapturing = true   // didSet pushes Watch state — no need to call pushState again
-        pendingSim = selectedSim
-        pendingGrain = grainAmount
-        pendingAspectRatio = selectedAspectRatio
-        pendingIsLandscape = isLandscape
-        pendingDeviceAngle = deviceAngle
-        pendingGrainEnabled = grainEnabled
-        pendingContextAwareGrain = contextAwareGrainEnabled
-        pendingISO = isoValue
-        pendingCrosstalk = crosstalkAmount
-        pendingHalation = halationAmount
-        pendingRolloff = rolloffThreshold
-        pendingCrosstalkEnabled = crosstalkEnabled
-        pendingHalationEnabled = halationEnabled
-        pendingRolloffEnabled = rolloffEnabled
-        pendingDoubleExposureOpacity = doubleExposureOpacity
-        pendingMask = doubleExposureMaskEnabled ? doubleExposureMask : nil
-        pendingCustomSim = activeCustomSim
-        pendingQuality = effectiveQualityPrioritization
-        pendingLongExposureDuration = longExposureDuration
-        pendingPushPullEnabled = pushPullEnabled
-        pendingPushPullAmount = pushPullAmount
-        pendingAnamorphicFlareEnabled = anamorphicFlareEnabled
-        pendingLightArtifactsEnabled = lightArtifactsEnabled
-        pendingFilmScratchesEnabled = filmScratchesEnabled
-        pendingRandomizationEnabled = filmRandomizationEnabled
-        pendingRandomSeed = UInt64.random(in: 0..<UInt64.max)
-        pendingPortraitEnabled = portraitModeEnabled
-        pendingPortraitFStop = portraitFStop
-        // Snapshot the on-device zoom factor for the photo pipeline. On virtual
-        // cameras (triple/dual) iOS occasionally delivers the constituent's
-        // full FOV without applying the zoom — we crop ourselves as a safety net.
-        pendingZoomCropFactor = computePhotoZoomCropFactor()
+        // Each shot keeps its own copy of the settings: the shutter frees as soon
+        // as the exposure is taken, so the next shot can start before this one
+        // has rendered, and must not change its film, crop or rotation.
+        // (computePhotoZoomCropFactor snapshots the on-device zoom: virtual
+        // cameras sometimes deliver the full FOV, so we crop as a safety net.)
+        let shotSim = selectedSim
+        let shotGrain = grainAmount
+        let shotAspectRatio = selectedAspectRatio
+        let shotIsLandscape = isLandscape
+        let shotDeviceAngle = deviceAngle
+        let shotGrainEnabled = grainEnabled
+        let shotContextAwareGrain = contextAwareGrainEnabled
+        let shotISO = isoValue
+        let shotCrosstalk = crosstalkAmount
+        let shotHalation = halationAmount
+        let shotRolloff = rolloffThreshold
+        let shotCrosstalkEnabled = crosstalkEnabled
+        let shotHalationEnabled = halationEnabled
+        let shotRolloffEnabled = rolloffEnabled
+        let shotDoubleExposureOpacity = doubleExposureOpacity
+        let shotMask = doubleExposureMaskEnabled ? doubleExposureMask : nil
+        let shotCustomSim = activeCustomSim
+        let shotQuality = effectiveQualityPrioritization
+        let shotLongExposureDuration = longExposureDuration
+        let shotPushPullEnabled = pushPullEnabled
+        let shotPushPullAmount = pushPullAmount
+        let shotAnamorphicFlareEnabled = anamorphicFlareEnabled
+        let shotLightArtifactsEnabled = lightArtifactsEnabled
+        let shotFilmScratchesEnabled = filmScratchesEnabled
+        let shotRandomizationEnabled = filmRandomizationEnabled
+        let shotRandomSeed = UInt64.random(in: 0..<UInt64.max)
+        let shotPortraitEnabled = portraitModeEnabled
+        let shotPortraitFStop = portraitFStop
+        let shotZoomCropFactor = computePhotoZoomCropFactor()
+        let applySettings: @Sendable () -> Void = { [self] in
+            pendingSim = shotSim
+            pendingGrain = shotGrain
+            pendingAspectRatio = shotAspectRatio
+            pendingIsLandscape = shotIsLandscape
+            pendingDeviceAngle = shotDeviceAngle
+            pendingGrainEnabled = shotGrainEnabled
+            pendingContextAwareGrain = shotContextAwareGrain
+            pendingISO = shotISO
+            pendingCrosstalk = shotCrosstalk
+            pendingHalation = shotHalation
+            pendingRolloff = shotRolloff
+            pendingCrosstalkEnabled = shotCrosstalkEnabled
+            pendingHalationEnabled = shotHalationEnabled
+            pendingRolloffEnabled = shotRolloffEnabled
+            pendingDoubleExposureOpacity = shotDoubleExposureOpacity
+            pendingMask = shotMask
+            pendingCustomSim = shotCustomSim
+            pendingQuality = shotQuality
+            pendingLongExposureDuration = shotLongExposureDuration
+            pendingPushPullEnabled = shotPushPullEnabled
+            pendingPushPullAmount = shotPushPullAmount
+            pendingAnamorphicFlareEnabled = shotAnamorphicFlareEnabled
+            pendingLightArtifactsEnabled = shotLightArtifactsEnabled
+            pendingFilmScratchesEnabled = shotFilmScratchesEnabled
+            pendingRandomizationEnabled = shotRandomizationEnabled
+            pendingRandomSeed = shotRandomSeed
+            pendingPortraitEnabled = shotPortraitEnabled
+            pendingPortraitFStop = shotPortraitFStop
+            pendingZoomCropFactor = shotZoomCropFactor
+        }
 
         if isLongExposure {
             switch longExposureMode {
@@ -1748,12 +1806,18 @@ import CoreLocation
             case .nativeExposure:
                 sessionQueue.async { self.startNativeExposure() }
             }
+            applySettings()
             return
         }
+        // While an earlier shot is still rendering, its settings must stay put;
+        // this shot's are applied when its own render starts.
+        if !hasShotsInFlight { applySettings() }
 
         let flash = flashMode
         let strength = flashStrength
         let useRAW = rawEnabled
+        let quality = effectiveQualityPrioritization
+        let portrait = portraitModeEnabled
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
             let codec: AVVideoCodecType = photoOutput.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
@@ -1775,9 +1839,9 @@ import CoreLocation
                     ])
                 }
             }
-            settings.photoQualityPrioritization = pendingQuality
+            settings.photoQualityPrioritization = quality
             let dims = currentDevice?.activeFormat.supportedMaxPhotoDimensions
-            switch pendingQuality {
+            switch quality {
             case .quality:
                 if let d = dims?.max(by: { $0.width * $0.height < $1.width * $1.height }) {
                     settings.maxPhotoDimensions = d
@@ -1801,6 +1865,7 @@ import CoreLocation
             } else if photoOutput.supportedFlashModes.contains(flash) {
                 settings.flashMode = flash
             }
+            registerShot(id: settings.uniqueID, apply: applySettings, portrait: portrait)
             photoOutput.capturePhoto(with: settings, delegate: self)
         }
     }
@@ -2265,11 +2330,13 @@ import CoreLocation
 
     // MARK: Film Processing & Save
 
-    nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil) {
+    nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil, shot: (@Sendable () -> Void)? = nil) {
         // Unblock shutter immediately — process and save in background
         DispatchQueue.main.async { self.isCapturing = false }
 
         processQueue.async { [self] in
+            if let shot { shot() }
+            defer { if shot != nil { shotRendered() } }
             guard var ciImage = CIImage(data: imageData) else { return }
 
             // Extract original metadata (focal length, lens, GPS, etc.) before processing
@@ -2327,11 +2394,13 @@ import CoreLocation
     }
 
     /// Portrait capture using the live-streamed depth pixel buffer from AVCaptureDepthDataOutput.
-    nonisolated func processAndSavePortraitFromBuffer(imageData: Data, depthBuffer: CVPixelBuffer, rawID: Int64? = nil) {
+    nonisolated func processAndSavePortraitFromBuffer(imageData: Data, depthBuffer: CVPixelBuffer, rawID: Int64? = nil, shot: (@Sendable () -> Void)? = nil) {
         DispatchQueue.main.async { self.isCapturing = false }
         // CVPixelBuffer is not Sendable — rebind before the closure captures it
         nonisolated(unsafe) let sendableBuffer = depthBuffer
         processQueue.async { [self] in
+            if let shot { shot() }
+            defer { if shot != nil { shotRendered() } }
             guard var ciImage = CIImage(data: imageData) else { return };
             let originalMetadata = ciImage.properties
             ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
@@ -2974,6 +3043,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 // MARK: - AVCapturePhotoCaptureDelegate
 
 extension CameraManager: AVCapturePhotoCaptureDelegate {
+    /// The exposure is done: free the shutter now instead of waiting for the
+    /// full-res photo to be processed (seconds at 48MP / RAW). The double
+    /// exposure's first frame still waits — its preview is needed first.
+    nonisolated func photoOutput(_ output: AVCapturePhotoOutput,
+                                 didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        guard !capturingFirstExposure, !burstActive else { return }
+        DispatchQueue.main.async { self.isCapturing = false }
+    }
+
     nonisolated func photoOutput(
         _ output: AVCapturePhotoOutput,
         didFinishProcessingPhoto photo: AVCapturePhoto,
@@ -3011,7 +3089,9 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             return
         }
 
+        let shot = takeShot(id: photo.resolvedSettings.uniqueID)
         guard let data = photo.fileDataRepresentation() else {
+            if shot != nil { shotRendered() }
             DispatchQueue.main.async {
                 self.isCapturing = false
                 self.isBursting = false
@@ -3022,6 +3102,7 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // Double exposure first shot — apply sim, store CIImage, don't save
         if capturingFirstExposure {
             capturingFirstExposure = false
+            if let shot { processQueue.sync { shot.apply() }; shotRendered() }
             if let ciImage = CIImage(data: data) {
                 let oriented = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
                 // Safety crop for virtual cameras (no-op on physical) so first
@@ -3071,10 +3152,10 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // Portrait mode: apply high-quality depth blur using the most recent live depth frame.
         // (Depth is delivered via AVCaptureDepthDataOutput, not embedded in AVCapturePhoto
         //  when a separate depth output is in the session.)
-        if pendingPortraitEnabled, let depthBuffer = latestDepthPixelBuffer {
-            processAndSavePortraitFromBuffer(imageData: data, depthBuffer: depthBuffer, rawID: pairedRAWID)
+        if shot?.portrait ?? pendingPortraitEnabled, let depthBuffer = latestDepthPixelBuffer {
+            processAndSavePortraitFromBuffer(imageData: data, depthBuffer: depthBuffer, rawID: pairedRAWID, shot: shot?.apply)
         } else {
-            processAndSaveJPEG(imageData: data, rawID: pairedRAWID)
+            processAndSaveJPEG(imageData: data, rawID: pairedRAWID, shot: shot?.apply)
         }
     }
 }
