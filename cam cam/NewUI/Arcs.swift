@@ -363,16 +363,16 @@ struct LensPill: View {
     var onScrubEnd: () -> Void
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 1) {
             if scrubbing {
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text("\(liveMM)").font(.system(size: 18, weight: .semibold).monospacedDigit())
+                    Text("\(liveMM)").font(.system(size: 22, weight: .semibold).monospacedDigit())
                         .foregroundStyle(.yellow)
                         .contentTransition(.numericText())
                     Text("mm").font(.system(size: 12, weight: .semibold))
                 }
-                .padding(.horizontal, 16)
-                .frame(height: 28)
+                .padding(.horizontal, 18)
+                .frame(height: 34)
             } else {
                 ForEach(Array(focalPresets.enumerated()), id: \.offset) { i, p in
                     let on = i == selectedIndex
@@ -381,18 +381,20 @@ struct LensPill: View {
                     let hot = on || (selectedIndex < 0 && i == nearestIndex)
                     Button { onTap(i) } label: {
                         Text(label)
-                            .font(.system(size: hot ? 12 : 10.5, weight: .semibold).monospacedDigit())
+                            .font(.system(size: hot ? 13 : 11, weight: .semibold).monospacedDigit())
                             .foregroundStyle(hot ? Color.yellow : .white)
-                            .frame(width: 30, height: 28)
-                            .background(Capsule().fill(hot ? Color.black.opacity(0.45) : .clear))
+                            .frame(width: 36, height: 36)
+                            .background(Circle().fill(hot ? Color.black.opacity(0.45) : .clear))
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("\(p.mm) millimetre")
                 }
             }
         }
-        .padding(2)
-        .glassEffect(.regular.interactive(), in: Capsule())
+        .padding(3)
+        // No glass of its own: the numbers sit on the dial's glass, so the
+        // pill reads as part of the dial rather than a second layer on it.
+        .contentShape(Capsule())
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.25)
                 .sequenced(before: DragGesture(minimumDistance: 0))
