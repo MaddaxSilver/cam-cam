@@ -111,4 +111,43 @@ float4 halationApply(sample_t s, sample_t energy, sample_t nearHalo, sample_t fa
     return float4(linearToSrgb(lin), s.a);
 }
 
+// MARK: - Film engine (colour negative + print, and B&W)
+//
+// Film is modelled in exposure, not as a filter on the finished image:
+//
+//   1. Spectral sensitivity: a 3×3 matrix — how the film's three dye layers
+//      see the scene (their sensitivities overlap differently from a sensor).
+//   2. Exposure in stops around mid grey.
+//   3. Each layer's characteristic curve: an S-curve with its own slope, a
+//      toe (shadows) and a shoulder (highlights). Layers with different
+//      slopes give film's colour crossover (e.g. cool shadows, warm
+//      highlights) instead of one global tint.
+//   4. Inter-layer (DIR coupler) effects: a 3×3 matrix on the layer
+//      responses — film's saturation and hue rendering.
+//   5. Print: a per-layer power curve whose exponent is solved on the CPU so
+//      mid grey prints exactly at the stock's mid value (neutral by
+//      construction; any cast is the stock's intent), between the print's
+//      black (max density) and white (paper / base).
+//   6. B&W: the layers are averaged and toned by the silver colour.
+float4 filmEngine(sample_t s,
+                  float3 s0, float3 s1, float3 s2, float exposure,
+                  float3 slope, float3 speed, float toe, float shoulder,
+                  float3 c0, float3 c1, float3 c2,
+                  float3 printGamma, float3 black, float3 white,
+                  float mono, float3 tone)
+{
+    float3 lin = srgbToLinear(s.rgb);
+    float3 seen = float3(dot(s0, lin), dot(s1, lin), dot(s2, lin));
+    float3 e = log2(max(seen, float3(1e-6)) / 0.18) + exposure;
+    float3 x = e - speed;
+    float3 k = select(slope * shoulder, slope * toe, x < 0.0);
+    float3 n = 1.0 / (1.0 + exp(-k * x));
+    n = clamp(float3(dot(c0, n), dot(c1, n), dot(c2, n)), float3(1e-6), float3(1.0));
+    float3 outLin = black + (white - black) * pow(n, printGamma);
+    if (mono > 0.5) {
+        outLin = float3((outLin.r + outLin.g + outLin.b) / 3.0) * tone;
+    }
+    return float4(linearToSrgb(outLin), s.a);
+}
+
 }}

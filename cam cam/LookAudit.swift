@@ -202,10 +202,26 @@ nonisolated enum LookAudit {
         tiles.append(etiles)
         inputs.append(("effects", scene))
 
+        // Film engine pilot: each pilot stock's old look next to the engine.
+        let pilot: [FilmSimulation] = [.kodakPortra, .kodakEktar, .kodakGold, .fujiSuperia, .kodakTriX]
+        let photoInputs = inputs.filter { $0.0 != "effects" }
+        for input in photoInputs {
+            var row: [(String, CIImage)] = [("Original", input.1)]
+            for sim in pilot {
+                var r = ShotRecipe(); r.sim = sim
+                FilmEngine.enabled = false
+                row.append(("Old \(sim.label)", camera.renderLook(input.1, recipe: r, flatten: true).cropped(to: input.1.extent)))
+                FilmEngine.enabled = true
+                row.append(("New \(sim.label)", camera.renderLook(input.1, recipe: r, flatten: true).cropped(to: input.1.extent)))
+            }
+            tiles.append(row)
+            inputs.append(("pilot-\((input.0 as NSString).deletingPathExtension)", input.1))
+        }
+
         // Contact sheets: 8 per row, labelled.
         for (k, input) in inputs.enumerated() {
             let w = input.1.extent.width, h = input.1.extent.height
-            let perRow = 8, labelH: CGFloat = 22
+            let perRow = inputs[k].0.hasPrefix("pilot-") ? 11 : 8, labelH: CGFloat = 22
             let rows = Int(ceil(Double(tiles[k].count) / Double(perRow)))
             let size = CGSize(width: CGFloat(perRow) * (w + 6) + 6, height: CGFloat(rows) * (h + labelH + 6) + 6)
             let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1

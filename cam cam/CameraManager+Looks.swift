@@ -336,6 +336,8 @@ extension CameraManager {
                                   digiCamQuality: Float) -> CIImage {
         // Bent speckle amount: 0 with grain off, ramps to 1 at the slider top.
         let speckle: CGFloat = grainEnabled ? min(1.0, CGFloat(grain) / 0.5) : 0
+        // Stocks on the film engine (modelled in exposure, see FilmEngine).
+        if let film = FilmEngine.apply(image, sim: sim) { return film }
         switch sim {
         case .none:
             return image
