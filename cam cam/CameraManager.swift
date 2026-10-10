@@ -1524,32 +1524,27 @@ import CoreLocation
             // Ignore if user is doing manual focus or in the middle of a tap-focus
             guard !self.cachedManualFocusEnabled, !self.tapFocusActive else { return }
             self.sessionQueue.async {
+                // This fires constantly while the phone moves. Continuous AF/AE
+                // already follow the scene, so do NOTHING when they're running at
+                // the centre. (It used to force a one-shot AF + AE lock and hand
+                // back after 0.8 s every time — a visible hunt and exposure jump,
+                // i.e. the "stutter / reset" while moving.)
+                let center = CGPoint(x: 0.5, y: 0.5)
+                func near(_ p: CGPoint) -> Bool { abs(p.x - 0.5) < 0.05 && abs(p.y - 0.5) < 0.05 }
+                let focusFine = device.focusMode == .continuousAutoFocus
+                    && (!device.isFocusPointOfInterestSupported || near(device.focusPointOfInterest))
+                let exposureFine = device.exposureMode == .continuousAutoExposure
+                    && (!device.isExposurePointOfInterestSupported || near(device.exposurePointOfInterest))
+                guard !(focusFine && exposureFine) else { return }
+                // A previous tap had locked a point: return smoothly to
+                // continuous at the centre, no one-shot snap.
                 do {
                     try device.lockForConfiguration()
-                    // Snap focus at center then hand back to continuous
-                    if device.isFocusPointOfInterestSupported {
-                        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
-                        device.focusMode = .autoFocus
-                    }
-                    if device.isExposurePointOfInterestSupported {
-                        device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
-                        device.exposureMode = .autoExpose
-                    }
+                    if device.isFocusPointOfInterestSupported { device.focusPointOfInterest = center }
+                    if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+                    if device.isExposurePointOfInterestSupported { device.exposurePointOfInterest = center }
+                    if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
                     device.unlockForConfiguration()
-
-                    // Return to continuous after a short snap
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) {
-                        do {
-                            try device.lockForConfiguration()
-                            if device.isFocusModeSupported(.continuousAutoFocus) {
-                                device.focusMode = .continuousAutoFocus
-                            }
-                            if device.isExposureModeSupported(.continuousAutoExposure) {
-                                device.exposureMode = .continuousAutoExposure
-                            }
-                            device.unlockForConfiguration()
-                        } catch {}
-                    }
                 } catch {}
             }
         }

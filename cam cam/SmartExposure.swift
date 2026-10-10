@@ -89,8 +89,12 @@ final class SmartExposure {
         target = min(target, max(maxUp, 0))
         if faceHint { target = max(target, -0.5) }
 
-        // Smooth toward the target; clamp the total correction.
-        let next = max(-2.0, min(1.0, smart + 0.35 * target))
+        // Calm: ignore small errors (dead zone), move gently, and cap each
+        // step — Apple's AE is adapting at the same time while you move the
+        // phone, and a fast loop on top of it makes the picture pump.
+        guard abs(target) > 0.2 else { return }
+        let step = max(-0.12, min(0.12, 0.2 * target))
+        let next = max(-2.0, min(1.0, smart + step))
         smart = next
         let status: String
         if next < -0.15 { status = faceHint ? "Face priority" : "Protecting highlights" }
