@@ -231,7 +231,8 @@ struct CameraContentView: View {
                 }
 
                 // Thermal throttle notice (live effects reduced; captures unaffected)
-                if let warn = camera.thermalWarning {
+                // Glass UI shows "warm" as a small chip; only "hot" gets a banner.
+                if let warn = camera.thermalWarning, classicUI || camera.cachedThermalCritical {
                     VStack {
                         Label(warn, systemImage: "thermometer.high")
                             .font(.system(size: 12, weight: .medium))
@@ -503,7 +504,7 @@ struct CameraContentView: View {
                 .overlay {
                     // Live filtered preview — Metal-rendered, full GPU pipeline
                     // Always present when a sim is selected; Metal view shows nothing if no image
-                    if camera.selectedSim != .none || camera.activeCustomSim != nil {
+                    if camera.selectedSim != .none || camera.activeCustomSim != nil || camera.showZebras {
                         MetalFilteredPreview(camera: camera)
                             .allowsHitTesting(false)
                     }

@@ -140,6 +140,12 @@ import CoreLocation
     var showLevel: Bool = false {
         didSet { UserDefaults.standard.set(showLevel, forKey: "cc_showLevel") }
     }
+    /// Zebra stripes on anything about to clip (display only, never saved).
+    var showZebras: Bool = UserDefaults.standard.bool(forKey: "cc_showZebras") {
+        didSet { cachedZebras = showZebras; UserDefaults.standard.set(showZebras, forKey: "cc_showZebras") }
+    }
+    @ObservationIgnored nonisolated(unsafe) var cachedThermalCritical = false
+    @ObservationIgnored nonisolated(unsafe) var cachedZebras = UserDefaults.standard.bool(forKey: "cc_showZebras")
     var showPeaking: Bool = false {
         didSet { UserDefaults.standard.set(showPeaking, forKey: "cc_showPeaking") }
     }
@@ -224,7 +230,11 @@ import CoreLocation
     var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality
         didSet { UserDefaults.standard.set(photoQuality, forKey: "cc_photoQuality") }
     }
-    @ObservationIgnored nonisolated(unsafe) var activeCustomSim: CustomSimulation?
+    /// Observable so the UI follows it; the capture/render queues read the mirror.
+    var activeCustomSim: CustomSimulation? {
+        didSet { cachedActiveCustomSim = activeCustomSim }
+    }
+    @ObservationIgnored nonisolated(unsafe) var cachedActiveCustomSim: CustomSimulation?
     // Live-cached effect flags for preview rendering (updated via didSet)
     @ObservationIgnored nonisolated(unsafe) var cachedCrosstalkEnabled: Bool = false
     @ObservationIgnored nonisolated(unsafe) var cachedCrosstalkAmount: Float = 0.1
@@ -369,12 +379,15 @@ import CoreLocation
         switch state {
         case .serious:
             cachedThermalThrottle = true
+            cachedThermalCritical = false
             thermalWarning = "iPhone is warm — live effects reduced"
         case .critical:
             cachedThermalThrottle = true
+            cachedThermalCritical = true
             thermalWarning = "iPhone is hot — let it cool"
         default:
             cachedThermalThrottle = false
+            cachedThermalCritical = false
             thermalWarning = nil
         }
     }
@@ -2845,10 +2858,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         // Live filtered preview — render to Metal view (no CGImage round-trip)
         let sim = cachedSim
-        let customSim = activeCustomSim
+        let customSim = cachedActiveCustomSim
         let metal = metalPreviewView
 
-        guard sim != .none || customSim != nil else {
+        let zebras = cachedZebras
+        guard sim != .none || customSim != nil || zebras else {
             metal?.currentImage = nil
             return
         }
@@ -2908,6 +2922,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         // extent beyond the input. Crop back to the downscaled-input extent so
         // Metal's aspect-fill math (which uses image.extent) renders correctly.
         filtered = filtered.cropped(to: scaled.extent)
+
+        // Zebras measure the sensor image (what will clip), drawn over the look.
+        if zebras {
+            filtered = ExposureAids.zebras(over: filtered, measuring: scaled)
+        }
 
         if let metal {
             metal.currentImage = filtered

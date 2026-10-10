@@ -33,7 +33,7 @@ extension CameraManager {
     ///   false for video (procedural grain at recording resolution).
     nonisolated func applyLiveLook(_ input: CIImage, grainTextures: Bool) -> CIImage {
         let sim = cachedSim
-        let custom = activeCustomSim
+        let custom = cachedActiveCustomSim
         let extent = input.extent
         var img: CIImage
         if let custom {
@@ -2187,20 +2187,17 @@ extension CameraManager {
         let grn  = isolateChannel(result, channel: 1)
         let blue = isolateChannel(result, channel: 2).clampedToExtent()
             .transformed(by: CGAffineTransform(translationX: -fringeShift, y: 0))
-        let a = CIFilter.additionCompositing(); a.inputImage = red; a.backgroundImage = grn
-        let b = CIFilter.additionCompositing(); b.inputImage = a.outputImage ?? grn; b.backgroundImage = blue
+        // MAX, not add: each plane holds one channel, so max rebuilds the
+        // colour while alpha stays 1. Adding summed alpha to 3, which broke
+        // the live preview (Bent frames were dropped; the camera showed
+        // through) and blanked Bent++ entirely.
+        let a = CIFilter.maximumCompositing(); a.inputImage = red; a.backgroundImage = grn
+        let b = CIFilter.maximumCompositing(); b.inputImage = a.outputImage ?? grn; b.backgroundImage = blue
         result = (b.outputImage ?? result).cropped(to: extent)
 
         // ── E. Heavy mode only: hard horizontal scan lines on top ───────
         if heavy {
-            let stripes = CIFilter.checkerboardGenerator()
-            stripes.color0 = CIColor(red: 1, green: 1, blue: 1, alpha: 1)
-            stripes.color1 = CIColor(red: 0.35, green: 0.35, blue: 0.4, alpha: 1)
-            stripes.width = 3
-            stripes.center = CGPoint(x: 0, y: 0)
-            let stripPattern = (stripes.outputImage ?? CIImage.empty())
-                .transformed(by: CGAffineTransform(scaleX: 9999, y: 1))
-                .cropped(to: extent)
+            let stripPattern = horizontalLines(period: 3, dark: CIColor(red: 0.35, green: 0.35, blue: 0.4), extent: extent)
             let mult = CIFilter.multiplyCompositing()
             mult.inputImage = stripPattern
             mult.backgroundImage = result
@@ -2215,18 +2212,26 @@ extension CameraManager {
     /// multiplied over the image. Used by DigiCam when its context-aware
     /// "lines" toggle is on. Deliberately subtle so it reads as a CRT/LCD
     /// artifact, not a glitch.
+    /// Horizontal line pattern: `period` px white, `period` px `dark`.
+    /// (The old trick — a checkerboard stretched 9999× wide — rendered as
+    /// nothing, which blanked Bent++ and DigiCam's scanlines.)
+    nonisolated func horizontalLines(period: CGFloat, dark: CIColor, extent: CGRect) -> CIImage {
+        guard let stripes = CIFilter(name: "CIStripesGenerator", parameters: [
+            "inputColor0": CIColor(red: 1, green: 1, blue: 1),
+            "inputColor1": dark,
+            "inputWidth": period,
+            "inputSharpness": 1,
+            "inputCenter": CIVector(x: 0, y: 0),
+        ])?.outputImage else { return CIImage(color: .white).cropped(to: extent) }
+        // Stripes are vertical; turn them 90° to run across the frame.
+        return stripes.transformed(by: CGAffineTransform(rotationAngle: .pi / 2)).cropped(to: extent)
+    }
+
     nonisolated func applyScanlines(input: CIImage) -> CIImage {
         let extent = input.extent
         guard extent.height > 1 else { return input }
         // 2px-on / 2px-off dark lines — clearly visible interlacing.
-        let stripes = CIFilter.checkerboardGenerator()
-        stripes.color0 = CIColor(red: 1, green: 1, blue: 1, alpha: 1)
-        stripes.color1 = CIColor(red: 0.6, green: 0.6, blue: 0.66, alpha: 1)
-        stripes.width = 2
-        stripes.center = CGPoint(x: 0, y: 0)
-        let pattern = (stripes.outputImage ?? CIImage.empty())
-            .transformed(by: CGAffineTransform(scaleX: 9999, y: 1))   // horizontal-only
-            .cropped(to: extent)
+        let pattern = horizontalLines(period: 2, dark: CIColor(red: 0.6, green: 0.6, blue: 0.66), extent: extent)
         let mult = CIFilter.multiplyCompositing()
         mult.inputImage = pattern
         mult.backgroundImage = input
@@ -2341,8 +2346,8 @@ extension CameraManager {
             let gb   = isolateChannel(img, channel: 1)
             let blue = isolateChannel(img, channel: 2).clampedToExtent()
                 .transformed(by: CGAffineTransform(translationX: -jump, y: 0))
-            let a = CIFilter.additionCompositing(); a.inputImage = red; a.backgroundImage = gb
-            let b = CIFilter.additionCompositing(); b.inputImage = a.outputImage ?? gb; b.backgroundImage = blue
+            let a = CIFilter.maximumCompositing(); a.inputImage = red; a.backgroundImage = gb
+            let b = CIFilter.maximumCompositing(); b.inputImage = a.outputImage ?? gb; b.backgroundImage = blue
             img = (b.outputImage ?? img).cropped(to: extent)
         }
 

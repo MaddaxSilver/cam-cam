@@ -17,26 +17,34 @@ import Photos
 enum CaptureMode: String { case photo, video }
 
 enum ControlKind: String, CaseIterable, Identifiable {
-    case grain, halation, exposure, effects, aspect
+    case halation, exposure, effects, modes, view
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .grain: "Grain"
         case .halation: "Halation"
         case .exposure: "Exposure"
         case .effects: "Effects"
-        case .aspect: "Aspect"
+        case .modes: "Shooting modes"
+        case .view: "View"
         }
     }
     var symbol: String {
         switch self {
-        case .grain: "circle.grid.3x3.fill"
         case .halation: "sun.max"
         case .exposure: "plusminus.circle"
         case .effects: "sparkles"
-        case .aspect: "aspectratio"
+        case .modes: "camera.aperture"
+        case .view: "viewfinder"
         }
     }
+}
+
+/// One switch in a tile grid (effects, modes, view).
+struct Tile {
+    let title: String
+    let symbol: String
+    let isOn: Binding<Bool>
+    var enabled = true
 }
 
 struct GlassChrome<Shutter: View>: View {
@@ -51,7 +59,8 @@ struct GlassChrome<Shutter: View>: View {
     @ViewBuilder var shutter: () -> Shutter
 
     @State private var showControls = false
-    @State private var active: ControlKind = .grain
+    @State private var active: ControlKind = .exposure
+    @State private var showGrain = false
     @State private var scrubStartMM: Double?
     @State private var scrubMM: Double = 35
     @State private var lastPresetCrossed: Int?
@@ -73,6 +82,12 @@ struct GlassChrome<Shutter: View>: View {
             contextRulers
                 .padding(.horizontal, 16)
                 .padding(.bottom, 10)
+            if showGrain && !showControls {
+                grainPanel
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             if showControls {
                 controlPanel
                     .padding(.horizontal, 16)
@@ -105,10 +120,10 @@ struct GlassChrome<Shutter: View>: View {
         }
         .background {
             // While controls are open, a tap anywhere on the picture closes them.
-            if showControls {
+            if showControls || showGrain {
                 Color.black.opacity(0.001)
                     .ignoresSafeArea()
-                    .onTapGesture { showControls = false }
+                    .onTapGesture { showControls = false; showGrain = false }
                     .accessibilityHidden(true)
             }
         }
@@ -119,6 +134,8 @@ struct GlassChrome<Shutter: View>: View {
             Button("Cancel", role: .cancel) {}
         }
         .animation(.snappy(duration: 0.3), value: showControls)
+        .animation(.snappy(duration: 0.3), value: showGrain)
+        .onChange(of: showControls) { _, on in if on { showGrain = false } }
         .animation(.snappy(duration: 0.2), value: scrubStartMM == nil)
         .task(id: arcItems.count) { tones.ensure(arcItems, camera: camera) }
         .onChange(of: camera.isCapturing) { _, capturing in
@@ -162,6 +179,8 @@ struct GlassChrome<Shutter: View>: View {
                         .glassEffect(.regular.interactive(), in: Capsule())
                         .accessibilityLabel("\(roll.exposuresLeft) frames left on the roll")
                     }
+
+                    modeChips
 
                     if camera.isFocusing || (camera.faceDetected && !camera.manualFocusEnabled) {
                         HStack(spacing: 6) {
@@ -221,6 +240,40 @@ struct GlassChrome<Shutter: View>: View {
         }
     }
 
+    /// Small glass icons under the flash for modes that change how the
+    /// shutter behaves, so they're never on by surprise. Tap to open Modes.
+    @ViewBuilder private var modeChips: some View {
+        let all: [(String, String?)?] = [
+            camera.doubleExposureEnabled ? ("circle.lefthalf.filled", camera.firstExposurePreview == nil ? "1st" : "2nd") : nil,
+            camera.isLongExposure ? ("timer", String(format: "%gs", camera.longExposureDuration)) : nil,
+            camera.burstMode ? ("square.stack.3d.down.right", nil) : nil,
+            camera.macroModeEnabled ? ("camera.macro", nil) : nil,
+            camera.pushPullEnabled && camera.pushPullAmount != 0 ? ("plusminus", String(format: "%+d", Int(camera.pushPullAmount))) : nil,
+            camera.rawEnabled ? ("r.square", nil) : nil,
+            camera.thermalWarning != nil ? ("thermometer.medium", nil) : nil,
+        ]
+        let chips = all.compactMap { $0 }
+        if !chips.isEmpty {
+            Button { active = .modes; showControls = true } label: {
+                HStack(spacing: 8) {
+                    ForEach(chips.indices, id: \.self) { i in
+                        HStack(spacing: 3) {
+                            Image(systemName: chips[i].0).font(.system(size: 12, weight: .semibold))
+                            if let t = chips[i].1 {
+                                Text(t).font(.system(size: 11, weight: .semibold).monospacedDigit())
+                            }
+                        }
+                        .foregroundStyle(chips[i].0.hasPrefix("thermometer") ? Color.orange : .yellow)
+                    }
+                }
+                .padding(.horizontal, 10).frame(height: 30)
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: Capsule())
+            .accessibilityLabel("Active shooting modes")
+        }
+    }
+
     private var flashSymbol: String {
         switch camera.flashMode {
         case .off: "bolt.slash.fill"
@@ -273,14 +326,7 @@ struct GlassChrome<Shutter: View>: View {
                 ForEach(ControlKind.allCases) { k in
                     let on = k == active
                     Button { active = k } label: {
-                        Group {
-                            if k == .aspect {
-                                Text(camera.selectedAspectRatio.label)
-                                    .font(.system(size: 11, weight: .bold))
-                            } else {
-                                Image(systemName: k.symbol).font(.system(size: 17, weight: .medium))
-                            }
-                        }
+                        Image(systemName: k.symbol).font(.system(size: 17, weight: .medium))
                         .foregroundStyle(on ? .black : .white)
                         .frame(width: 46, height: 46)
                         .background(Circle().fill(on ? Color.yellow : .clear))
@@ -305,11 +351,6 @@ struct GlassChrome<Shutter: View>: View {
 
     @ViewBuilder private var controlPanel: some View {
         switch active {
-        case .grain:
-            GlassRuler(title: "Grain", valueText: camera.grainEnabled ? "\(Int(camera.grainAmount * 200))" : "Off",
-                       isOn: $camera.grainEnabled,
-                       value: Binding(get: { Double(camera.grainAmount) }, set: { camera.grainAmount = Float($0) }),
-                       range: 0...0.5)
         case .halation:
             GlassRuler(title: "Halation", valueText: camera.halationEnabled ? "\(Int(camera.halationAmount * 100))" : "Off",
                        isOn: $camera.halationEnabled,
@@ -341,56 +382,170 @@ struct GlassChrome<Shutter: View>: View {
                            range: -3...3)
             }
         case .effects:
-            chipPanel(title: "Effects", chips: [
-                ("Crosstalk", $camera.crosstalkEnabled), ("Rolloff", $camera.rolloffEnabled),
-                ("Flares", $camera.anamorphicFlareEnabled), ("Leaks", $camera.lightArtifactsEnabled),
-                ("Scratches", $camera.filmScratchesEnabled), ("Random", $camera.filmRandomizationEnabled),
+            tilePanel(title: "Effects", tiles: [
+                Tile(title: "Crosstalk", symbol: "circle.hexagongrid", isOn: $camera.crosstalkEnabled),
+                Tile(title: "Rolloff", symbol: "circle.lefthalf.striped.horizontal", isOn: $camera.rolloffEnabled),
+                Tile(title: "Flares", symbol: "rays", isOn: $camera.anamorphicFlareEnabled),
+                Tile(title: "Light leaks", symbol: "light.max", isOn: $camera.lightArtifactsEnabled),
+                Tile(title: "Scratches", symbol: "scribble", isOn: $camera.filmScratchesEnabled),
+                Tile(title: "Randomise", symbol: "dice", isOn: $camera.filmRandomizationEnabled),
             ])
-        case .aspect:
-            VStack(spacing: 8) {
-                Text("ASPECT").font(.system(size: 12, weight: .semibold)).tracking(1)
-                    .foregroundStyle(.white.opacity(0.85))
-                HStack(spacing: 6) {
-                    ForEach(AspectRatio.allCases) { a in
-                        let on = a == camera.selectedAspectRatio
-                        Button { camera.selectedAspectRatio = a } label: {
-                            Text(a.label).font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(on ? .black : .white)
-                                .padding(.horizontal, 10).frame(height: 32)
-                                .background(Capsule().fill(on ? Color.yellow : Color.white.opacity(0.14)))
-                        }
-                        .buttonStyle(.plain)
+        case .modes:
+            VStack(spacing: 10) {
+                tilePanel(title: "Shooting modes", tiles: [
+                    Tile(title: "Burst", symbol: "square.stack.3d.down.right", isOn: $camera.burstMode),
+                    Tile(title: "Macro", symbol: "camera.macro", isOn: $camera.macroModeEnabled),
+                    Tile(title: "Long exp.", symbol: "timer", isOn: $camera.isLongExposure),
+                    Tile(title: "Double exp.", symbol: "circle.lefthalf.filled", isOn: $camera.doubleExposureEnabled),
+                    Tile(title: "Push / pull", symbol: "plusminus", isOn: $camera.pushPullEnabled),
+                    Tile(title: "RAW", symbol: "r.square", isOn: $camera.rawEnabled),
+                    Tile(title: "Portrait", symbol: "person.crop.circle", isOn: $camera.portraitModeEnabled,
+                         enabled: camera.portraitModeAvailable && camera.currentDeviceSupportsDepth),
+                    Tile(title: "Manual focus", symbol: "scope",
+                         isOn: Binding(get: { camera.manualFocusEnabled }, set: { camera.setManualFocusEnabled($0) })),
+                    Tile(title: "One lens", symbol: "arrow.left.and.right.circle", isOn: $camera.unifiedZoomMode),
+                ])
+                if camera.pushPullEnabled {
+                    segmentRow(title: "Push / pull",
+                               options: [(-2, "−2"), (-1, "−1"), (0, "0"), (1, "+1"), (2, "+2"), (3, "+3")],
+                               selected: Int(camera.pushPullAmount)) { camera.pushPullAmount = Float($0) }
+                }
+                if camera.isLongExposure {
+                    segmentRow(title: "Long exposure",
+                               options: LongExposureMode.allCases.enumerated().map { ($0.offset, $0.element.label) },
+                               selected: LongExposureMode.allCases.firstIndex(of: camera.longExposureMode) ?? 0) {
+                        camera.longExposureMode = LongExposureMode.allCases[$0]
                     }
                 }
             }
-            .padding(12)
-            .frame(maxWidth: .infinity)
-            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        case .view:
+            VStack(spacing: 10) {
+                tilePanel(title: "View", tiles: [
+                    Tile(title: "Grid", symbol: "grid", isOn: $camera.showGrid),
+                    Tile(title: "Level", symbol: "level", isOn: $camera.showLevel),
+                    Tile(title: "Peaking", symbol: "scope", isOn: $camera.showPeaking),
+                    Tile(title: "Zebras", symbol: "line.diagonal", isOn: $camera.showZebras),
+                ])
+                segmentRow(title: "Aspect",
+                           options: AspectRatio.allCases.enumerated().map { ($0.offset, $0.element.label) },
+                           selected: AspectRatio.allCases.firstIndex(of: camera.selectedAspectRatio) ?? 0) {
+                    camera.selectedAspectRatio = AspectRatio.allCases[$0]
+                }
+            }
         }
     }
 
-    private func chipPanel(title: String, chips: [(String, Binding<Bool>)]) -> some View {
-        VStack(spacing: 8) {
-            Text("\(title.uppercased())  \(chips.filter { $0.1.wrappedValue }.count) ON")
-                .font(.system(size: 12, weight: .semibold)).tracking(1)
-                .foregroundStyle(.white.opacity(0.85))
-            HStack(spacing: 6) {
-                ForEach(chips.indices, id: \.self) { i in
-                    let on = chips[i].1.wrappedValue
-                    Button { chips[i].1.wrappedValue.toggle() } label: {
-                        Text(chips[i].0).font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(on ? .black : .white)
-                            .padding(.horizontal, 8).frame(height: 32)
-                            .background(Capsule().fill(on ? Color.yellow : Color.white.opacity(0.14)))
+    /// A grid of icon tiles, three across, with even text.
+    private func tilePanel(title: String, tiles: [Tile]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(title.uppercased()).foregroundStyle(.white.opacity(0.85))
+                Spacer()
+                Text("\(tiles.filter { $0.isOn.wrappedValue }.count) on").foregroundStyle(.yellow)
+            }
+            .font(.system(size: 12, weight: .semibold)).tracking(0.8)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                ForEach(tiles.indices, id: \.self) { i in
+                    let t = tiles[i]
+                    let on = t.isOn.wrappedValue
+                    Button { t.isOn.wrappedValue.toggle() } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: t.symbol)
+                                .font(.system(size: 14, weight: .semibold))
+                                .frame(width: 18)
+                            Text(t.title)
+                                .font(.system(size: 13, weight: .semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                            Spacer(minLength: 0)
+                        }
+                        .foregroundStyle(on ? .black : .white)
+                        .padding(.horizontal, 10)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(on ? Color.yellow : Color.white.opacity(0.12)))
                     }
                     .buttonStyle(.plain)
+                    .disabled(!t.enabled)
+                    .opacity(t.enabled ? 1 : 0.4)
                     .accessibilityAddTraits(on ? .isSelected : [])
                 }
             }
         }
-        .padding(12)
-        .frame(maxWidth: .infinity)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(14)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+    }
+
+    private func segmentRow(title: String, options: [(Int, String)], selected: Int,
+                            set: @escaping (Int) -> Void) -> some View {
+        HStack(spacing: 10) {
+            Text(title.uppercased())
+                .font(.system(size: 11, weight: .semibold)).tracking(0.8)
+                .foregroundStyle(.white.opacity(0.85))
+                .fixedSize()
+            HStack(spacing: 4) {
+                ForEach(options, id: \.0) { opt in
+                    let on = opt.0 == selected
+                    Button { set(opt.0) } label: {
+                        Text(opt.1).font(.system(size: 13, weight: .semibold).monospacedDigit())
+                            .lineLimit(1).minimumScaleFactor(0.7)
+                            .foregroundStyle(on ? .black : .white)
+                            .frame(maxWidth: .infinity, minHeight: 34)
+                            .background(Capsule().fill(on ? Color.yellow : Color.white.opacity(0.12)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    // MARK: Grain (beside the shutter)
+
+    private var grainKind: (label: String, symbol: String) {
+        if camera.activeCustomSim == nil {
+            if camera.selectedSim == .digiCam { return ("Lines", "line.3.horizontal") }
+            if camera.selectedSim == .circuitBent || camera.selectedSim == .circuitBentHeavy { return ("Wild", "waveform.path") }
+        }
+        return ("Context", "waveform.badge.magnifyingglass")
+    }
+
+    private var grainPanel: some View {
+        VStack(spacing: 8) {
+            GlassRuler(title: "Grain", valueText: camera.grainEnabled ? "\(Int(camera.grainAmount * 200))" : "Off",
+                       isOn: $camera.grainEnabled,
+                       value: Binding(get: { Double(camera.grainAmount) }, set: { camera.grainAmount = Float($0) }),
+                       range: 0...0.5)
+            Button {
+                camera.contextAwareGrainEnabled.toggle()
+                if camera.contextAwareGrainEnabled { camera.grainEnabled = true }
+            } label: {
+                Label(grainKind.label, systemImage: grainKind.symbol)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(camera.contextAwareGrainEnabled ? .black : .white)
+                    .padding(.horizontal, 14).frame(height: 36)
+                    .background(Capsule().fill(camera.contextAwareGrainEnabled ? Color.yellow : .clear))
+            }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: Capsule())
+            .accessibilityHint(grainKind.label == "Context"
+                               ? "More grain in dark areas, less in bright ones, like real film"
+                               : "Changes how this film's texture behaves")
+        }
+    }
+
+    private var grainButton: some View {
+        Button { showGrain.toggle(); if showGrain { showControls = false } } label: {
+            Image(systemName: camera.grainEnabled ? "circle.grid.3x3.fill" : "circle.grid.3x3")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(showGrain ? .black : (camera.grainEnabled ? .yellow : .white))
+                .frame(width: 48, height: 48)
+                .background(Circle().fill(showGrain ? Color.yellow : .clear))
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
+        .accessibilityLabel(camera.grainEnabled ? "Grain on" : "Grain off")
     }
 
     // MARK: Bottom
@@ -403,32 +558,46 @@ struct GlassChrome<Shutter: View>: View {
                 modeButton("SONY", on: false, action: onSony)
             }
             .padding(.top, 6)
-            HStack(spacing: 18) {
+            Group {
                 if camera.shutterOnLeft {
-                    // Left-handed: shutter under the left thumb.
-                    shutterForMode
-                    Spacer()
-                    thumbButton
+                    // Left-handed: shutter under the left thumb, grain beside it.
+                    HStack(spacing: 18) {
+                        shutterForMode
+                        grainButton
+                        Spacer()
+                        thumbButton
+                        flipButton
+                    }
                 } else {
-                    thumbButton
-                    Spacer()
-                    shutterForMode
-                    Spacer()
+                    // Shutter dead centre, like the Camera app.
+                    ZStack {
+                        HStack {
+                            thumbButton
+                            Spacer()
+                            flipButton
+                        }
+                        shutterForMode
+                        // Grain sits just right of the shutter.
+                        grainButton.offset(x: 80)
+                    }
                 }
-                Button { camera.flipCamera() } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 48, height: 48)
-                }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Circle())
-                .accessibilityLabel(camera.isFrontCamera ? "Switch to back camera" : "Switch to front camera")
             }
             .padding(.horizontal, 28)
             .padding(.bottom, 20)
         }
         .background(Color.black.ignoresSafeArea(edges: .bottom))
+    }
+
+    private var flipButton: some View {
+        Button { camera.flipCamera() } label: {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 48, height: 48)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
+        .accessibilityLabel(camera.isFrontCamera ? "Switch to back camera" : "Switch to front camera")
     }
 
     private var thumbButton: some View {
