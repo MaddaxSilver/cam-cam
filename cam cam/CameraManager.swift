@@ -517,6 +517,30 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) var pendingPortraitEnabled: Bool = false
     @ObservationIgnored nonisolated(unsafe) var pendingPortraitFStop: Float = 2.8
     @ObservationIgnored nonisolated(unsafe) var firstExposureCIImage: CIImage?
+    /// RAW halves of RAW + film captures, keyed by capture ID, waiting for
+    /// their processed photo to finish rendering.
+    @ObservationIgnored nonisolated(unsafe) private var rawStash: [Int64: Data] = [:]
+    @ObservationIgnored private let rawStashLock = NSLock()
+
+    nonisolated func stashRAW(_ data: Data, id: Int64) {
+        rawStashLock.lock()
+        if rawStash.count > 6, let oldest = rawStash.keys.min() { rawStash[oldest] = nil }
+        rawStash[id] = data
+        rawStashLock.unlock()
+    }
+
+    /// The RAW for a capture, waiting briefly if it hasn't been delivered yet.
+    nonisolated func takeRAW(id: Int64?) -> Data? {
+        guard let id else { return nil }
+        for _ in 0..<60 {
+            rawStashLock.lock()
+            let d = rawStash.removeValue(forKey: id)
+            rawStashLock.unlock()
+            if let d { return d }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return nil
+    }
     @ObservationIgnored nonisolated(unsafe) var capturingFirstExposure: Bool = false
     @ObservationIgnored nonisolated(unsafe) private var _burstActive: Bool = false
     @ObservationIgnored private let burstActiveLock = NSLock()
@@ -1732,8 +1756,13 @@ import CoreLocation
         let useRAW = rawEnabled
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
+            let codec: AVVideoCodecType = photoOutput.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
             if useRAW, let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
-                settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+                // RAW + film: the DNG and a processed photo from one exposure.
+                // The processed one gets the film look; the DNG rides along as
+                // the same Photos asset's RAW (like Halide / Project Indigo).
+                settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat,
+                                                  processedFormat: [AVVideoCodecKey: codec])
             } else {
                 // Use HEIF for 10-bit wide color when available, fall back to JPEG
                 if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
@@ -2236,7 +2265,7 @@ import CoreLocation
 
     // MARK: Film Processing & Save
 
-    nonisolated func processAndSaveJPEG(imageData: Data) {
+    nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil) {
         // Unblock shutter immediately — process and save in background
         DispatchQueue.main.async { self.isCapturing = false }
 
@@ -2268,7 +2297,7 @@ import CoreLocation
 
             let processed = applySimAndGrain(to: ciImage)
             renderAndSave(ciImage: processed, metadata: originalMetadata,
-                          base: isDoubleExposure ? nil : base, recipe: recipe)
+                          base: isDoubleExposure ? nil : base, recipe: recipe, raw: takeRAW(id: rawID))
         }
     }
 
@@ -2298,7 +2327,7 @@ import CoreLocation
     }
 
     /// Portrait capture using the live-streamed depth pixel buffer from AVCaptureDepthDataOutput.
-    nonisolated func processAndSavePortraitFromBuffer(imageData: Data, depthBuffer: CVPixelBuffer) {
+    nonisolated func processAndSavePortraitFromBuffer(imageData: Data, depthBuffer: CVPixelBuffer, rawID: Int64? = nil) {
         DispatchQueue.main.async { self.isCapturing = false }
         // CVPixelBuffer is not Sendable — rebind before the closure captures it
         nonisolated(unsafe) let sendableBuffer = depthBuffer
@@ -2323,7 +2352,7 @@ import CoreLocation
             let blurred = applyPortraitBlurFromCIImage(to: ciImage, disparityCI: scaledDepth, fStop: pendingPortraitFStop)
             let recipe = pendingRecipe()
             let withSim = applySimAndGrain(to: blurred)
-            renderAndSave(ciImage: withSim, metadata: originalMetadata, base: blurred, recipe: recipe)
+            renderAndSave(ciImage: withSim, metadata: originalMetadata, base: blurred, recipe: recipe, raw: takeRAW(id: rawID))
         }
     }
 
@@ -2607,7 +2636,7 @@ import CoreLocation
     ///   non-destructively: base = original resource, look = Photos edit with
     ///   the recipe attached → revertible and re-gradable in cam cam.
     nonisolated func renderAndSave(ciImage: CIImage, metadata: [String: Any] = [:],
-                                   base: CIImage? = nil, recipe: ShotRecipe? = nil) {
+                                   base: CIImage? = nil, recipe: ShotRecipe? = nil, raw: Data? = nil) {
         let location = LocationTagger.shared.locationForPhoto()
         let heic = AVFileType.heic.rawValue as CFString
         let original: Data
@@ -2631,7 +2660,7 @@ import CoreLocation
         Task {
             do {
                 _ = try await PhotoSaver.save(original: original, rendered: rendered,
-                                              recipe: savedRecipe, location: location)
+                                              recipe: savedRecipe, location: location, raw: raw)
             } catch {
                 await MainActor.run { [weak self] in
                     self?.saveErrorMessage = "Couldn't save photo: \(error.localizedDescription)"
@@ -2968,10 +2997,17 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // Check if RAW
+        // RAW: with a processed photo coming too (RAW + film), stash it to be
+        // saved alongside the graded photo; RAW-only falls back to a bare DNG.
+        let pairedRAWID: Int64? = photo.resolvedSettings.rawPhotoDimensions.width > 0
+            && photo.resolvedSettings.photoDimensions.width > 0 ? photo.resolvedSettings.uniqueID : nil
         if photo.isRawPhoto, let data = photo.fileDataRepresentation() {
-            saveRAW(data: data)
-            if burstActive { burstDidCapture() }
+            if let id = pairedRAWID, !capturingFirstExposure {
+                stashRAW(data, id: id)
+            } else if pairedRAWID == nil {
+                saveRAW(data: data)
+                if burstActive { burstDidCapture() }
+            }
             return
         }
 
@@ -3036,9 +3072,9 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // (Depth is delivered via AVCaptureDepthDataOutput, not embedded in AVCapturePhoto
         //  when a separate depth output is in the session.)
         if pendingPortraitEnabled, let depthBuffer = latestDepthPixelBuffer {
-            processAndSavePortraitFromBuffer(imageData: data, depthBuffer: depthBuffer)
+            processAndSavePortraitFromBuffer(imageData: data, depthBuffer: depthBuffer, rawID: pairedRAWID)
         } else {
-            processAndSaveJPEG(imageData: data)
+            processAndSaveJPEG(imageData: data, rawID: pairedRAWID)
         }
     }
 }

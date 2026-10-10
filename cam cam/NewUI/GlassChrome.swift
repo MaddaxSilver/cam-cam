@@ -429,7 +429,7 @@ struct GlassChrome<Shutter: View>: View {
                     Tile(title: "Long exp.", symbol: "timer", isOn: $camera.isLongExposure),
                     Tile(title: "Double exp.", symbol: "circle.lefthalf.filled", isOn: $camera.doubleExposureEnabled),
                     Tile(title: "Push / pull", symbol: "plusminus", isOn: $camera.pushPullEnabled),
-                    Tile(title: "RAW", symbol: "r.square", isOn: $camera.rawEnabled),
+                    Tile(title: "RAW+", symbol: "r.square", isOn: $camera.rawEnabled),
                     Tile(title: "Portrait", symbol: "person.crop.circle", isOn: $camera.portraitModeEnabled,
                          enabled: camera.portraitModeAvailable && camera.currentDeviceSupportsDepth),
                     Tile(title: "Manual focus", symbol: "scope",

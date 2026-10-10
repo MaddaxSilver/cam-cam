@@ -576,7 +576,7 @@ struct CameraContentView: View {
                 }
 
                 TopPill(
-                    text: camera.rawEnabled ? "RAW" : "JPEG",
+                    text: camera.rawEnabled ? "RAW+" : "JPEG",
                     isActive: camera.rawEnabled
                 )
                 .onTapGesture {

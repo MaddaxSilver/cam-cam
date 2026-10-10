@@ -286,7 +286,7 @@ struct CamSettingsSheet: View {
                         Text("Speed").tag(0); Text("Balanced").tag(1); Text("Max").tag(2)
                     }
                     .pickerStyle(.segmented)
-                    Toggle("RAW", isOn: $camera.rawEnabled)
+                    Toggle("RAW + film", isOn: $camera.rawEnabled)
                     Picker("Aspect", selection: $camera.selectedAspectRatio) {
                         ForEach(AspectRatio.allCases) { Text($0.label).tag($0) }
                     }

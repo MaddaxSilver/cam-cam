@@ -47,7 +47,7 @@ nonisolated enum PhotoSaver {
     /// - recipe: the look that produced `rendered` (stored for re-grading).
     /// - location: phone GPS fix, or nil.
     static func save(original: Data, rendered: Data?, recipe: ShotRecipe?,
-                     location: CLLocation?) async throws -> Result {
+                     location: CLLocation?, raw: Data? = nil) async throws -> Result {
         let status = await authorize()
         switch status {
         case .authorized, .limited:
@@ -62,7 +62,12 @@ nonisolated enum PhotoSaver {
         }
 
         let base = location.flatMap { MetadataTools.addingGPS(to: original, location: $0) } ?? original
-        let assetID = try await createAsset(data: base, location: location)
+        let assetID: String?
+        if raw != nil, let id = try? await createAsset(data: base, location: location, raw: raw) {
+            assetID = id
+        } else {
+            assetID = try await createAsset(data: base, location: location)   // never lose the photo over the DNG
+        }
 
         guard let rendered, let recipe, let assetID else {
             return Result(assetID: assetID, nondestructive: true, message: "Saved original")
@@ -110,11 +115,17 @@ nonisolated enum PhotoSaver {
         return await PHPhotoLibrary.requestAuthorization(for: .readWrite)
     }
 
-    private static func createAsset(data: Data, location: CLLocation?) async throws -> String? {
+    private static func createAsset(data: Data, location: CLLocation?, raw: Data? = nil) async throws -> String? {
         var placeholder: String?
         try await PHPhotoLibrary.shared().performChanges {
             let req = PHAssetCreationRequest.forAsset()
             req.addResource(with: .photo, data: data, options: nil)
+            if let raw {
+                // RAW + film: the DNG is the same photo's RAW, not a second picture.
+                let opts = PHAssetResourceCreationOptions()
+                opts.uniformTypeIdentifier = "com.adobe.raw-image"
+                req.addResource(with: .alternatePhoto, data: raw, options: opts)
+            }
             if let location { req.location = location }
             placeholder = req.placeholderForCreatedAsset?.localIdentifier
             if let album = albumIfExists(), let ph = req.placeholderForCreatedAsset {
