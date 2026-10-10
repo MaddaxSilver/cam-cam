@@ -273,6 +273,9 @@ struct CamSettingsSheet: View {
     var onEditFilms: () -> Void
     var onImportLUT: () -> Void
     @Binding var cleanMode: Bool
+    /// Separate: the DNG is its own picture. Combined: hidden inside the film
+    /// photo as its RAW (Photos shows one picture; export "unmodified original").
+    @AppStorage("cc_rawSeparate") private var rawSeparate = true
 
     @Environment(\.dismiss) private var dismiss
     @State private var geotag = LocationTagger.shared
@@ -286,6 +289,12 @@ struct CamSettingsSheet: View {
                     }
                     .pickerStyle(.segmented)
                     Toggle("RAW + film", isOn: $camera.rawEnabled)
+                    if camera.rawEnabled {
+                        Picker("RAW files", selection: $rawSeparate) {
+                            Text("Separate").tag(true); Text("Combined").tag(false)
+                        }
+                        .pickerStyle(.segmented)
+                    }
                     Picker("Aspect", selection: $camera.selectedAspectRatio) {
                         ForEach(AspectRatio.allCases) { Text($0.label).tag($0) }
                     }

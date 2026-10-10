@@ -48,6 +48,12 @@ nonisolated enum PhotoSaver {
     ///   when no look was applied (then only the original is saved).
     /// - recipe: the look that produced `rendered` (stored for re-grading).
     /// - location: phone GPS fix, or nil.
+    /// RAW + film: save the DNG as its own picture (true, default) or hidden
+    /// inside the film photo as its RAW (false, "combined").
+    nonisolated static var separateRAW: Bool {
+        UserDefaults.standard.object(forKey: "cc_rawSeparate") as? Bool ?? true
+    }
+
     static func save(original: Data, rendered: Data?, recipe: ShotRecipe?,
                      location: CLLocation?, raw: Data? = nil) async throws -> Result {
         let status = await authorize()
@@ -66,7 +72,13 @@ nonisolated enum PhotoSaver {
         let base = location.flatMap { MetadataTools.addingGPS(to: original, location: $0) } ?? original
         var assetID: String?
         var rawIssue: String?
-        if let raw {
+        if let raw, separateRAW {
+            // Separate (the default, like Project Indigo's "separate"): the DNG
+            // is its own picture in the camera roll, next to the film photo.
+            if (try? await createAsset(data: raw, location: location, uti: "com.adobe.raw-image")) == nil {
+                rawIssue = "Couldn't save the RAW"
+            }
+        } else if let raw {
             do {
                 assetID = try await createAsset(data: base, location: location, raw: raw)
             } catch {
@@ -131,16 +143,26 @@ nonisolated enum PhotoSaver {
     private static func createAsset(data: Data, location: CLLocation?, raw: Data? = nil,
                                     uti: String? = nil) async throws -> String? {
         var placeholder: String?
+        var rawURL: URL?
+        if let raw {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathExtension("dng")
+            try raw.write(to: url)
+            rawURL = url
+        }
+        defer { if let rawURL { try? FileManager.default.removeItem(at: rawURL) } }
         try await PHPhotoLibrary.shared().performChanges {
             let req = PHAssetCreationRequest.forAsset()
             let photoOpts = PHAssetResourceCreationOptions()
             if let uti { photoOpts.uniformTypeIdentifier = uti }
             req.addResource(with: .photo, data: data, options: photoOpts)
-            if let raw {
-                // RAW + film: the DNG is the same photo's RAW, not a second picture.
+            if let rawURL {
+                // Combined: the DNG is the same photo's RAW, not a second
+                // picture (passed as a file, as Apple's RAW + JPEG sample does).
                 let opts = PHAssetResourceCreationOptions()
                 opts.uniformTypeIdentifier = "com.adobe.raw-image"
-                req.addResource(with: .alternatePhoto, data: raw, options: opts)
+                opts.shouldMoveFile = true
+                req.addResource(with: .alternatePhoto, fileURL: rawURL, options: opts)
             }
             if let location { req.location = location }
             placeholder = req.placeholderForCreatedAsset?.localIdentifier
