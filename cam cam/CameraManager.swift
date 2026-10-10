@@ -89,8 +89,18 @@ import CoreLocation
 
     // Portrait mode
     var portraitModeEnabled: Bool = false {
-        didSet { applyPortraitModeSession() }
+        didSet {
+            portraitSessionWanted = portraitModeEnabled
+            applyPortraitModeSession()
+            if portraitModeEnabled != oldValue { routeForPortrait() }
+        }
     }
+    /// Portrait wanted (read on the session queue when picking formats).
+    @ObservationIgnored nonisolated(unsafe) var portraitSessionWanted = false
+    /// The phone has a multi-lens back camera, which is what produces depth.
+    nonisolated static let hasDepthCamera: Bool =
+        [.builtInTripleCamera, .builtInDualWideCamera, .builtInDualCamera]
+            .contains { AVCaptureDevice.default($0, for: .video, position: .back) != nil }
     var portraitFStop: Float = 2.8        // f/1.4 → f/16
     var portraitModeAvailable: Bool = false
     /// True if the currently active device's format produces depth data.
@@ -765,7 +775,12 @@ import CoreLocation
             let photoAspect = Double(photo.width) / Double(photo.height)
             return abs(videoAspect - photoAspect) < 0.02
         }
-        let pool = candidates.isEmpty ? device.formats : candidates
+        var pool = candidates.isEmpty ? device.formats : candidates
+        // Portrait needs a format that streams depth; the 48MP formats don't.
+        if portraitSessionWanted {
+            let depthPool = pool.filter { !$0.supportedDepthDataFormats.isEmpty }
+            if !depthPool.isEmpty { pool = depthPool }
+        }
 
         let best = pool.max { a, b in
             let aPhoto = a.supportedMaxPhotoDimensions
@@ -782,6 +797,56 @@ import CoreLocation
         }
         guard let best else { return }
         device.activeFormat = best
+        if portraitSessionWanted {
+            // Largest float disparity/depth map the format offers.
+            let floats: Set<FourCharCode> = [kCVPixelFormatType_DisparityFloat16, kCVPixelFormatType_DisparityFloat32,
+                                             kCVPixelFormatType_DepthFloat16, kCVPixelFormatType_DepthFloat32]
+            let depth = best.supportedDepthDataFormats
+                .filter { floats.contains(CMFormatDescriptionGetMediaSubType($0.formatDescription)) }
+                .max { a, b in
+                    let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+                    let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+                    return Int(da.width) * Int(da.height) < Int(db.width) * Int(db.height)
+                }
+            if let depth { device.activeDepthDataFormat = depth }
+        }
+    }
+
+    /// Portrait on: move to the multi-lens camera (the single main lens can't
+    /// make depth) at the same framing, on a depth-capable format.
+    /// Portrait off: back to the preset's normal lens and full-res format.
+    func routeForPortrait() {
+        let index = selectedFocalIndex
+        guard focalPresets.indices.contains(index) else { return }
+        let preset = focalPresets[index]
+        guard preset.deviceType != .builtInUltraWideCamera else { return }   // no depth there
+        let onVirtual = [.builtInTripleCamera, .builtInDualCamera, .builtInDualWideCamera]
+            .contains(currentDevice?.deviceType)
+        let wantsVirtual = portraitModeEnabled || preset.useVirtualDevice || unifiedZoomMode
+        let intentZoom = CGFloat(Double(currentMM) / 26.0)
+        lastRequestedZoom = intentZoom
+        if wantsVirtual && !onVirtual {
+            swapToVirtualDevice(zoom: intentZoom * prospectiveVirtualCompensation, animate: true)
+        } else if !wantsVirtual && onVirtual {
+            swapInputDevice(to: preset, animate: true)
+        } else if let device = currentDevice {
+            // Same camera: just switch between the depth and full-res formats.
+            sessionQueue.async { [self] in
+                session.beginConfiguration()
+                if (try? device.lockForConfiguration()) != nil {
+                    selectBestFormat(for: device)
+                    device.unlockForConfiguration()
+                }
+                session.commitConfiguration()
+                if let maxDim = device.activeFormat.supportedMaxPhotoDimensions
+                    .max(by: { $0.width * $0.height < $1.width * $1.height }) {
+                    photoOutput.maxPhotoDimensions = maxDim
+                }
+                updateDepthAvailability(for: device)
+                let z = lastRequestedZoom
+                DispatchQueue.main.async { self.setZoom(z) }
+            }
+        }
     }
 
     nonisolated func configureSession() {
@@ -2897,7 +2962,7 @@ import CoreLocation
         //   • Unified-zoom mode is on AND the preset isn't ultrawide (which can only
         //     be reached via the physical builtInUltraWideCamera).
         let useVirtual = preset.useVirtualDevice
-            || (unifiedZoomMode && preset.deviceType != .builtInUltraWideCamera)
+            || ((unifiedZoomMode || portraitModeEnabled) && preset.deviceType != .builtInUltraWideCamera)
 
         // intentZoom = preset's mm in our 26mm-based scale. setZoom takes intent.
         // For swap calls that take a device-specific zoom we apply the prospective
