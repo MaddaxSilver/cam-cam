@@ -272,7 +272,6 @@ struct CamSettingsSheet: View {
     var onRoll: () -> Void
     var onEditFilms: () -> Void
     var onImportLUT: () -> Void
-    @Binding var classicUI: Bool
     @Binding var cleanMode: Bool
 
     @Environment(\.dismiss) private var dismiss
@@ -335,11 +334,6 @@ struct CamSettingsSheet: View {
                     Button("Re-grade a photo") { dismiss(); onRegrade() }
                     Button("Edit films") { dismiss(); onEditFilms() }
                     Button("Import LUT") { dismiss(); onImportLUT() }
-                }
-                Section {
-                    Toggle("Classic controls", isOn: $classicUI)
-                } footer: {
-                    Text("Switches back to the previous cam cam interface.")
                 }
             }
             .navigationTitle("Settings")

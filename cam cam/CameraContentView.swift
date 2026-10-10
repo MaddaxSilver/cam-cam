@@ -38,7 +38,8 @@ struct CameraContentView: View {
     @State private var showRollSheet = false
     @State private var showSettings = false
     @State private var pinchBaseZoom: Double?
-    @AppStorage("cc_classicUI") private var classicUI = false
+    /// The old controls are retired (they crashed); the glass chrome is the UI.
+    private let classicUI = false
     @AppStorage("cc_captureMode") private var captureModeRaw = CaptureMode.photo.rawValue
     @State private var roll = FilmRoll.shared
     @State private var showRollOptions = false
@@ -393,7 +394,7 @@ struct CameraContentView: View {
                              onRoll: { showRollSheet = true },
                              onEditFilms: { showCustomSimEditor = true },
                              onImportLUT: { showLUTImporter = true },
-                             classicUI: $classicUI, cleanMode: $cleanMode)
+                             cleanMode: $cleanMode)
         }
         .onChange(of: motion.isLandscape) { _, newValue in
             camera.isLandscape = newValue

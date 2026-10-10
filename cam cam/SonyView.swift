@@ -41,7 +41,8 @@ struct SonyView: View {
     /// When true, the diagnostic log overlay is visible. Useful since the
     /// phone is on the camera's WiFi and not reachable from Xcode.
     @State private var showDebugLog = false
-    @AppStorage("cc_classicUI") private var classicUI = false
+    /// The old controls are retired; the glass chrome is the UI.
+    private let classicUI = false
     /// File picker presentation for .cube LUT import.
     @State private var showLUTImporter = false
     /// Last LUT import error message — shown briefly in shutterStatus if set.
