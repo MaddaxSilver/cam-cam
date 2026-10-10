@@ -56,66 +56,220 @@ struct FilmArc: View {
     var onOpenLibrary: () -> Void
 
     @State private var tones = FilmToneStore.shared
-    @State private var dragDeg: Double = 0
-    @State private var lastStep = 0
-    private let step: Double = 17
+    /// Where the dial is turned to (points along the arc). Animated as a
+    /// value, so a long flick rolls smoothly through every film in between.
+    @State private var offset: CGFloat = 0
+    @State private var dragging = false
+    @State private var dragBase: CGFloat = 0
+    @State private var lastFilm = -1
+    @State private var lastMinor = 0
+    @State private var settleID = 0
+    // Two feels: soft quick ticks between films, a firm detent on each film.
+    @State private var tick = UIImpactFeedbackGenerator(style: .soft)
+    @State private var detent = UIImpactFeedbackGenerator(style: .rigid)
 
-    private var selectedIndex: Int { items.firstIndex { $0.key == selectedKey } ?? 0 }
+    static let font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+    static let tracking: CGFloat = 0.7
+    static let gap: CGFloat = 30
+    static let minorStep: CGFloat = 11       // a small mark (and tick) every 11 pt
+
+    private var centers: [CGFloat] {
+        var out: [CGFloat] = []
+        var x: CGFloat = 0
+        var prevHalf: CGFloat = 0
+        for (i, item) in items.enumerated() {
+            let w = Self.width(item.label)
+            if i > 0 { x += prevHalf + Self.gap + w / 2 }
+            out.append(x)
+            prevHalf = w / 2
+        }
+        return out
+    }
+
+    static func width(_ label: String) -> CGFloat {
+        let t = label.uppercased() as NSString
+        return max(ceil(t.size(withAttributes: [.font: font, .kern: tracking]).width), 30)
+    }
+
+    private var selectedIndex: Int? { items.firstIndex { $0.key == selectedKey } }
+
+    static func nearest(_ offset: CGFloat, in c: [CGFloat]) -> Int {
+        guard !c.isEmpty else { return 0 }
+        var best = 0
+        for i in c.indices where abs(c[i] - offset) < abs(c[best] - offset) { best = i }
+        return best
+    }
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                ArcGlass()
-                ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
-                    let a = Double(i - selectedIndex) * step + dragDeg
-                    if abs(a) < 44 {
-                        let isSel = i == selectedIndex && dragDeg == 0
-                        Text(item.label.uppercased())
-                            .font(.system(size: isSel ? 13 : 12, weight: isSel ? .bold : .semibold))
-                            .tracking(0.7)
-                            .lineLimit(1)
-                            .fixedSize()
-                            .foregroundStyle(tones.tone(item.key))
-                            .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                if i == selectedIndex { onOpenLibrary() } else { onSelect(item) }
-                            }
-                            .modifier(OnArc(angle: a, width: geo.size.width))
-                            .accessibilityLabel(item.label)
-                            .accessibilityAddTraits(isSel ? .isSelected : [])
-                    }
-                }
-                // index mark: which film is chosen
-                Capsule().fill(Color.yellow)
-                    .frame(width: 18, height: 3)
-                    .position(x: geo.size.width / 2, y: 6)
+        let c = centers
+        ZStack {
+            ArcGlass()
+            if items.isEmpty {
+                Text("No films here yet")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .offset(y: -6)
             }
+            FilmDialFace(items: items, centers: c, offset: offset, tones: tones,
+                         selectedIndex: selectedIndex,
+                         onTapItem: { i in
+                             if i == selectedIndex { onOpenLibrary() } else {
+                                 detent.impactOccurred(intensity: 0.85)
+                                 onSelect(items[i])
+                             }
+                         })
         }
         .frame(height: ArcGeo.height)
         .clipped()
         .contentShape(Rectangle())
         .gesture(
-            DragGesture(minimumDistance: 6)
+            DragGesture(minimumDistance: 4)
                 .onChanged { v in
-                    dragDeg = Double(v.translation.width) * ArcGeo.degPerPoint()
-                    let s = Int((dragDeg / step).rounded())
-                    if s != lastStep {
-                        lastStep = s
-                        UISelectionFeedbackGenerator().selectionChanged()
+                    if !dragging {
+                        dragging = true
+                        settleID += 1
+                        dragBase = offset
+                        lastFilm = Self.nearest(offset, in: c)
+                        lastMinor = Int((offset / Self.minorStep).rounded(.down))
+                        tick.prepare(); detent.prepare()
                     }
+                    let lo = (c.first ?? 0) - 36, hi = (c.last ?? 0) + 36
+                    offset = min(max(dragBase - v.translation.width, lo), hi)
+                    clicks(at: offset, centers: c)
                 }
-                .onEnded { _ in
-                    let target = min(max(selectedIndex - lastStep, 0), max(items.count - 1, 0))
-                    withAnimation(.spring(duration: 0.35, bounce: 0.15)) { dragDeg = 0 }
-                    lastStep = 0
-                    if items.indices.contains(target), target != selectedIndex { onSelect(items[target]) }
+                .onEnded { v in
+                    dragging = false
+                    // Momentum: follow the flick, then settle on a film.
+                    let projected = dragBase - v.predictedEndTranslation.width
+                    let target = Self.nearest(projected, in: c)
+                    guard c.indices.contains(target) else { return }
+                    let from = offset, to = c[target]
+                    let duration = min(0.75, 0.3 + Double(abs(to - from)) / 1600)
+                    withAnimation(.timingCurve(0.15, 0.7, 0.25, 1, duration: duration)) { offset = to }
+                    settleClicks(from: from, to: to, duration: duration, centers: c)
+                    if target != selectedIndex { onSelect(items[target]) }
                 }
         )
-        .animation(.spring(duration: 0.35, bounce: 0.15), value: selectedKey)
+        .onAppear { offset = c.indices.contains(selectedIndex ?? -1) ? c[selectedIndex!] : 0 }
+        .onChange(of: selectedKey) {
+            guard !dragging, let i = selectedIndex, c.indices.contains(i), abs(offset - c[i]) > 0.5 else { return }
+            withAnimation(.spring(duration: 0.4, bounce: 0.1)) { offset = c[i] }
+        }
+        .onChange(of: items.map(\.key)) {
+            offset = c.indices.contains(selectedIndex ?? -1) ? c[selectedIndex!] : 0
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Film dial")
+    }
+
+    /// Clicks while the finger moves the dial.
+    private func clicks(at o: CGFloat, centers c: [CGFloat]) {
+        let film = Self.nearest(o, in: c)
+        if film != lastFilm, abs(c[film] - o) < 8 {
+            lastFilm = film
+            detent.impactOccurred(intensity: 0.9)
+            detent.prepare()
+        }
+        let minor = Int((o / Self.minorStep).rounded(.down))
+        if minor != lastMinor {
+            lastMinor = minor
+            tick.impactOccurred(intensity: 0.35)
+            tick.prepare()
+        }
+    }
+
+    /// The same clicks, timed along the settle animation after a flick.
+    private func settleClicks(from: CGFloat, to: CGFloat, duration: Double, centers c: [CGFloat]) {
+        let id = settleID
+        let dist = to - from
+        guard abs(dist) > 1 else { detent.impactOccurred(intensity: 0.9); return }
+        let steps = min(Int(abs(dist) / Self.minorStep), 60)
+        // Ease-out: progress p happens at time ≈ duration * (1 - (1-p)^(1/2.2)).
+        for k in 1...max(steps, 1) {
+            let p = Double(k) / Double(max(steps, 1))
+            let t = duration * (1 - pow(1 - p, 1 / 2.2)) * 0.9
+            let pos = from + dist * CGFloat(p)
+            let onFilm = c.contains { abs($0 - pos) < Self.minorStep / 2 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + t) {
+                guard settleID == id else { return }
+                if onFilm { detent.impactOccurred(intensity: k == steps ? 1 : 0.8) }
+                else { tick.impactOccurred(intensity: 0.35) }
+            }
+        }
+    }
+}
+
+/// The dial's face: marks and film names. Animatable on `offset`, so SwiftUI
+/// redraws every frame of a turn instead of sliding labels between two states.
+private struct FilmDialFace: View, Animatable {
+    let items: [ArcItem]
+    let centers: [CGFloat]
+    var offset: CGFloat
+    let tones: FilmToneStore
+    let selectedIndex: Int?
+    var onTapItem: (Int) -> Void
+
+    var animatableData: CGFloat {
+        get { offset }
+        set { offset = newValue }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let focus = FilmArc.nearest(offset, in: centers)
+            let rl = ArcGeo.labelRadius
+            let first = (centers.first ?? 0) - 36, last = (centers.last ?? 0) + 36
+            // Minor marks every few points; film marks above each name.
+            let lo = max(first, offset - 340), hi = min(last, offset + 340)
+            let startK = Int((lo / FilmArc.minorStep).rounded(.up))
+            let endK = Int((hi / FilmArc.minorStep).rounded(.down))
+            ZStack {
+                if endK >= startK {
+                    ForEach(startK...endK, id: \.self) { k in
+                        let pos = CGFloat(k) * FilmArc.minorStep
+                        mark(at: pos, w: w, height: 4, opacity: 0.35)
+                    }
+                }
+                ForEach(centers.indices, id: \.self) { i in
+                    let a = Double((centers[i] - offset) / rl) * 180 / .pi
+                    if abs(a) < 48 {
+                        mark(at: centers[i], w: w, height: 8, opacity: i == focus ? 0 : 0.85)
+                        let isSel = i == focus
+                        Text(items[i].label.uppercased())
+                            .font(Font(FilmArc.font))
+                            .tracking(FilmArc.tracking)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .foregroundStyle(tones.tone(items[i].key))
+                            .opacity(isSel ? 1 : 0.8)
+                            .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
+                            .frame(minHeight: 44)
+                            .contentShape(Rectangle())
+                            .onTapGesture { onTapItem(i) }
+                            .rotationEffect(.degrees(a))
+                            .position(x: w / 2 + CGFloat(Double(rl) * sin(a * .pi / 180)),
+                                      y: ArcGeo.radius - CGFloat(Double(rl) * cos(a * .pi / 180)))
+                            .accessibilityLabel(items[i].label)
+                            .accessibilityAddTraits(i == selectedIndex ? .isSelected : [])
+                    }
+                }
+                Capsule().fill(Color.yellow)
+                    .frame(width: 2.5, height: 11)
+                    .position(x: w / 2, y: 10.5)
+            }
+        }
+    }
+
+    private func mark(at pos: CGFloat, w: CGFloat, height: CGFloat, opacity: Double) -> some View {
+        let a = Double((pos - offset) / ArcGeo.labelRadius) * 180 / .pi
+        let rad = a * .pi / 180
+        let r = Double(ArcGeo.radius - 5 - height / 2)
+        return Capsule()
+            .fill(.white.opacity(opacity))
+            .frame(width: 1.5, height: height)
+            .rotationEffect(.degrees(a))
+            .position(x: w / 2 + CGFloat(r * sin(rad)), y: ArcGeo.radius - CGFloat(r * cos(rad)))
     }
 }
 

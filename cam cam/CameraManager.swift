@@ -74,7 +74,9 @@ import CoreLocation
     }
     var focusLocked: Bool = false
     var isFocusing: Bool = false          // true while camera is hunting for focus
-    var faceDetected: Bool = false        // true when ≥1 face is in frame
+    var faceDetected: Bool = false {      // true when ≥1 face is in frame
+        didSet { SmartExposure.shared.faceHint = faceDetected }
+    }
     var manualFocusEnabled: Bool = false
     var manualFocusValue: Float = 0.5 {
         didSet { cachedManualFocusValue = manualFocusValue }
@@ -407,6 +409,8 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) var audioDataOutput = AVCaptureAudioDataOutput()
     @ObservationIgnored nonisolated(unsafe) var audioOutputAdded = false
     @ObservationIgnored nonisolated(unsafe) var cachedIsRecording: Bool = false
+    /// Your exposure offset, readable off-main (smart AE adds its correction on top).
+    @ObservationIgnored nonisolated(unsafe) var cachedUserBias: Float = 0
     @ObservationIgnored nonisolated(unsafe) var assetWriter: AVAssetWriter? = nil
     @ObservationIgnored nonisolated(unsafe) var videoWriterInput: AVAssetWriterInput? = nil
     @ObservationIgnored nonisolated(unsafe) var audioWriterInput: AVAssetWriterInput? = nil
@@ -1341,11 +1345,14 @@ import CoreLocation
 
     func setExposureBias(_ bias: Float) {
         guard let device = currentDevice else { return }
+        cachedUserBias = bias
+        let smart = SmartExposure.shared
+        let total = bias + (smart.enabled ? smart.correction : 0)
         sessionQueue.async {
             do {
                 try device.lockForConfiguration()
                 let clamped = max(device.minExposureTargetBias,
-                                  min(bias, device.maxExposureTargetBias))
+                                  min(total, device.maxExposureTargetBias))
                 device.setExposureTargetBias(clamped)
                 device.unlockForConfiguration()
             } catch {}
@@ -2804,6 +2811,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         }
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+        // Smart auto exposure (throttled internally to ~5 Hz)
+        SmartExposure.shared.process(pixelBuffer,
+                                     time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                                     camera: self)
 
         // Long exposure frame stacking. Cap = ~30fps × duration so long durations
         // (e.g. 30s) don't get silently truncated at 300 frames. Hard ceiling at 1500

@@ -59,6 +59,9 @@ struct GlassChrome<Shutter: View>: View {
     @State private var roll = FilmRoll.shared
     @State private var tones = FilmToneStore.shared
     @State private var thumbToken = 0
+    @State private var smartAE = SmartExposure.shared
+    @AppStorage("cc_arcSet") private var arcSetRaw = ArcSet.all.rawValue
+    private var arcSet: ArcSet { ArcSet(rawValue: arcSetRaw) ?? .all }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,18 +87,29 @@ struct GlassChrome<Shutter: View>: View {
                          onTap: { i in camera.selectFocalPreset(i) },
                          onScrub: scrub,
                          onScrubEnd: endScrub)
+                    .frame(maxWidth: .infinity)
+                    .overlay(alignment: .leading) { arcSetMenu.padding(.leading, 16) }
                     .padding(.bottom, 12)
                 Group {
                     if scrubStartMM != nil {
                         ZoomArc(mm: scrubMM)
                     } else {
-                        FilmArc(items: arcItems, selectedKey: selectedKey,
+                        FilmArc(items: shownItems, selectedKey: selectedKey,
                                 onSelect: select, onOpenLibrary: onLibrary)
                     }
                 }
                 .transition(.opacity)
             }
             bottomRows
+        }
+        .background {
+            // While controls are open, a tap anywhere on the picture closes them.
+            if showControls {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .onTapGesture { showControls = false }
+                    .accessibilityHidden(true)
+            }
         }
         .animation(.snappy(duration: 0.3), value: showControls)
         .animation(.snappy(duration: 0.2), value: scrubStartMM == nil)
@@ -113,19 +127,65 @@ struct GlassChrome<Shutter: View>: View {
     // MARK: Top
 
     private var topBar: some View {
-        GlassEffectContainer(spacing: 20) {
-            HStack {
-                Button { camera.toggleFlash() } label: {
-                    Image(systemName: flashSymbol)
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(camera.flashMode == .off ? .white : .yellow)
-                        .frame(width: 44, height: 44)
+        GlassEffectContainer(spacing: 2) {
+            HStack(alignment: .top) {
+                // Left: flash, then status chips (roll, focus, face).
+                VStack(alignment: .leading, spacing: 10) {
+                    Button { camera.toggleFlash() } label: {
+                        Image(systemName: flashSymbol)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(camera.flashMode == .off ? .white : .yellow)
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: Circle())
+                    .accessibilityLabel("Flash \(camera.flashLabel)")
+
+                    if roll.isLoaded {
+                        Button(action: onRoll) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "film").font(.system(size: 11, weight: .semibold))
+                                Text(roll.isFull ? "Develop" : "\(roll.exposuresLeft)")
+                                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                            }
+                            .foregroundStyle(roll.isFull ? .yellow : .white)
+                            .padding(.horizontal, 11).frame(height: 30)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: Capsule())
+                        .accessibilityLabel("\(roll.exposuresLeft) frames left on the roll")
+                    }
+
+                    if camera.isFocusing || (camera.faceDetected && !camera.manualFocusEnabled) {
+                        HStack(spacing: 6) {
+                            if camera.isFocusing { FocusPulse() }
+                            if camera.faceDetected && !camera.manualFocusEnabled {
+                                Image(systemName: "face.dashed").font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(.yellow)
+                            }
+                        }
+                        .padding(.horizontal, 10).frame(height: 28)
+                        .glassEffect(.regular, in: Capsule())
+                        .transition(.opacity)
+                    }
                 }
-                .buttonStyle(.plain)
-                .glassEffect(.regular.interactive(), in: Circle())
-                .accessibilityLabel("Flash \(camera.flashLabel)")
 
                 Spacer()
+
+                // Right: the exposure scale, viewfinder style. Tap for exposure.
+                Button {
+                    if showControls && active == .exposure { showControls = false }
+                    else { active = .exposure; showControls = true }
+                } label: {
+                    GlassEVMeter(bias: camera.exposureBias, correction: smartAE.correction,
+                                 smart: smartAE.enabled)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Capsule())
+                .accessibilityLabel("Exposure \(String(format: "%+.1f", camera.exposureBias))\(smartAE.enabled ? ", smart exposure on" : "")")
+            }
+            .overlay(alignment: .top) {
+                Group {
 
                 if camera.isRecording {
                     HStack(spacing: 6) {
@@ -149,21 +209,6 @@ struct GlassChrome<Shutter: View>: View {
                     .accessibilityLabel(showControls ? "Hide controls" : "Show controls")
                 }
 
-                Spacer()
-
-                if roll.isLoaded {
-                    Button(action: onRoll) {
-                        Text(roll.isFull ? "Dev" : "\(roll.exposuresLeft)")
-                            .font(.system(size: 15, weight: .semibold).monospacedDigit())
-                            .foregroundStyle(roll.isFull ? .yellow : .white)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .padding(.horizontal, 2)
-                    }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: Capsule())
-                    .accessibilityLabel("\(roll.exposuresLeft) frames left on the roll")
-                } else {
-                    Color.clear.frame(width: 44, height: 44)
                 }
             }
         }
@@ -196,6 +241,15 @@ struct GlassChrome<Shutter: View>: View {
                 GlassRuler(title: "Long exposure", valueText: String(format: "%.1f s", camera.longExposureDuration),
                            value: Binding(get: { camera.longExposureDuration }, set: { camera.longExposureDuration = ($0 * 2).rounded() / 2 }),
                            range: 1...30)
+            }
+            if camera.doubleExposureEnabled && camera.firstExposurePreview != nil {
+                Button { camera.firstExposurePreview = nil } label: {
+                    Label("Retake first exposure", systemImage: "arrow.uturn.backward")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 14).frame(height: 36)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Capsule())
             }
             if camera.doubleExposureEnabled {
                 GlassRuler(title: "Blend", valueText: "\(Int(camera.doubleExposureOpacity * 100))%",
@@ -255,10 +309,30 @@ struct GlassChrome<Shutter: View>: View {
                        value: Binding(get: { Double(camera.halationAmount) }, set: { camera.halationAmount = Float($0) }),
                        range: 0...1)
         case .exposure:
-            GlassRuler(title: "Exposure", valueText: String(format: "%+.1f", camera.exposureBias),
-                       value: Binding(get: { Double(camera.exposureBias) },
-                                      set: { camera.setExposureBias(Float(($0 * 3).rounded() / 3)) }),
-                       range: -3...3)
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    Button { smartAE.enabled.toggle() } label: {
+                        Label(smartAE.enabled ? "Smart" : "Apple auto", systemImage: smartAE.enabled ? "sparkles" : "a.circle")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(smartAE.enabled ? .black : .white)
+                            .padding(.horizontal, 12).frame(height: 32)
+                            .background(Capsule().fill(smartAE.enabled ? Color.yellow : Color.white.opacity(0.14)))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Switches between smart exposure and Apple's standard auto exposure")
+                    if smartAE.enabled {
+                        Text(smartAE.status.isEmpty ? "Balanced" : smartAE.status)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .contentTransition(.opacity)
+                    }
+                }
+                GlassRuler(title: smartAE.enabled ? "Your offset" : "Exposure",
+                           valueText: String(format: "%+.1f", camera.exposureBias),
+                           value: Binding(get: { Double(camera.exposureBias) },
+                                          set: { camera.setExposureBias(Float(($0 * 3).rounded() / 3)) }),
+                           range: -3...3)
+            }
         case .effects:
             chipPanel(title: "Effects", chips: [
                 ("Crosstalk", $camera.crosstalkEnabled), ("Rolloff", $camera.rolloffEnabled),
@@ -315,26 +389,25 @@ struct GlassChrome<Shutter: View>: View {
     // MARK: Bottom
 
     private var bottomRows: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 6) {
             HStack(spacing: 30) {
                 modeButton("VIDEO", on: mode == .video) { mode = .video }
                 modeButton("PHOTO", on: mode == .photo) { mode = .photo }
                 modeButton("SONY", on: false, action: onSony)
             }
-            .padding(.top, 10)
-            HStack {
-                Button(action: onAlbum) {
-                    LastShotThumb(token: thumbToken, hidden: roll.isLoaded)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Last photo")
-                Spacer()
-                if mode == .video {
-                    videoShutter
+            .padding(.top, 6)
+            HStack(spacing: 18) {
+                if camera.shutterOnLeft {
+                    // Left-handed: shutter under the left thumb.
+                    shutterForMode
+                    Spacer()
+                    thumbButton
                 } else {
-                    shutter()
+                    thumbButton
+                    Spacer()
+                    shutterForMode
+                    Spacer()
                 }
-                Spacer()
                 Button { camera.flipCamera() } label: {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .font(.system(size: 18, weight: .semibold))
@@ -345,10 +418,22 @@ struct GlassChrome<Shutter: View>: View {
                 .glassEffect(.regular.interactive(), in: Circle())
                 .accessibilityLabel(camera.isFrontCamera ? "Switch to back camera" : "Switch to front camera")
             }
-            .padding(.horizontal, 32)
-            .padding(.bottom, 34)
+            .padding(.horizontal, 28)
+            .padding(.bottom, 20)
         }
         .background(Color.black.ignoresSafeArea(edges: .bottom))
+    }
+
+    private var thumbButton: some View {
+        Button(action: onAlbum) {
+            LastShotThumb(token: thumbToken, hidden: roll.isLoaded)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Last photo")
+    }
+
+    @ViewBuilder private var shutterForMode: some View {
+        if mode == .video { videoShutter } else { shutter() }
     }
 
     private func modeButton(_ title: String, on: Bool, action: @escaping () -> Void) -> some View {
@@ -379,6 +464,34 @@ struct GlassChrome<Shutter: View>: View {
     }
 
     // MARK: Film arc data
+
+    private var arcSetMenu: some View {
+        Menu {
+            Picker("Dial shows", selection: $arcSetRaw) {
+                ForEach(ArcSet.allCases) { set in
+                    Label(set.title, systemImage: set.symbol).tag(set.rawValue)
+                }
+            }
+        } label: {
+            Image(systemName: arcSet.symbol)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(arcSet == .all ? .white : .yellow)
+                .frame(width: 40, height: 40)
+        }
+        .glassEffect(.regular.interactive(), in: Circle())
+        .accessibilityLabel("Dial shows \(arcSet.title)")
+    }
+
+    /// The films on the dial, after the All / Pinned / Built-in / Custom / LUTs choice.
+    private var shownItems: [ArcItem] {
+        switch arcSet {
+        case .all: return arcItems
+        case .pinned: return arcItems.filter { favorites.isFavorite($0.key) }
+        case .builtIn: return arcItems.filter { $0.sim != nil }
+        case .custom: return arcItems.filter { $0.custom != nil && $0.custom?.lutFilename == nil }
+        case .luts: return arcItems.filter { $0.custom?.lutFilename != nil }
+        }
+    }
 
     private var arcItems: [ArcItem] {
         let pinnedBuilt = favorites.builtIns
@@ -540,5 +653,99 @@ struct LastShotThumb: View {
                                               contentMode: .aspectFill, options: req) { img, _ in
             if let img { image = img }
         }
+    }
+}
+
+
+// MARK: - Dial set
+
+enum ArcSet: String, CaseIterable, Identifiable {
+    case all, pinned, builtIn, custom, luts
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: "All films"
+        case .pinned: "Pinned"
+        case .builtIn: "Built-in"
+        case .custom: "Your films"
+        case .luts: "LUTs"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .all: "film.stack"
+        case .pinned: "star.fill"
+        case .builtIn: "film"
+        case .custom: "paintbrush.fill"
+        case .luts: "cube.fill"
+        }
+    }
+}
+
+// MARK: - Exposure meter (glass)
+
+/// A viewfinder-style exposure scale: −2 … +2 in thirds. The yellow caret is
+/// your offset; when smart exposure is on, a small white dot shows where it
+/// is steering on top of that.
+struct GlassEVMeter: View {
+    let bias: Float
+    let correction: Float
+    let smart: Bool
+
+    private let span: CGFloat = 78          // width of the scale
+    private func x(_ ev: Float) -> CGFloat { CGFloat(max(-2, min(2, ev)) / 2) * span / 2 }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            ZStack {
+                // ticks: thirds, with taller ones on whole stops
+                ForEach(-6...6, id: \.self) { k in
+                    Capsule()
+                        .fill(.white.opacity(k == 0 ? 0.95 : (k % 3 == 0 ? 0.75 : 0.4)))
+                        .frame(width: k == 0 ? 1.5 : 1, height: k == 0 ? 10 : (k % 3 == 0 ? 7 : 4))
+                        .offset(x: CGFloat(k) / 6 * span / 2, y: 3)
+                }
+                // your offset
+                Image(systemName: "arrowtriangle.down.fill")
+                    .font(.system(size: 7))
+                    .foregroundStyle(.yellow)
+                    .offset(x: x(bias), y: -6)
+                // smart exposure's steering
+                if smart {
+                    Circle().fill(.white)
+                        .frame(width: 4, height: 4)
+                        .offset(x: x(bias + correction), y: 11)
+                }
+            }
+            .frame(width: span + 4, height: 30)
+            .animation(.snappy(duration: 0.25), value: bias)
+            .animation(.smooth(duration: 0.4), value: correction)
+
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(String(format: "%+.1f", bias))
+                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .contentTransition(.numericText())
+                Text(smart ? "SMART" : "AUTO")
+                    .font(.system(size: 8, weight: .bold)).tracking(0.8)
+                    .foregroundStyle(smart ? .yellow : .white.opacity(0.6))
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 44)
+    }
+}
+
+/// Pulsing ring while the camera hunts for focus.
+struct FocusPulse: View {
+    @State private var on = false
+    var body: some View {
+        Circle()
+            .stroke(Color.yellow.opacity(on ? 0.9 : 0.35), lineWidth: 1.5)
+            .frame(width: 14, height: 14)
+            .scaleEffect(on ? 1.15 : 0.9)
+            .animation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true), value: on)
+            .onAppear { on = true }
+            .accessibilityLabel("Focusing")
     }
 }
