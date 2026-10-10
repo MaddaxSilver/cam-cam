@@ -232,7 +232,14 @@ import CoreLocation
     }
     /// Observable so the UI follows it; the capture/render queues read the mirror.
     var activeCustomSim: CustomSimulation? {
-        didSet { cachedActiveCustomSim = activeCustomSim }
+        didSet {
+            cachedActiveCustomSim = activeCustomSim
+            // A saved camera brings its grain and aspect with it.
+            if let c = activeCustomSim, c.id != oldValue?.id {
+                if let g = c.grainAmount { grainEnabled = g > 0; if g > 0 { grainAmount = g } }
+                if let a = c.aspect.flatMap(AspectRatio.init(rawValue:)) { selectedAspectRatio = a }
+            }
+        }
     }
     @ObservationIgnored nonisolated(unsafe) var cachedActiveCustomSim: CustomSimulation?
     // Live-cached effect flags for preview rendering (updated via didSet)

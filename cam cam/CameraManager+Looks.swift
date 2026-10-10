@@ -1798,7 +1798,109 @@ extension CameraManager {
 
     // MARK: Custom Sim Processing
 
+    /// A custom film = optional base film → your adjustments (or LUT) → lens.
     nonisolated func applyCustomSim(to image: CIImage, sim: CustomSimulation) -> CIImage {
+        var img = image
+        if sim.lutFilename == nil, let base = sim.baseSim, base != .none {
+            img = applyFilmSim(to: img, sim: base, grainEnabled: false, grain: 0, digiCamQuality: cachedDigiCamQuality)
+            if let k = base.styleKind {
+                img = StyleEngine.apply(img, kind: k, tone: 0, color: 0, palette: 1, mask: nil)
+            }
+        }
+        img = applyCustomParams(to: img, sim: sim)
+        if sim.lensKind != .none { img = applyLens(img, sim.lensKind) }
+        return img.cropped(to: image.extent)
+    }
+
+    // MARK: - Lens character
+
+    nonisolated func applyLens(_ input: CIImage, _ lens: LensKind) -> CIImage {
+        let extent = input.extent
+        let size = max(extent.width, extent.height)
+        let c = CIVector(x: extent.midX, y: extent.midY)
+        func vignette(_ img: CIImage, _ intensity: Float, _ radius: Float) -> CIImage {
+            let v = CIFilter.vignetteEffect()
+            v.inputImage = img
+            v.center = CGPoint(x: extent.midX, y: extent.midY)
+            v.radius = Float(size) * radius
+            v.intensity = intensity
+            v.falloff = 0.6
+            return v.outputImage ?? img
+        }
+        /// White at the edges, black in the middle — where lens faults show.
+        func edgeMask(_ inner: CGFloat, _ outer: CGFloat) -> CIImage {
+            CIFilter(name: "CIRadialGradient", parameters: [
+                "inputCenter": c, "inputRadius0": size * inner, "inputRadius1": size * outer,
+                "inputColor0": CIColor(red: 0, green: 0, blue: 0), "inputColor1": CIColor(red: 1, green: 1, blue: 1),
+            ])?.outputImage?.cropped(to: extent) ?? CIImage(color: .black).cropped(to: extent)
+        }
+        func rotated(_ img: CIImage, _ degrees: CGFloat) -> CIImage {
+            let r = degrees * .pi / 180
+            return img.clampedToExtent()
+                .transformed(by: CGAffineTransform(translationX: -extent.midX, y: -extent.midY)
+                    .concatenating(CGAffineTransform(rotationAngle: r))
+                    .concatenating(CGAffineTransform(translationX: extent.midX, y: extent.midY)))
+                .cropped(to: extent)
+        }
+        func mix(_ a: CIImage, _ b: CIImage, _ t: Double) -> CIImage {
+            CIFilter(name: "CIDissolveTransition", parameters: [
+                kCIInputImageKey: a, kCIInputTargetImageKey: b, "inputTime": t,
+            ])?.outputImage?.cropped(to: extent) ?? a
+        }
+        func masked(_ fg: CIImage, over bg: CIImage, _ mask: CIImage) -> CIImage {
+            let b = CIFilter.blendWithMask()
+            b.inputImage = fg; b.backgroundImage = bg; b.maskImage = mask
+            return b.outputImage?.cropped(to: extent) ?? bg
+        }
+
+        switch lens {
+        case .none:
+            return input
+        case .swirl:
+            // Rotational smear grows toward the edges (Helios-44 swirly bokeh).
+            let a = mix(rotated(input, 0.9), rotated(input, -0.9), 0.5)
+            let b = mix(rotated(input, 1.8), rotated(input, -1.8), 0.5)
+            let swirl = mix(a, b, 0.5)
+            return vignette(masked(swirl, over: input, edgeMask(0.22, 0.62)), 0.6, 0.75)
+        case .glow:
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = input
+            bloom.radius = Float(size * 0.012)
+            bloom.intensity = 0.55
+            let soft = CIFilter.colorControls()
+            soft.inputImage = bloom.outputImage?.cropped(to: extent) ?? input
+            soft.contrast = 0.94
+            return vignette(soft.outputImage ?? input, 0.4, 0.8)
+        case .toy:
+            // Radial chromatic aberration + soft corners + heavy vignette.
+            func scaled(_ img: CIImage, _ k: CGFloat) -> CIImage {
+                img.clampedToExtent()
+                    .transformed(by: CGAffineTransform(translationX: -extent.midX, y: -extent.midY)
+                        .concatenating(CGAffineTransform(scaleX: k, y: k))
+                        .concatenating(CGAffineTransform(translationX: extent.midX, y: extent.midY)))
+                    .cropped(to: extent)
+            }
+            let r = isolateChannel(scaled(input, 1.007), channel: 0)
+            let g = isolateChannel(input, channel: 1)
+            let b = isolateChannel(scaled(input, 0.993), channel: 2)
+            let m1 = CIFilter.maximumCompositing(); m1.inputImage = r; m1.backgroundImage = g
+            let m2 = CIFilter.maximumCompositing(); m2.inputImage = m1.outputImage; m2.backgroundImage = b
+            let fringed = m2.outputImage?.cropped(to: extent) ?? input
+            let blurred = fringed.clampedToExtent().applyingGaussianBlur(sigma: Double(size) * 0.004).cropped(to: extent)
+            return vignette(masked(blurred, over: fringed, edgeMask(0.25, 0.6)), 1.6, 0.6)
+        case .anamorphic:
+            let streaked = applyAnamorphicFlare(input: input)
+            // Oval falloff: vignette on a horizontally squeezed frame.
+            return vignette(streaked, 0.7, 0.85)
+        case .pinhole:
+            let soft = input.clampedToExtent().applyingGaussianBlur(sigma: Double(size) * 0.0018).cropped(to: extent)
+            let d = CIFilter.colorControls()
+            d.inputImage = soft; d.saturation = 0.9
+            return vignette(d.outputImage ?? soft, 2.2, 0.55)
+        }
+    }
+
+    nonisolated func applyCustomParams(to image: CIImage, sim: CustomSimulation) -> CIImage {
         // LUT short-circuit: if this sim is backed by a .cube file, apply
         // the LUT and skip parameter-based grading. The LUT IS the look.
         // This branch runs from the live preview's nonisolated callback,

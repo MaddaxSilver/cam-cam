@@ -87,6 +87,54 @@ nonisolated struct CustomSimulation: Codable, Identifiable, Equatable, Sendable 
     var bloomRadius: Float = 8.0       // 2 ... 20
     var hazeAmount: Float = 0.0        // 0 = clear, 1 = heavy atmospheric haze
     var redEyeStrength: Float = 0.0    // 0 = off, 1 = full correction; blended at capture time
+
+    // Saved-camera extras (all optional so older saved films still load)
+    /// Start from a built-in film, then apply this film's adjustments on top.
+    var baseSim: FilmSimulation? = nil
+    /// Lens character (LensKind raw value).
+    var lens: String? = nil
+    /// Grain amount to switch to when this film is picked (nil = leave as is).
+    var grainAmount: Float? = nil
+    /// Aspect ratio to switch to when this film is picked (AspectRatio raw value).
+    var aspect: String? = nil
+
+    var lensKind: LensKind { lens.flatMap(LensKind.init(rawValue:)) ?? .none }
+}
+
+/// Lens character for saved cameras (applied after the film).
+nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
+    case none, swirl, glow, toy, anamorphic, pinhole
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .none: "Clean"
+        case .swirl: "Swirly"
+        case .glow: "Soft glow"
+        case .toy: "Toy lens"
+        case .anamorphic: "Anamorphic"
+        case .pinhole: "Pinhole"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .none: "Modern, sharp corner to corner"
+        case .swirl: "Helios-44 style: edges swirl around the centre"
+        case .glow: "Uncoated vintage glass: highlights bloom softly"
+        case .toy: "Plastic lens: colour fringes, soft corners, dark edges"
+        case .anamorphic: "Cinema lens: horizontal streaks, oval falloff"
+        case .pinhole: "No lens at all: soft, deep vignette"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .none: "camera.aperture"
+        case .swirl: "tornado"
+        case .glow: "sparkle"
+        case .toy: "camera.fill"
+        case .anamorphic: "rectangle.ratio.16.to.9"
+        case .pinhole: "circle.dotted"
+        }
+    }
 }
 
 // MARK: - Custom Sim Store

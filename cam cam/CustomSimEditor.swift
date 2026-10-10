@@ -226,10 +226,12 @@ private struct FilmEditDetail: View {
     var onDelete: () -> Void
 
     enum Tab: String, CaseIterable, Identifiable {
-        case light = "Light", colour = "Colour", tone = "Tone", channels = "Channels", effects = "Effects", more = "More"
+        case base = "Base", light = "Light", colour = "Colour", tone = "Tone", channels = "Channels"
+        case effects = "Effects", lens = "Lens", camera = "Camera", more = "More"
         var id: String { rawValue }
     }
-    @State private var tab: Tab = .light
+    @State private var tab: Tab = .base
+    @State private var tones = FilmToneStore.shared
     @State private var comparing = false
 
     var body: some View {
@@ -313,6 +315,87 @@ private struct FilmEditDetail: View {
 
     @ViewBuilder private var panel: some View {
         switch tab {
+        case .base:
+            VStack(alignment: .leading, spacing: 10) {
+                Text("START FROM").font(.system(size: 12, weight: .semibold)).tracking(0.8)
+                    .foregroundStyle(.white.opacity(0.85))
+                Text("Pick a film to build on. Your adjustments go on top of it.")
+                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.7))
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 8)], spacing: 8) {
+                    ForEach(FilmSimulation.allCases) { f in
+                        let on = (sim.baseSim ?? .none) == f
+                        Button { sim.baseSim = f == .none ? nil : f } label: {
+                            HStack(spacing: 6) {
+                                Circle().fill(tones.tone(FavoritesStore.key(f))).frame(width: 10, height: 10)
+                                Text(f.label).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                                    .minimumScaleFactor(0.8)
+                                Spacer(minLength: 0)
+                            }
+                            .foregroundStyle(on ? .black : .white)
+                            .padding(.horizontal, 10).frame(minHeight: 36)
+                            .background(Capsule().fill(on ? Color.yellow : Color.white.opacity(0.1)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        case .lens:
+            VStack(spacing: 8) {
+                ForEach(LensKind.allCases) { l in
+                    let on = sim.lensKind == l
+                    Button { sim.lens = l == .none ? nil : l.rawValue } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: l.symbol).font(.system(size: 18, weight: .semibold)).frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(l.label).font(.system(size: 15, weight: .semibold))
+                                Text(l.detail).font(.system(size: 12)).opacity(0.75)
+                            }
+                            Spacer()
+                            if on { Image(systemName: "checkmark").font(.system(size: 14, weight: .bold)) }
+                        }
+                        .foregroundStyle(on ? .black : .white)
+                        .padding(.horizontal, 14).frame(minHeight: 56)
+                        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(on ? Color.yellow : Color.white.opacity(0.08)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        case .camera:
+            VStack(alignment: .leading, spacing: 10) {
+                Text("WHEN YOU PICK THIS FILM").font(.system(size: 12, weight: .semibold)).tracking(0.8)
+                    .foregroundStyle(.white.opacity(0.85))
+                Toggle("Set grain", isOn: Binding(get: { sim.grainAmount != nil },
+                                                  set: { sim.grainAmount = $0 ? 0.15 : nil }))
+                    .tint(.yellow).font(.system(size: 15, weight: .semibold))
+                if sim.grainAmount != nil {
+                    GlassRuler(title: "Grain", valueText: "\(Int((sim.grainAmount ?? 0) * 200))",
+                               value: Binding(get: { Double(sim.grainAmount ?? 0) }, set: { sim.grainAmount = Float($0) }),
+                               range: 0...0.5)
+                }
+                Toggle("Set aspect", isOn: Binding(get: { sim.aspect != nil },
+                                                   set: { sim.aspect = $0 ? AspectRatio.full.rawValue : nil }))
+                    .tint(.yellow).font(.system(size: 15, weight: .semibold))
+                if let a = sim.aspect {
+                    HStack(spacing: 6) {
+                        ForEach(AspectRatio.allCases) { r in
+                            Button { sim.aspect = r.rawValue } label: {
+                                Text(r.label).font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(a == r.rawValue ? .black : .white)
+                                    .frame(maxWidth: .infinity, minHeight: 36)
+                                    .background(Capsule().fill(a == r.rawValue ? Color.yellow : Color.white.opacity(0.12)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                Text("Base film + adjustments + lens + grain + aspect make this a saved camera you can pick from the dial.")
+                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.7))
+            }
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         case .light:
             ruler("Brightness", $sim.brightness, -0.1...0.1)
             ruler("Contrast", $sim.contrast, 0.7...1.5, neutral: 1)
