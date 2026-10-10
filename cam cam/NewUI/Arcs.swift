@@ -12,7 +12,7 @@ import SwiftUI
 private enum ArcGeo {
     static let radius: CGFloat = 450        // glass disc radius
     static let labelInset: CGFloat = 36     // labels sit this far inside the rim
-    static let height: CGFloat = 118        // visible cap (room for the lens pill under the labels)
+    static let height: CGFloat = 112        // visible cap (room for the lens pill under the labels)
     static var labelRadius: CGFloat { radius - labelInset }
     static func degPerPoint() -> Double { 180 / (Double.pi * Double(labelRadius)) }
 }
@@ -363,16 +363,16 @@ struct LensPill: View {
     var onScrubEnd: () -> Void
 
     var body: some View {
-        HStack(spacing: 1) {
+        HStack(spacing: 0) {
             if scrubbing {
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text("\(liveMM)").font(.system(size: 22, weight: .semibold).monospacedDigit())
+                    Text("\(liveMM)").font(.system(size: 18, weight: .semibold).monospacedDigit())
                         .foregroundStyle(.yellow)
                         .contentTransition(.numericText())
                     Text("mm").font(.system(size: 12, weight: .semibold))
                 }
-                .padding(.horizontal, 18)
-                .frame(height: 34)
+                .padding(.horizontal, 16)
+                .frame(height: 28)
             } else {
                 ForEach(Array(focalPresets.enumerated()), id: \.offset) { i, p in
                     let on = i == selectedIndex
@@ -381,17 +381,17 @@ struct LensPill: View {
                     let hot = on || (selectedIndex < 0 && i == nearestIndex)
                     Button { onTap(i) } label: {
                         Text(label)
-                            .font(.system(size: hot ? 13 : 11, weight: .semibold).monospacedDigit())
+                            .font(.system(size: hot ? 12 : 10.5, weight: .semibold).monospacedDigit())
                             .foregroundStyle(hot ? Color.yellow : .white)
-                            .frame(width: 36, height: 36)
-                            .background(Circle().fill(hot ? Color.black.opacity(0.45) : .clear))
+                            .frame(width: 30, height: 28)
+                            .background(Capsule().fill(hot ? Color.black.opacity(0.45) : .clear))
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("\(p.mm) millimetre")
                 }
             }
         }
-        .padding(3)
+        .padding(2)
         .glassEffect(.regular.interactive(), in: Capsule())
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.25)
