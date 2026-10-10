@@ -129,13 +129,41 @@ final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
         isOpaque = false
     }
 
+    /// Drawable size, mirrored for the camera queue (UIKit owns the real one).
+    nonisolated(unsafe) private var renderSize: CGSize = .zero
+    nonisolated(unsafe) private var renderQueue: MTLCommandQueue?
+    nonisolated(unsafe) private var metalLayer: CAMetalLayer?
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        renderSize = drawableSize
+        renderQueue = commandQueue
+        metalLayer = layer as? CAMetalLayer
+    }
+
+    /// Render a frame straight from the camera queue. Drawing used to hop to
+    /// the main thread every frame (setNeedsDisplay → draw(in:)), where
+    /// building and submitting the Core Image graph competed with touches,
+    /// the film dial and pinch. CAMetalLayer hands out drawables on any thread.
+    nonisolated func render(_ image: CIImage) {
+        guard let layer = metalLayer,
+              renderSize.width > 0,
+              let context = sharedCIContext,
+              let commandBuffer = renderQueue?.makeCommandBuffer(),
+              let drawable = layer.nextDrawable() else { return }
+        encode(image, size: renderSize, context: context, drawable: drawable, commandBuffer: commandBuffer)
+    }
+
     func draw(in view: MTKView) {
         guard let image = currentImage,
               let context = sharedCIContext,
               let drawable = currentDrawable,
               let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
+        encode(image, size: drawableSize, context: context, drawable: drawable, commandBuffer: commandBuffer)
+    }
 
-        let dSize = drawableSize
+    nonisolated private func encode(_ image: CIImage, size dSize: CGSize, context: CIContext,
+                                    drawable: CAMetalDrawable, commandBuffer: MTLCommandBuffer) {
         // Aspect-fill so the preview fills the whole screen.
         let scaleX = dSize.width / image.extent.width
         let scaleY = dSize.height / image.extent.height
@@ -150,7 +178,7 @@ final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
         let destination = CIRenderDestination(
             width: Int(dSize.width),
             height: Int(dSize.height),
-            pixelFormat: colorPixelFormat,
+            pixelFormat: drawable.texture.pixelFormat,
             commandBuffer: commandBuffer,
             mtlTextureProvider: { drawable.texture }
         )
@@ -159,7 +187,7 @@ final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
         commandBuffer.commit()
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { renderSize = size }
 }
 
 struct MetalFilteredPreview: UIViewRepresentable {

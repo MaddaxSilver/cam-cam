@@ -87,9 +87,16 @@ struct FilmArc: View {
         return out
     }
 
+    /// Measured once per label: the dial re-lays out every drag frame, and
+    /// measuring text with UIKit each time was the dial's main cost.
+    private static var widthCache: [String: CGFloat] = [:]
+
     static func width(_ label: String) -> CGFloat {
+        if let w = widthCache[label] { return w }
         let t = label.uppercased() as NSString
-        return max(ceil(t.size(withAttributes: [.font: font, .kern: tracking]).width), 30)
+        let w = max(ceil(t.size(withAttributes: [.font: font, .kern: tracking]).width), 30)
+        widthCache[label] = w
+        return w
     }
 
     private var selectedIndex: Int? { items.firstIndex { $0.key == selectedKey } }

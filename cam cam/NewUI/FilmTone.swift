@@ -19,6 +19,20 @@ final class FilmToneStore {
 
     private(set) var tones: [String: Color] = [:]
     @ObservationIgnored private var pending: Set<String> = []
+    /// Measured tones survive launches (hue, saturation, brightness per key),
+    /// so the dial doesn't re-render every film (and re-parse every LUT) on
+    /// each start. Keyed to the build, since looks can change between builds.
+    @ObservationIgnored private var saved: [String: [Double]]
+    nonisolated private static var cacheKey: String {
+        "cc_filmTones_" + (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0")
+    }
+
+    init() {
+        saved = UserDefaults.standard.dictionary(forKey: Self.cacheKey) as? [String: [Double]] ?? [:]
+        for (k, v) in saved where v.count == 3 {
+            tones[k] = Color(hue: v[0], saturation: v[1], brightness: v[2])
+        }
+    }
 
     func tone(_ key: String) -> Color { tones[key] ?? .white }
 
@@ -30,18 +44,28 @@ final class FilmToneStore {
         nonisolated(unsafe) let cam = camera
         let jobs = todo.map { ($0.key, $0.sim, $0.custom) }
         Task.detached(priority: .utility) {
-            var out: [String: Color] = [:]
+            var out: [String: [Double]] = [:]
             for (key, sim, custom) in jobs {
                 out[key] = FilmToneStore.measure(sim: sim, custom: custom, camera: cam)
             }
             await MainActor.run {
-                for (k, v) in out { FilmToneStore.shared.tones[k] = v; FilmToneStore.shared.pending.remove(k) }
+                let store = FilmToneStore.shared
+                for (k, v) in out {
+                    store.tones[k] = Color(hue: v[0], saturation: v[1], brightness: v[2])
+                    store.pending.remove(k)
+                    store.saved[k] = v
+                }
+                UserDefaults.standard.set(store.saved, forKey: FilmToneStore.cacheKey)
             }
         }
     }
 
     /// Forget a custom film's tone (after it's edited).
-    func invalidate(_ key: String) { tones[key] = nil }
+    func invalidate(_ key: String) {
+        tones[key] = nil
+        saved[key] = nil
+        UserDefaults.standard.set(saved, forKey: Self.cacheKey)
+    }
 
     nonisolated private static let swatch: CIImage = {
         let patches: [(CGFloat, CGFloat, CGFloat)] = [
@@ -59,11 +83,12 @@ final class FilmToneStore {
         return img
     }()
 
-    nonisolated static func measure(sim: FilmSimulation?, custom: CustomSimulation?, camera: CameraManager) -> Color {
+    /// The film's label tint as [hue, saturation, brightness].
+    nonisolated static func measure(sim: FilmSimulation?, custom: CustomSimulation?, camera: CameraManager) -> [Double] {
         var r = ShotRecipe()
         r.sim = sim ?? .none
         r.custom = custom
-        guard !r.isIdentity else { return .white }
+        guard !r.isIdentity else { return [0, 0, 1] }
         let input = swatch
         let graded = camera.renderLook(input, recipe: r, flatten: false).cropped(to: input.extent)
         let avg = graded.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: input.extent)])
@@ -76,7 +101,7 @@ final class FilmToneStore {
         ui.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
         // Exaggerate the cast a little so it reads, but keep text light.
         let sat = min(max(s * 1.8, 0), 0.55)
-        return Color(hue: Double(h), saturation: Double(sat), brightness: 0.97)
+        return [Double(h), Double(sat), 0.97]
     }
 }
 

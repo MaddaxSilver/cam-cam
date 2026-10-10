@@ -257,9 +257,13 @@ extension CameraManager {
             // Context-aware grain: scale amount by inverse of scene luminance
             // Dark scenes → more grain (like underexposed film), bright scenes → less
             if r.contextAwareGrain {
+                // Measure a small copy of the scene: averaging the full-res
+                // graded image forced the whole look to render twice.
+                let s = 256 / max(input.extent.width, input.extent.height, 1)
+                let probe = input.transformed(by: CGAffineTransform(scaleX: s, y: s))
                 let avgFilter = CIFilter.areaAverage()
-                avgFilter.inputImage = image
-                avgFilter.extent = image.extent
+                avgFilter.inputImage = probe
+                avgFilter.extent = probe.extent
                 if let avgImg = avgFilter.outputImage {
                     var bitmap = [UInt8](repeating: 0, count: 4)
                     ciContext.render(avgImg,

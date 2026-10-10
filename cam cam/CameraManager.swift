@@ -744,7 +744,15 @@ import CoreLocation
         let candidates = device.formats.filter { f in
             guard CMFormatDescriptionGetMediaType(f.formatDescription) == kCMMediaType_Video else { return false }
             let dims = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-            return dims.width >= 1920
+            // ≥1080p, 30fps, and the same shape as its photos, so the preview
+            // frames exactly what's saved (a 16:9 feed would crop a 4:3 photo).
+            guard dims.width >= 1920,
+                  f.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= 30 }),
+                  let photo = f.supportedMaxPhotoDimensions.max(by: { $0.width * $0.height < $1.width * $1.height })
+            else { return false }
+            let videoAspect = Double(dims.width) / Double(dims.height)
+            let photoAspect = Double(photo.width) / Double(photo.height)
+            return abs(videoAspect - photoAspect) < 0.02
         }
         let pool = candidates.isEmpty ? device.formats : candidates
 
@@ -754,9 +762,12 @@ import CoreLocation
             let bPhoto = b.supportedMaxPhotoDimensions
                 .map { Int($0.width) * Int($0.height) }.max() ?? 0
             if aPhoto != bPhoto { return aPhoto < bPhoto }
+            // Same photo size: prefer the SMALLER live feed (still ≥1080p).
+            // Every frame is filtered for the preview, so a 12MP feed costs
+            // ~4× the bandwidth, heat and battery of a 1920-wide one.
             let aVid = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let bVid = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-            return Int(aVid.width) * Int(aVid.height) < Int(bVid.width) * Int(bVid.height)
+            return Int(aVid.width) * Int(aVid.height) > Int(bVid.width) * Int(bVid.height)
         }
         guard let best else { return }
         device.activeFormat = best
@@ -2703,16 +2714,18 @@ import CoreLocation
         else if pendingDeviceAngle == 180 { cropped = cropped.oriented(.down) }   // upside down
 
         let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
-        guard let cgImage = ciContext.createCGImage(cropped, from: cropped.extent, format: .RGBA8, colorSpace: p3)
-        else { return nil }
-        // Force noneSkipLast alpha info so the encoder knows the image is opaque.
-        let w = cgImage.width, h = cgImage.height
-        var opaque = cgImage
-        if let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                               space: p3, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
-            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
-            opaque = ctx.makeImage() ?? cgImage
-        }
+        // Render straight into an opaque (noneSkipLast) bitmap so the encoder
+        // knows there's no alpha: one full-res buffer and no CPU redraw
+        // (at 48MP the old render-then-redraw held two ~190MB bitmaps).
+        let bounds = cropped.extent.integral
+        let w = Int(bounds.width), h = Int(bounds.height)
+        guard w > 0, h > 0,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: p3, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let pixels = ctx.data else { return nil }
+        ciContext.render(cropped, toBitmap: pixels, rowBytes: w * 4, bounds: bounds,
+                         format: .RGBA8, colorSpace: p3)
+        guard let opaque = ctx.makeImage() else { return nil }
 
         // Original EXIF, orientation reset (already rotated), real pixel dims.
         var meta = metadata
@@ -3078,7 +3091,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         if let metal {
             metal.currentImage = filtered
-            DispatchQueue.main.async { metal.setNeedsDisplay() }
+            metal.render(filtered)        // drawn here, off the main thread
         }
     }
 }
