@@ -34,6 +34,12 @@ struct CameraContentView: View {
     @State private var showCustomSimEditor = false
     @State private var showSonyView = false
     @State private var showRegrade = false
+    @State private var showLibrary = false
+    @State private var showRollSheet = false
+    @State private var showSettings = false
+    @State private var pinchBaseZoom: Double?
+    @AppStorage("cc_classicUI") private var classicUI = false
+    @AppStorage("cc_captureMode") private var captureModeRaw = CaptureMode.photo.rawValue
     @State private var roll = FilmRoll.shared
     @State private var showRollOptions = false
     @State private var router = LaunchRouter.shared
@@ -103,6 +109,20 @@ struct CameraContentView: View {
                 // Camera layer
                 cameraLayer
                     .ignoresSafeArea()
+                    .gesture(
+                        MagnifyGesture()
+                            .onChanged { v in
+                                if pinchBaseZoom == nil { pinchBaseZoom = camera.zoom }
+                                let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
+                                camera.setZoom(CGFloat(z))
+                            }
+                            .onEnded { v in
+                                let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
+                                camera.zoom = z
+                                pinchBaseZoom = nil
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { camera.syncZoomState() }
+                            }
+                    )
                     .onTapGesture { location in
                         guard !camera.manualFocusEnabled else { return }
                         focusPoint = location
@@ -222,17 +242,49 @@ struct CameraContentView: View {
                 }
 
                 // Controls overlay — full width
-                VStack(spacing: 0) {
-                    // Top bar — right-aligned content
-                    topBar
-                        .padding(.top, 60)
+                if classicUI {
+                    VStack(spacing: 0) {
+                        // Top bar — right-aligned content
+                        topBar
+                            .padding(.top, 60)
 
-                    Spacer()
+                        Spacer()
 
-                    // Bottom controls — full width
-                    bottomSection
+                        // Bottom controls — full width
+                        bottomSection
+                    }
+                    .frame(maxWidth: .infinity)
+                } else if cleanMode {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            shutterButton
+                            Spacer()
+                        }
+                        .overlay(alignment: .trailing) {
+                            Button { cleanMode = false } label: {
+                                Image(systemName: "eye").font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.white).frame(width: 44, height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.interactive(), in: Circle())
+                            .padding(.trailing, 32)
+                            .accessibilityLabel("Show controls")
+                        }
+                        .padding(.bottom, 44)
+                    }
+                } else {
+                    GlassChrome(camera: camera, customSimStore: customSimStore,
+                                mode: Binding(get: { CaptureMode(rawValue: captureModeRaw) ?? .photo },
+                                              set: { captureModeRaw = $0.rawValue }),
+                                onSony: { showSonyView = true },
+                                onLibrary: { showLibrary = true },
+                                onRoll: { showRollSheet = true },
+                                onSettings: { showSettings = true },
+                                onAlbum: { showRegrade = true },
+                                shutter: { shutterButton })
                 }
-                .frame(maxWidth: .infinity)
 
                 // Startup fade — hides orientation settle on first frame
                 if startupBlackOpacity > 0 {
@@ -246,6 +298,94 @@ struct CameraContentView: View {
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
         .persistentSystemOverlays(.hidden)
+        .fullScreenCover(isPresented: $showCustomSimEditor) {
+            CustomSimEditorView(store: customSimStore, camera: camera)
+        }
+        .fullScreenCover(isPresented: $showSonyView) {
+            SonyView(camera: camera)
+                .preferredColorScheme(.dark)
+        }
+        .fullScreenCover(isPresented: $showRegrade) {
+            RegradeView(camera: camera, customSimStore: customSimStore)
+        }
+        .confirmationDialog(roll.isLoaded ? "Roll · \(roll.shotCount) of \(roll.capacity) shot" : "Load a film roll",
+                            isPresented: $showRollOptions, titleVisibility: .visible) {
+            if roll.isLoaded {
+                if roll.shotCount > 0 {
+                    Button("Develop \(roll.shotCount) frame\(roll.shotCount == 1 ? "" : "s")") {
+                        Task { await roll.develop() }
+                    }
+                }
+                Button("Discard roll (deletes undeveloped frames)", role: .destructive) { roll.discard() }
+            } else {
+                Button("24 exposures") { roll.load(capacity: 24) }
+                Button("36 exposures") { roll.load(capacity: 36) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(roll.isLoaded
+                 ? "Frames stay hidden until developed. Developing saves them to the cam cam album."
+                 : "Shoot blind: no reviewing until the roll is developed.")
+        }
+        .sheet(item: $shareItem) { item in
+            ShareSheet(items: [item.url]).presentationDetents([.medium, .large])
+        }
+        .overlay(alignment: .bottom) {
+            if roll.developing {
+                Label("Developing \(roll.developProgress)/\(roll.shotCount + roll.developProgress)…", systemImage: "film")
+                    .font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Color.black.opacity(0.75), in: Capsule())
+                    .padding(.bottom, 200)
+            } else if let msg = roll.message {
+                Text(msg)
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Color.black.opacity(0.75), in: Capsule())
+                    .padding(.bottom, 200).padding(.horizontal, 24)
+                    .task(id: msg) {
+                        try? await Task.sleep(for: .seconds(3))
+                        if roll.message == msg { roll.message = nil }
+                    }
+            }
+        }
+        .overlay(alignment: .top) {
+            if exportingLUT {
+                Label("Baking LUT…", systemImage: "cube.transparent")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Color.black.opacity(0.7), in: Capsule())
+                    .offset(y: -44)
+            }
+        }
+        .fileImporter(
+            isPresented: $showLUTImporter,
+            allowedContentTypes: [
+                UTType(filenameExtension: "cube") ?? .data,
+                .data
+            ],
+            allowsMultipleSelection: false
+        ) { result in
+            handleLUTImport(result: result)
+        }
+        .sheet(isPresented: $showLibrary) {
+            FilmLibrarySheet(camera: camera, customSimStore: customSimStore,
+                             onExportLUT: { sim, custom, name in exportLUT(sim: sim, custom: custom, name: name) },
+                             onEditFilms: { showCustomSimEditor = true },
+                             onImportLUT: { showLUTImporter = true })
+        }
+        .sheet(isPresented: $showRollSheet) {
+            RollSheet().presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showSettings) {
+            CamSettingsSheet(camera: camera,
+                             onRegrade: { showRegrade = true },
+                             onRoll: { showRollSheet = true },
+                             onEditFilms: { showCustomSimEditor = true },
+                             onImportLUT: { showLUTImporter = true },
+                             classicUI: $classicUI, cleanMode: $cleanMode)
+        }
         .onChange(of: motion.isLandscape) { _, newValue in
             camera.isLandscape = newValue
         }
@@ -1352,77 +1492,6 @@ struct CameraContentView: View {
                 .padding(.horizontal, 32)
             }
             .padding(.horizontal, -32)
-            .fullScreenCover(isPresented: $showCustomSimEditor) {
-                CustomSimEditorView(store: customSimStore, camera: camera)
-            }
-            .fullScreenCover(isPresented: $showSonyView) {
-                SonyView(camera: camera)
-                    .preferredColorScheme(.dark)
-            }
-            .fullScreenCover(isPresented: $showRegrade) {
-                RegradeView(camera: camera, customSimStore: customSimStore)
-            }
-            .confirmationDialog(roll.isLoaded ? "Roll · \(roll.shotCount) of \(roll.capacity) shot" : "Load a film roll",
-                                isPresented: $showRollOptions, titleVisibility: .visible) {
-                if roll.isLoaded {
-                    if roll.shotCount > 0 {
-                        Button("Develop \(roll.shotCount) frame\(roll.shotCount == 1 ? "" : "s")") {
-                            Task { await roll.develop() }
-                        }
-                    }
-                    Button("Discard roll (deletes undeveloped frames)", role: .destructive) { roll.discard() }
-                } else {
-                    Button("24 exposures") { roll.load(capacity: 24) }
-                    Button("36 exposures") { roll.load(capacity: 36) }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text(roll.isLoaded
-                     ? "Frames stay hidden until developed. Developing saves them to the cam cam album."
-                     : "Shoot blind: no reviewing until the roll is developed.")
-            }
-            .sheet(item: $shareItem) { item in
-                ShareSheet(items: [item.url]).presentationDetents([.medium, .large])
-            }
-            .overlay(alignment: .bottom) {
-                if roll.developing {
-                    Label("Developing \(roll.developProgress)/\(roll.shotCount + roll.developProgress)…", systemImage: "film")
-                        .font(.system(size: 13, weight: .medium)).foregroundStyle(.white)
-                        .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(Color.black.opacity(0.75), in: Capsule())
-                        .padding(.bottom, 200)
-                } else if let msg = roll.message {
-                    Text(msg)
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(Color.black.opacity(0.75), in: Capsule())
-                        .padding(.bottom, 200).padding(.horizontal, 24)
-                        .task(id: msg) {
-                            try? await Task.sleep(for: .seconds(3))
-                            if roll.message == msg { roll.message = nil }
-                        }
-                }
-            }
-            .overlay(alignment: .top) {
-                if exportingLUT {
-                    Label("Baking LUT…", systemImage: "cube.transparent")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
-                        .padding(.horizontal, 12).padding(.vertical, 6)
-                        .background(Color.black.opacity(0.7), in: Capsule())
-                        .offset(y: -44)
-                }
-            }
-            .fileImporter(
-                isPresented: $showLUTImporter,
-                allowedContentTypes: [
-                    UTType(filenameExtension: "cube") ?? .data,
-                    .data
-                ],
-                allowsMultipleSelection: false
-            ) { result in
-                handleLUTImport(result: result)
-            }
             } // end if !cleanMode (film sim strip)
 
             // Grain toggle + slider — hidden in clean mode

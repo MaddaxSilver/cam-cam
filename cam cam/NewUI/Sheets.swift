@@ -1,0 +1,314 @@
+//
+//  Sheets.swift
+//  cam cam
+//
+//  The three sheets of the new UI: the film library (opened from the centre
+//  film on the arc), the film roll, and Settings (everything that isn't a
+//  per-shot control).
+//
+
+import SwiftUI
+
+// MARK: - Film library
+
+struct FilmLibrarySheet: View {
+    @Bindable var camera: CameraManager
+    let customSimStore: CustomSimStore
+    var onExportLUT: (FilmSimulation, CustomSimulation?, String) -> Void
+    var onEditFilms: () -> Void
+    var onImportLUT: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var favorites = FavoritesStore.shared
+    @State private var tones = FilmToneStore.shared
+    @State private var query = ""
+    @State private var filter: Filter = .all
+
+    enum Filter: String, CaseIterable, Identifiable {
+        case all = "All", pinned = "Pinned", builtIn = "Built-in", custom = "Custom", luts = "LUTs"
+        var id: String { rawValue }
+    }
+
+    private var items: [ArcItem] {
+        let built = FilmSimulation.allCases.map(ArcItem.builtIn)
+        let customs = customSimStore.simulations.map(ArcItem.custom)
+        let all: [ArcItem]
+        switch filter {
+        case .all: all = built + customs
+        case .pinned: all = (built + customs).filter { favorites.isFavorite($0.key) }
+        case .builtIn: all = built
+        case .custom: all = customs.filter { $0.custom?.lutFilename == nil }
+        case .luts: all = customs.filter { $0.custom?.lutFilename != nil }
+        }
+        guard !query.isEmpty else { return all }
+        return all.filter { $0.label.localizedCaseInsensitiveContains(query) }
+    }
+
+    private var selectedKey: String {
+        if let c = camera.activeCustomSim { return FavoritesStore.key(c) }
+        return FavoritesStore.key(camera.selectedSim)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(Filter.allCases) { f in
+                                Button { filter = f } label: {
+                                    Text(f.rawValue).font(.system(size: 14, weight: .semibold))
+                                        .foregroundStyle(filter == f ? .black : .white)
+                                        .padding(.horizontal, 12).frame(height: 32)
+                                        .background(Capsule().fill(filter == f ? Color.white : Color.white.opacity(0.12)))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
+                }
+                let pinned = items.filter { favorites.isFavorite($0.key) }
+                if !pinned.isEmpty && filter != .pinned {
+                    Section("Pinned") { ForEach(pinned) { row($0) } }
+                }
+                Section(filter == .pinned ? "Pinned" : "Films") {
+                    ForEach(items.filter { filter == .pinned || !favorites.isFavorite($0.key) }) { row($0) }
+                }
+            }
+            .searchable(text: $query, prompt: "Search films")
+            .navigationTitle("Films")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button("Edit films") { dismiss(); onEditFilms() }
+                    Spacer()
+                    Button("Import LUT") { dismiss(); onImportLUT() }
+                }
+            }
+            .task { tones.ensure(FilmSimulation.allCases.map(ArcItem.builtIn) + customSimStore.simulations.map(ArcItem.custom), camera: camera) }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func row(_ item: ArcItem) -> some View {
+        let isSel = item.key == selectedKey
+        let pinned = favorites.isFavorite(item.key)
+        return HStack(spacing: 12) {
+            Circle().fill(tones.tone(item.key)).frame(width: 22, height: 22)
+                .overlay(Circle().stroke(.white.opacity(0.2), lineWidth: 1))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.label).font(.body.weight(isSel ? .bold : .regular))
+                    .foregroundStyle(isSel ? Color.yellow : .primary)
+                Text(kind(item)).font(.footnote).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { favorites.toggle(item.key) } label: {
+                Image(systemName: pinned ? "star.fill" : "star")
+                    .foregroundStyle(pinned ? Color.yellow : .secondary)
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(pinned ? "Unpin \(item.label)" : "Pin \(item.label)")
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { choose(item); dismiss() }
+        .contextMenu {
+            Button { favorites.toggle(item.key) } label: {
+                Label(pinned ? "Unpin" : "Pin to the dial", systemImage: pinned ? "star.slash" : "star")
+            }
+            if item.sim != FilmSimulation.none || item.custom != nil {
+                Button {
+                    onExportLUT(item.sim ?? .none, item.custom, item.label)
+                } label: { Label("Export as LUT (.cube)", systemImage: "square.and.arrow.up") }
+            }
+        }
+    }
+
+    private func kind(_ item: ArcItem) -> String {
+        if let c = item.custom { return c.lutFilename == nil ? "Your film" : "LUT" }
+        return "Built-in"
+    }
+
+    private func choose(_ item: ArcItem) {
+        if let c = item.custom {
+            customSimStore.activeCustomSimID = c.id
+            camera.activeCustomSim = c
+            camera.selectedSim = .none
+        } else if let s = item.sim {
+            camera.selectedSim = s
+            customSimStore.activeCustomSimID = nil
+            camera.activeCustomSim = nil
+        }
+    }
+}
+
+// MARK: - Film roll
+
+struct RollSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var roll = FilmRoll.shared
+    @State private var confirmDiscard = false
+    @State private var developedCount: Int?
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                if let n = developedCount {
+                    Spacer()
+                    VStack(spacing: 14) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 40, weight: .bold)).foregroundStyle(.black)
+                            .frame(width: 96, height: 96).background(Circle().fill(Color.yellow))
+                            .symbolEffect(.bounce, value: n)
+                        Text("\(n) frames developed").font(.title2.bold())
+                        Text("They’re in the cam cam album.").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .sensoryFeedback(.success, trigger: n)
+                    Spacer()
+                } else if roll.isLoaded {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("\(roll.shotCount)").font(.system(size: 64, weight: .bold).monospacedDigit())
+                        Text("of \(roll.capacity)").font(.title3).foregroundStyle(.secondary)
+                    }
+                    ProgressView(value: Double(roll.shotCount), total: Double(max(roll.capacity, 1)))
+                        .tint(.yellow)
+                    Text("Frames stay hidden until you develop. Each keeps its film and location, and can be re-graded afterwards.")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    if roll.developing {
+                        ProgressView("Developing \(roll.developProgress)…").tint(.yellow)
+                    }
+                    Spacer()
+                    Button {
+                        let n = roll.shotCount
+                        Task { await roll.develop(); if !roll.isLoaded { developedCount = n } }
+                    } label: {
+                        Text("Develop \(roll.shotCount) frame\(roll.shotCount == 1 ? "" : "s")")
+                            .font(.headline).frame(maxWidth: .infinity).frame(height: 52)
+                    }
+                    .buttonStyle(.glassProminent).tint(.yellow).foregroundStyle(.black)
+                    .disabled(roll.shotCount == 0 || roll.developing)
+                    Button("Discard roll…", role: .destructive) { confirmDiscard = true }
+                        .frame(maxWidth: .infinity)
+                        .disabled(roll.developing)
+                } else {
+                    Text("Shoot without looking back. Frames are hidden until you develop the roll.")
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        loadButton(24)
+                        loadButton(36)
+                    }
+                    Spacer()
+                }
+            }
+            .padding(20)
+            .navigationTitle("Film roll")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .confirmationDialog("Discard this roll?", isPresented: $confirmDiscard, titleVisibility: .visible) {
+                Button("Discard \(roll.shotCount) undeveloped frames", role: .destructive) { roll.discard() }
+            } message: { Text("The frames haven’t been saved anywhere else.") }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func loadButton(_ n: Int) -> some View {
+        Button { roll.load(capacity: n); developedCount = nil } label: {
+            VStack(spacing: 4) {
+                Text("\(n)").font(.system(size: 40, weight: .bold))
+                Text("exposures").font(.subheadline).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity).frame(height: 120)
+        }
+        .buttonStyle(.glass)
+    }
+}
+
+// MARK: - Settings
+
+struct CamSettingsSheet: View {
+    @Bindable var camera: CameraManager
+    var onRegrade: () -> Void
+    var onRoll: () -> Void
+    var onEditFilms: () -> Void
+    var onImportLUT: () -> Void
+    @Binding var classicUI: Bool
+    @Binding var cleanMode: Bool
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var geotag = LocationTagger.shared
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Photos") {
+                    Picker("Quality", selection: $camera.photoQuality) {
+                        Text("Speed").tag(0); Text("Balanced").tag(1); Text("Max").tag(2)
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("RAW", isOn: $camera.rawEnabled)
+                    Picker("Aspect", selection: $camera.selectedAspectRatio) {
+                        ForEach(AspectRatio.allCases) { Text($0.label).tag($0) }
+                    }
+                    Toggle("Long exposure", isOn: $camera.isLongExposure)
+                    if camera.isLongExposure {
+                        Picker("Method", selection: $camera.longExposureMode) {
+                            ForEach(LongExposureMode.allCases) { Text($0.label).tag($0) }
+                        }
+                    }
+                }
+                Section("Shooting") {
+                    Toggle("Burst (hold shutter)", isOn: $camera.burstMode)
+                    if camera.portraitModeAvailable {
+                        Toggle("Portrait", isOn: $camera.portraitModeEnabled)
+                            .disabled(!camera.currentDeviceSupportsDepth)
+                    }
+                    Toggle("Macro", isOn: $camera.macroModeEnabled)
+                    Toggle("Double exposure", isOn: $camera.doubleExposureEnabled)
+                    if camera.doubleExposureEnabled {
+                        Toggle("Paint a mask", isOn: $camera.doubleExposureMaskEnabled)
+                    }
+                    Toggle("Manual focus", isOn: Binding(get: { camera.manualFocusEnabled },
+                                                         set: { camera.setManualFocusEnabled($0) }))
+                    Toggle("One lens (smooth zoom)", isOn: $camera.unifiedZoomMode)
+                    Toggle("Push / pull", isOn: $camera.pushPullEnabled)
+                    if camera.pushPullEnabled {
+                        Stepper("\(camera.pushPullAmount >= 0 ? "+" : "")\(Int(camera.pushPullAmount)) stop",
+                                value: $camera.pushPullAmount, in: -2...3, step: 1)
+                    }
+                }
+                Section("Display") {
+                    Toggle("Grid", isOn: $camera.showGrid)
+                    Toggle("Level", isOn: $camera.showLevel)
+                    Toggle("Focus peaking", isOn: $camera.showPeaking)
+                    Toggle("Clean screen", isOn: $cleanMode)
+                }
+                Section("Controls") {
+                    Toggle("Volume buttons take the photo", isOn: $camera.volumeShutterEnabled)
+                    Toggle("Left-handed shutter", isOn: $camera.shutterOnLeft)
+                }
+                Section("Location") {
+                    Toggle("Tag photos with location", isOn: $geotag.enabled)
+                }
+                Section("Films and photos") {
+                    Button("Film roll") { dismiss(); onRoll() }
+                    Button("Re-grade a photo") { dismiss(); onRegrade() }
+                    Button("Edit films") { dismiss(); onEditFilms() }
+                    Button("Import LUT") { dismiss(); onImportLUT() }
+                }
+                Section {
+                    Toggle("Classic controls", isOn: $classicUI)
+                } footer: {
+                    Text("Switches back to the previous cam cam interface.")
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
