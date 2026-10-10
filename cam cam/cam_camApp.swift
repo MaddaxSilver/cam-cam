@@ -25,6 +25,19 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 struct cam_camApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
+    init() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-lookAudit") {
+            let camera = CameraManager()
+            // Let loadSettings' main-queue writes land first, then audit off-main.
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+                LookAudit.run(camera: camera)
+                exit(0)
+            }
+        }
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()

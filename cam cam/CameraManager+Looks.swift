@@ -540,14 +540,17 @@ extension CameraManager {
             // Quality slider 0..20 maps to:
             //   q=0  → OFF: pass image through untouched. Lets the user keep
             //          DigiCam "selected" in the strip but bypass it on the fly.
-            //   q=5  → heavy noise (~0.32), 4 posterize levels, crushed shadows (cheapest disposable)
-            //   q=12 → moderate noise (~0.16), 8 posterize levels (early-2000s point-and-shoot, default)
-            //   q=20 → minimal noise (~0.04), 16 posterize levels (mid-2000s prosumer compact)
+            //   q=5  → heavy noise (~0.32), 6 posterize levels, crushed shadows (cheapest disposable)
+            //   q=12 → moderate noise (~0.16), 18 posterize levels (early-2000s point-and-shoot, default)
+            //   q=20 → minimal noise (~0.04), 32 posterize levels (mid-2000s prosumer compact)
             if digiCamQuality < 1 { return image }
             let q = max(5, min(20, digiCamQuality))
             let qNorm = (q - 5) / 15.0                                // 0 = worst, 1 = best
             let noiseAmt: Float    = 0.32 - 0.28 * qNorm              // 0.32 → 0.04
-            let posterLevels: Int  = Int(4 + round(12 * Double(qNorm))) // 4 → 16
+            // 6 → 32 levels: the default (q=12, 18 levels) shows a little
+            // banding in skies like a real 8-bit JPEG compact; at 10 levels it
+            // painted rainbow rings across every smooth gradient.
+            let posterLevels: Int  = Int(6 + round(26 * Double(qNorm))) // 6 → 32
             let shadowCrush: Float = 0.06 + 0.04 * (1 - qNorm)        // crush more on low quality
 
             let cc = CIFilter.colorControls()
@@ -671,32 +674,24 @@ extension CameraManager {
             cc.saturation = 1.2
             cc.contrast = 1.25
             cc.brightness = -0.02
-            // Heavy teal shadows / warm orange highlights via color matrix
+            // Tungsten-balanced stock: cool in daylight, teal-lifted shadows.
+            // (The old matrix lifted red AND blue over green — magenta — and
+            // bloomed the whole frame back over itself, washing it pink.)
+            let cool = CIFilter.temperatureAndTint()
+            cool.inputImage = cc.outputImage
+            cool.neutral = CIVector(x: 6500, y: 0)
+            cool.targetNeutral = CIVector(x: 7300, y: -4)
             let matrix = CIFilter.colorMatrix()
-            matrix.inputImage = cc.outputImage
-            matrix.rVector = CIVector(x: 1.15, y: 0.0,  z: 0.0, w: 0)
-            matrix.gVector = CIVector(x: 0.0,  y: 0.88, z: 0.08, w: 0)
-            matrix.bVector = CIVector(x: 0.0,  y: 0.12, z: 1.2,  w: 0)
+            matrix.inputImage = cool.outputImage
+            matrix.rVector = CIVector(x: 1.02, y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.0,  z: 0.02, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.03, z: 1.03, w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            matrix.biasVector = CIVector(x: 0.01, y: -0.01, z: 0.03, w: 0)
-            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.04, mid: -0.01, highlights: -0.06)
-            // Orange halation: tint source orange-red, bloom it, screen-blend so only bright areas halo
-            let orangeSrc = CIFilter.colorMatrix()
-            orangeSrc.inputImage = curved
-            orangeSrc.rVector = CIVector(x: 1.35, y: 0.05, z: 0.0,  w: 0)
-            orangeSrc.gVector = CIVector(x: 0.0,  y: 0.85, z: 0.0,  w: 0)
-            orangeSrc.bVector = CIVector(x: 0.0,  y: 0.0,  z: 0.35, w: 0)
-            orangeSrc.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            let orangeTinted = orangeSrc.outputImage?.cropped(to: image.extent) ?? curved
-            let bloom = CIFilter.bloom()
-            bloom.inputImage = orangeTinted
-            bloom.intensity = 0.55
-            bloom.radius = 18
-            let orangeBloom = bloom.outputImage?.cropped(to: image.extent) ?? orangeTinted
-            let screen = CIFilter.screenBlendMode()
-            screen.inputImage = orangeBloom
-            screen.backgroundImage = curved
-            return screen.outputImage?.cropped(to: image.extent) ?? curved
+            matrix.biasVector = CIVector(x: 0.0, y: 0.012, z: 0.022, w: 0)   // teal blacks
+            let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.04, mid: -0.01, highlights: -0.05)
+            // The signature red halo: CineStill has no anti-halation layer, so
+            // only the highlights spill red — physical halation, not a bloom.
+            return applyHalation(input: curved, amount: 0.45).cropped(to: image.extent)
 
         case .kodakVision3:
             // Vision3 500T: cinema negative tungsten stock — shot in daylight it reads cool-teal.
@@ -710,15 +705,17 @@ extension CameraManager {
             let cool = CIFilter.temperatureAndTint()
             cool.inputImage = cc.outputImage
             cool.neutral = CIVector(x: 6500, y: 0)
-            cool.targetNeutral = CIVector(x: 7400, y: 0)
+            cool.targetNeutral = CIVector(x: 7000, y: 0)
             // Teal-orange split: the classic cinema grade
             let matrix = CIFilter.colorMatrix()
             matrix.inputImage = cool.outputImage
-            matrix.rVector = CIVector(x: 1.04, y: 0.0,  z: 0.0,  w: 0)  // warm highlight reds
-            matrix.gVector = CIVector(x: 0.0,  y: 0.92, z: 0.06, w: 0)  // green pulled to teal
-            matrix.bVector = CIVector(x: 0.0,  y: 0.08, z: 1.18, w: 0)  // strong teal in shadows
+            // Teal, not purple: green must stay level with blue (cutting green
+            // while lifting red and blue made the whole frame lavender).
+            matrix.rVector = CIVector(x: 1.0,  y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.0,  z: 0.03, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.04, z: 1.05, w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            matrix.biasVector = CIVector(x: 0.005, y: 0.0, z: 0.025, w: 0)  // teal lifted blacks
+            matrix.biasVector = CIVector(x: 0.0, y: 0.008, z: 0.02, w: 0)  // teal lifted blacks
             return toneCurve(input: matrix.outputImage ?? image, shadows: 0.05, mid: -0.01, highlights: -0.04)
 
         case .agfaVista:
@@ -809,11 +806,13 @@ extension CameraManager {
 
         case .kodakTriX:
             // Kodak Tri-X 400: the definitive photojournalism B&W — gritty, high contrast, chunky grain
-            let mono = CIFilter.photoEffectNoir()
+            // Mono, not Noir: Noir is already a hard curve, and +35% on top of
+            // it crushed half the frame to black. Tri-X is punchy but holds shadows.
+            let mono = CIFilter.photoEffectMono()
             mono.inputImage = image
             let cc = CIFilter.colorControls()
             cc.inputImage = mono.outputImage
-            cc.contrast = 1.35   // punchy, street-photography contrast
+            cc.contrast = 1.25   // punchy, street-photography contrast
             cc.brightness = -0.02
             cc.saturation = 0.0
             // Slightly warm/sepia tone (Tri-X has a warm silver tone)
@@ -826,7 +825,7 @@ extension CameraManager {
             let curved = toneCurve(input: toned.outputImage ?? image, shadows: 0.0, mid: -0.02, highlights: -0.05)
             let vignette = CIFilter.vignette()
             vignette.inputImage = curved
-            vignette.intensity = 0.9
+            vignette.intensity = 0.5
             vignette.radius = 1.4
             return vignette.outputImage ?? curved
 
@@ -953,15 +952,16 @@ extension CameraManager {
             let cool = CIFilter.temperatureAndTint()
             cool.inputImage = cc.outputImage
             cool.neutral = CIVector(x: 6500, y: 0)
-            cool.targetNeutral = CIVector(x: 7500, y: -12)  // cool + green
-            // Fade and shift: push blue-green into everything, lift shadows
+            cool.targetNeutral = CIVector(x: 6800, y: -8)   // cool + green
+            // Fade and shift toward blue-green, lift shadows. Gentle: stacking
+            // a hard red cut on the cool WB turned skin blue.
             let matrix = CIFilter.colorMatrix()
             matrix.inputImage = cool.outputImage
-            matrix.rVector = CIVector(x: 0.88, y: 0.0,  z: 0.0,  w: 0)   // suppress red
-            matrix.gVector = CIVector(x: 0.0,  y: 1.02, z: 0.04, w: 0)
-            matrix.bVector = CIVector(x: 0.0,  y: 0.05, z: 1.05, w: 0)
+            matrix.rVector = CIVector(x: 0.95, y: 0.0,  z: 0.0,  w: 0)
+            matrix.gVector = CIVector(x: 0.0,  y: 1.01, z: 0.02, w: 0)
+            matrix.bVector = CIVector(x: 0.0,  y: 0.03, z: 0.99, w: 0)
             matrix.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-            matrix.biasVector = CIVector(x: 0.02, y: 0.02, z: 0.04, w: 0)  // milky lifted blacks
+            matrix.biasVector = CIVector(x: 0.025, y: 0.025, z: 0.03, w: 0)  // milky lifted blacks
             let curved = toneCurve(input: matrix.outputImage ?? image, shadows: 0.08, mid: 0.02, highlights: -0.01)
             // Soft blur — Polaroid optics are never sharp
             let blur = CIFilter.gaussianBlur()
@@ -2034,7 +2034,14 @@ extension CameraManager {
         highlight.gVector = CIVector(x: 0, y: 3, z: 0, w: 0)
         highlight.bVector = CIVector(x: 0, y: 0, z: 3, w: 0)
         highlight.biasVector = CIVector(x: -2.2, y: -2.2, z: -2.2, w: 0)
-        let bright = highlight.outputImage?.clamped(to: extent) ?? input
+        // Clamp the VALUES to 0…1: everything below the threshold goes
+        // negative, and negative light screen-blended back darkened the whole
+        // frame and wiped out its blue. (.clamped(to:) only extends edges.)
+        let bright = (highlight.outputImage ?? input)
+            .applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
+            .clamped(to: extent)
 
         // 2. Horizontal motion blur — wide streak
         let blur = CIFilter.motionBlur()
@@ -2050,7 +2057,11 @@ extension CameraManager {
         tint.gVector = CIVector(x: 0, y: 0.6, z: 0, w: 0)
         tint.bVector = CIVector(x: 0, y: 0, z: 1.4, w: 0)
         tint.aVector = CIVector(x: 0, y: 0, z: 0, w: 1)
-        let tinted = tint.outputImage?.clamped(to: extent) ?? streaked
+        let tinted = (tint.outputImage ?? streaked)
+            .applyingFilter("CIColorClamp", parameters: [
+                "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
+            .clamped(to: extent)
 
         // 4. Screen blend over original
         let screen = CIFilter.screenBlendMode()
