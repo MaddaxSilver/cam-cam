@@ -54,6 +54,7 @@ struct FilmArc: View {
     let selectedKey: String?
     var onSelect: (ArcItem) -> Void
     var onOpenLibrary: () -> Void
+    var onSwitchSet: () -> Void = {}
 
     @State private var tones = FilmToneStore.shared
     /// Where the dial is turned to (points along the arc). Animated as a
@@ -78,7 +79,7 @@ struct FilmArc: View {
         var x: CGFloat = 0
         var prevHalf: CGFloat = 0
         for (i, item) in items.enumerated() {
-            let w = Self.width(item.label)
+            let w = Self.width(item.label) + (item.isSetSwitch ? 22 : 0)
             if i > 0 { x += prevHalf + Self.gap + w / 2 }
             out.append(x)
             prevHalf = w / 2
@@ -92,6 +93,16 @@ struct FilmArc: View {
     }
 
     private var selectedIndex: Int? { items.firstIndex { $0.key == selectedKey } }
+    /// Where the dial rests: the chosen film, or the first film in this set.
+    private var restIndex: Int {
+        selectedIndex ?? items.firstIndex { !$0.isSetSwitch } ?? 0
+    }
+    /// Landing on a set switch isn't a choice: settle on the film beside it.
+    private func filmIndex(near i: Int) -> Int {
+        guard items.indices.contains(i), items[i].isSetSwitch else { return i }
+        if i == 0 { return items.count > 1 ? 1 : 0 }
+        return max(i - 1, 0)
+    }
 
     static func nearest(_ offset: CGFloat, in c: [CGFloat]) -> Int {
         guard !c.isEmpty else { return 0 }
@@ -113,7 +124,8 @@ struct FilmArc: View {
             FilmDialFace(items: items, centers: c, offset: offset, tones: tones,
                          selectedIndex: selectedIndex,
                          onTapItem: { i in
-                             if i == selectedIndex { onOpenLibrary() } else {
+                             if items[i].isSetSwitch { detent.impactOccurred(intensity: 0.85); onSwitchSet() }
+                             else if i == selectedIndex { onOpenLibrary() } else {
                                  detent.impactOccurred(intensity: 0.85)
                                  onSelect(items[i])
                              }
@@ -141,7 +153,7 @@ struct FilmArc: View {
                     dragging = false
                     // Momentum: follow the flick, then settle on a film.
                     let projected = dragBase - v.predictedEndTranslation.width
-                    let target = Self.nearest(projected, in: c)
+                    let target = filmIndex(near: Self.nearest(projected, in: c))
                     guard c.indices.contains(target) else { return }
                     let from = offset, to = c[target]
                     let duration = min(0.75, 0.3 + Double(abs(to - from)) / 1600)
@@ -150,13 +162,13 @@ struct FilmArc: View {
                     if target != selectedIndex { onSelect(items[target]) }
                 }
         )
-        .onAppear { offset = c.indices.contains(selectedIndex ?? -1) ? c[selectedIndex!] : 0 }
+        .onAppear { offset = c.indices.contains(restIndex) ? c[restIndex] : 0 }
         .onChange(of: selectedKey) {
             guard !dragging, let i = selectedIndex, c.indices.contains(i), abs(offset - c[i]) > 0.5 else { return }
             withAnimation(.spring(duration: 0.4, bounce: 0.1)) { offset = c[i] }
         }
         .onChange(of: items.map(\.key)) {
-            offset = c.indices.contains(selectedIndex ?? -1) ? c[selectedIndex!] : 0
+            offset = c.indices.contains(restIndex) ? c[restIndex] : 0
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Film dial")
@@ -234,15 +246,10 @@ private struct FilmDialFace: View, Animatable {
                 ForEach(centers.indices, id: \.self) { i in
                     let a = Double((centers[i] - offset) / rl) * 180 / .pi
                     if abs(a) < 48 {
-                        mark(at: centers[i], w: w, height: 8, opacity: i == focus ? 0 : 0.85)
+                        mark(at: centers[i], w: w, height: 8, opacity: (i == focus || items[i].isSetSwitch) ? 0 : 0.85)
                         let isSel = i == focus
-                        Text(items[i].label.uppercased())
-                            .font(Font(FilmArc.font))
-                            .tracking(FilmArc.tracking)
-                            .lineLimit(1)
-                            .fixedSize()
-                            .foregroundStyle(tones.tone(items[i].key))
-                            .opacity(isSel ? 1 : 0.8)
+                        label(for: items[i])
+                            .opacity(isSel || items[i].isSetSwitch ? 1 : 0.8)
                             .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
                             .frame(minHeight: 44)
                             .contentShape(Rectangle())
@@ -258,6 +265,28 @@ private struct FilmDialFace: View, Animatable {
                     .frame(width: 2.5, height: 11)
                     .position(x: w / 2, y: 10.5)
             }
+        }
+    }
+
+    @ViewBuilder private func label(for item: ArcItem) -> some View {
+        if item.isSetSwitch {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.left.arrow.right.circle.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                Text(item.label.uppercased())
+                    .font(Font(FilmArc.font)).tracking(FilmArc.tracking)
+            }
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .fixedSize()
+            .accessibilityLabel("Switch films: \(item.label)")
+        } else {
+            Text(item.label.uppercased())
+                .font(Font(FilmArc.font))
+                .tracking(FilmArc.tracking)
+                .lineLimit(1)
+                .fixedSize()
+                .foregroundStyle(tones.tone(item.key))
         }
     }
 

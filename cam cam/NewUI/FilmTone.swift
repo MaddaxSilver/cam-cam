@@ -94,4 +94,9 @@ struct ArcItem: Identifiable, Equatable {
     static func custom(_ c: CustomSimulation) -> ArcItem {
         ArcItem(key: FavoritesStore.key(c), label: c.name, sim: nil, custom: c)
     }
+    /// A film-set switch that sits at each end of the dial.
+    static func setSwitch(_ end: String, title: String) -> ArcItem {
+        ArcItem(key: "__set_\(end)", label: title, sim: nil, custom: nil)
+    }
+    var isSetSwitch: Bool { key.hasPrefix("__set_") }
 }

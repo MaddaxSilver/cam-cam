@@ -60,6 +60,7 @@ struct GlassChrome<Shutter: View>: View {
     @State private var tones = FilmToneStore.shared
     @State private var thumbToken = 0
     @State private var smartAE = SmartExposure.shared
+    @State private var showSetPicker = false
     @AppStorage("cc_arcSet") private var arcSetRaw = ArcSet.all.rawValue
     private var arcSet: ArcSet { ArcSet(rawValue: arcSetRaw) ?? .all }
 
@@ -88,14 +89,14 @@ struct GlassChrome<Shutter: View>: View {
                          onScrub: scrub,
                          onScrubEnd: endScrub)
                     .frame(maxWidth: .infinity)
-                    .overlay(alignment: .leading) { arcSetMenu.padding(.leading, 16) }
                     .padding(.bottom, 12)
                 Group {
                     if scrubStartMM != nil {
                         ZoomArc(mm: scrubMM)
                     } else {
                         FilmArc(items: shownItems, selectedKey: selectedKey,
-                                onSelect: select, onOpenLibrary: onLibrary)
+                                onSelect: select, onOpenLibrary: onLibrary,
+                                onSwitchSet: { showSetPicker = true })
                     }
                 }
                 .transition(.opacity)
@@ -110,6 +111,12 @@ struct GlassChrome<Shutter: View>: View {
                     .onTapGesture { showControls = false }
                     .accessibilityHidden(true)
             }
+        }
+        .confirmationDialog("Show on the dial", isPresented: $showSetPicker, titleVisibility: .visible) {
+            ForEach(ArcSet.allCases) { set in
+                Button(set == arcSet ? "\(set.title) ✓" : set.title) { arcSetRaw = set.rawValue }
+            }
+            Button("Cancel", role: .cancel) {}
         }
         .animation(.snappy(duration: 0.3), value: showControls)
         .animation(.snappy(duration: 0.2), value: scrubStartMM == nil)
@@ -465,25 +472,13 @@ struct GlassChrome<Shutter: View>: View {
 
     // MARK: Film arc data
 
-    private var arcSetMenu: some View {
-        Menu {
-            Picker("Dial shows", selection: $arcSetRaw) {
-                ForEach(ArcSet.allCases) { set in
-                    Label(set.title, systemImage: set.symbol).tag(set.rawValue)
-                }
-            }
-        } label: {
-            Image(systemName: arcSet.symbol)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(arcSet == .all ? .white : .yellow)
-                .frame(width: 40, height: 40)
-        }
-        .glassEffect(.regular.interactive(), in: Circle())
-        .accessibilityLabel("Dial shows \(arcSet.title)")
-    }
-
     /// The films on the dial, after the All / Pinned / Built-in / Custom / LUTs choice.
     private var shownItems: [ArcItem] {
+        let films = filteredItems
+        return [.setSwitch("lead", title: arcSet.title)] + films + [.setSwitch("trail", title: arcSet.title)]
+    }
+
+    private var filteredItems: [ArcItem] {
         switch arcSet {
         case .all: return arcItems
         case .pinned: return arcItems.filter { favorites.isFavorite($0.key) }
