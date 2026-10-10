@@ -102,24 +102,28 @@ struct GlassChrome<Shutter: View>: View {
                     .padding(.bottom, 14)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
-                LensPill(selectedIndex: scrubStartMM == nil ? camera.selectedFocalIndex : -1,
-                         liveMM: scrubStartMM == nil ? camera.currentMM : Int(scrubMM.rounded()),
-                         scrubbing: scrubStartMM != nil,
-                         onTap: { i in camera.selectFocalPreset(i) },
-                         onScrub: scrub,
-                         onScrubEnd: endScrub)
-                    .frame(maxWidth: .infinity)
-                    .padding(.bottom, 12)
-                Group {
-                    if scrubStartMM != nil {
-                        ZoomArc(mm: scrubMM)
-                    } else {
-                        FilmArc(items: shownItems, selectedKey: selectedKey,
-                                onSelect: select, onOpenLibrary: onLibrary,
-                                onSwitchSet: { showSetPicker = true })
+                // The lens pill sits in the dial, under the film names: the
+                // dial turns behind it, the pill stays put (and takes its own
+                // taps and scrubs, since it's on top).
+                ZStack(alignment: .bottom) {
+                    Group {
+                        if scrubStartMM != nil {
+                            ZoomArc(mm: scrubMM)
+                        } else {
+                            FilmArc(items: shownItems, selectedKey: selectedKey,
+                                    onSelect: select, onOpenLibrary: onLibrary,
+                                    onSwitchSet: { showSetPicker = true })
+                        }
                     }
+                    .transition(.opacity)
+                    LensPill(selectedIndex: scrubStartMM == nil ? camera.selectedFocalIndex : -1,
+                             liveMM: scrubStartMM == nil ? camera.currentMM : Int(scrubMM.rounded()),
+                             scrubbing: scrubStartMM != nil,
+                             onTap: { i in camera.selectFocalPreset(i) },
+                             onScrub: scrub,
+                             onScrubEnd: endScrub)
+                        .padding(.bottom, 8)
                 }
-                .transition(.opacity)
             }
             bottomRows
         }

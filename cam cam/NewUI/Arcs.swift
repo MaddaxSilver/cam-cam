@@ -12,7 +12,7 @@ import SwiftUI
 private enum ArcGeo {
     static let radius: CGFloat = 450        // glass disc radius
     static let labelInset: CGFloat = 36     // labels sit this far inside the rim
-    static let height: CGFloat = 92         // visible cap
+    static let height: CGFloat = 112        // visible cap (room for the lens pill under the labels)
     static var labelRadius: CGFloat { radius - labelInset }
     static func degPerPoint() -> Double { 180 / (Double.pi * Double(labelRadius)) }
 }
