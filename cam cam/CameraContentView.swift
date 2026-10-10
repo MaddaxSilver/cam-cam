@@ -166,11 +166,14 @@ struct CameraContentView: View {
                 }
 
                 // Exposure meter — floating top left, fixed size
-                ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
-                    .iconRotation(motion.iconAngle)
-                    .frame(width: 80, height: 80)
-                    .position(x: 56, y: 100)
-                    .allowsHitTesting(false)
+                // (classic only: the glass UI keeps the top clear)
+                if classicUI {
+                    ExposureMeterBar(evValue: camera.evReading, bias: camera.exposureBias)
+                        .iconRotation(motion.iconAngle)
+                        .frame(width: 80, height: 80)
+                        .position(x: 56, y: 100)
+                        .allowsHitTesting(false)
+                }
 
                 // Focus indicator (tap-to-focus square)
                 if showFocusIndicator, let pt = focusPoint {
@@ -179,13 +182,13 @@ struct CameraContentView: View {
                 }
 
                 // Live AF hunting indicator — pulsing ring at top-left while camera seeks focus
-                if camera.isFocusing {
+                if camera.isFocusing && classicUI {
                     FocusHuntingIndicator()
                         .allowsHitTesting(false)
                 }
 
                 // Face-detected indicator — small icon when AF is steering toward a face
-                if camera.faceDetected && !camera.manualFocusEnabled {
+                if camera.faceDetected && !camera.manualFocusEnabled && classicUI {
                     FaceDetectedBadge()
                         .allowsHitTesting(false)
                 }
