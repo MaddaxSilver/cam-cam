@@ -153,8 +153,8 @@ struct GlassChrome<Shutter: View>: View {
     private var topBar: some View {
         GlassEffectContainer(spacing: 2) {
             HStack(alignment: .top) {
-                // Left: flash, then status chips (roll, focus, face).
-                VStack(alignment: .leading, spacing: 10) {
+                // Left: flash, then status icons beside it — same size.
+                HStack(spacing: 8) {
                     Button { camera.toggleFlash() } label: {
                         Image(systemName: flashSymbol)
                             .font(.system(size: 16, weight: .semibold))
@@ -165,35 +165,7 @@ struct GlassChrome<Shutter: View>: View {
                     .glassEffect(.regular.interactive(), in: Circle())
                     .accessibilityLabel("Flash \(camera.flashLabel)")
 
-                    if roll.isLoaded {
-                        Button(action: onRoll) {
-                            HStack(spacing: 5) {
-                                Image(systemName: "film").font(.system(size: 11, weight: .semibold))
-                                Text(roll.isFull ? "Develop" : "\(roll.exposuresLeft)")
-                                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
-                            }
-                            .foregroundStyle(roll.isFull ? .yellow : .white)
-                            .padding(.horizontal, 11).frame(height: 30)
-                        }
-                        .buttonStyle(.plain)
-                        .glassEffect(.regular.interactive(), in: Capsule())
-                        .accessibilityLabel("\(roll.exposuresLeft) frames left on the roll")
-                    }
-
-                    modeChips
-
-                    if camera.isFocusing || (camera.faceDetected && !camera.manualFocusEnabled) {
-                        HStack(spacing: 6) {
-                            if camera.isFocusing { FocusPulse() }
-                            if camera.faceDetected && !camera.manualFocusEnabled {
-                                Image(systemName: "face.dashed").font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(.yellow)
-                            }
-                        }
-                        .padding(.horizontal, 10).frame(height: 28)
-                        .glassEffect(.regular, in: Capsule())
-                        .transition(.opacity)
-                    }
+                    statusCircles
                 }
 
                 Spacer()
@@ -240,38 +212,78 @@ struct GlassChrome<Shutter: View>: View {
         }
     }
 
-    /// Small glass icons under the flash for modes that change how the
-    /// shutter behaves, so they're never on by surprise. Tap to open Modes.
-    @ViewBuilder private var modeChips: some View {
-        let all: [(String, String?)?] = [
-            camera.doubleExposureEnabled ? ("circle.lefthalf.filled", camera.firstExposurePreview == nil ? "1st" : "2nd") : nil,
-            camera.isLongExposure ? ("timer", String(format: "%gs", camera.longExposureDuration)) : nil,
-            camera.burstMode ? ("square.stack.3d.down.right", nil) : nil,
-            camera.macroModeEnabled ? ("camera.macro", nil) : nil,
-            camera.pushPullEnabled && camera.pushPullAmount != 0 ? ("plusminus", String(format: "%+d", Int(camera.pushPullAmount))) : nil,
-            camera.rawEnabled ? ("r.square", nil) : nil,
-            camera.thermalWarning != nil ? ("thermometer.medium", nil) : nil,
-        ]
-        let chips = all.compactMap { $0 }
-        if !chips.isEmpty {
+    struct StatusIcon: Identifiable {
+        let id: String
+        let symbol: String
+        var text: String? = nil
+        var tint: Color = .yellow
+        var pulse = false
+    }
+
+    /// What's on that changes the shot: roll, modes, heat, focus/face.
+    private var statusIcons: [StatusIcon] {
+        var out: [StatusIcon] = []
+        if roll.isLoaded {
+            out.append(.init(id: "roll", symbol: "film", text: roll.isFull ? "Dev" : "\(roll.exposuresLeft)",
+                             tint: roll.isFull ? .yellow : .white))
+        }
+        if camera.doubleExposureEnabled {
+            out.append(.init(id: "dx", symbol: "circle.lefthalf.filled", text: camera.firstExposurePreview == nil ? "1" : "2"))
+        }
+        if camera.isLongExposure {
+            out.append(.init(id: "lx", symbol: "timer", text: String(format: "%gs", camera.longExposureDuration)))
+        }
+        if camera.burstMode { out.append(.init(id: "burst", symbol: "square.stack.3d.down.right")) }
+        if camera.macroModeEnabled { out.append(.init(id: "macro", symbol: "camera.macro")) }
+        if camera.pushPullEnabled && camera.pushPullAmount != 0 {
+            out.append(.init(id: "pp", symbol: "plusminus", text: String(format: "%+d", Int(camera.pushPullAmount))))
+        }
+        if camera.rawEnabled { out.append(.init(id: "raw", symbol: "r.square")) }
+        if camera.thermalWarning != nil { out.append(.init(id: "heat", symbol: "thermometer.medium", tint: .orange)) }
+        if camera.isFocusing { out.append(.init(id: "focus", symbol: "scope", pulse: true)) }
+        else if camera.faceDetected && !camera.manualFocusEnabled { out.append(.init(id: "face", symbol: "face.dashed")) }
+        return out
+    }
+
+    /// Up to two full-size glass circles beside the flash; a third slot
+    /// becomes "+N". Tapping opens the roll (for the roll icon) or Modes.
+    @ViewBuilder private var statusCircles: some View {
+        let icons = statusIcons
+        let shown = icons.count > 2 ? Array(icons.prefix(1)) : icons
+        ForEach(shown) { icon in
+            Button {
+                if icon.id == "roll" { onRoll() } else { active = .modes; showControls = true }
+            } label: { statusLabel(icon) }
+            .buttonStyle(.plain)
+            .glassEffect(.regular.interactive(), in: Circle())
+            .transition(.scale.combined(with: .opacity))
+            .accessibilityLabel(icon.id)
+        }
+        if icons.count > 2 {
             Button { active = .modes; showControls = true } label: {
-                HStack(spacing: 8) {
-                    ForEach(chips.indices, id: \.self) { i in
-                        HStack(spacing: 3) {
-                            Image(systemName: chips[i].0).font(.system(size: 12, weight: .semibold))
-                            if let t = chips[i].1 {
-                                Text(t).font(.system(size: 11, weight: .semibold).monospacedDigit())
-                            }
-                        }
-                        .foregroundStyle(chips[i].0.hasPrefix("thermometer") ? Color.orange : .yellow)
-                    }
-                }
-                .padding(.horizontal, 10).frame(height: 30)
+                Text("+\(icons.count - 1)")
+                    .font(.system(size: 14, weight: .bold).monospacedDigit())
+                    .foregroundStyle(.yellow)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
-            .glassEffect(.regular.interactive(), in: Capsule())
-            .accessibilityLabel("Active shooting modes")
+            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel("\(icons.count - 1) more active modes")
         }
+    }
+
+    private func statusLabel(_ icon: StatusIcon) -> some View {
+        VStack(spacing: 0) {
+            Image(systemName: icon.symbol)
+                .font(.system(size: icon.text == nil ? 16 : 13, weight: .semibold))
+                .symbolEffect(.pulse, isActive: icon.pulse)
+            if let t = icon.text {
+                Text(t).font(.system(size: 9, weight: .bold).monospacedDigit())
+                    .lineLimit(1).minimumScaleFactor(0.7)
+            }
+        }
+        .foregroundStyle(icon.tint)
+        .frame(width: 44, height: 44)
     }
 
     private var flashSymbol: String {
