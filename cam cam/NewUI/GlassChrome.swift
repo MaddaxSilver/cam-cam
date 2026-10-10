@@ -684,7 +684,7 @@ struct GlassChrome<Shutter: View>: View {
 
     private var thumbButton: some View {
         Button(action: onAlbum) {
-            LastShotThumb(token: thumbToken, hidden: roll.isLoaded)
+            LastShotThumb(token: thumbToken, hidden: roll.isLoaded, preview: camera.lastShotPreview)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Last photo")
@@ -868,6 +868,7 @@ struct GlassRuler: View {
 struct LastShotThumb: View {
     let token: Int
     let hidden: Bool          // film roll loaded: no peeking
+    var preview: UIImage? = nil   // the shot just taken, before it reaches Photos
     @State private var image: UIImage?
 
     var body: some View {
@@ -875,7 +876,7 @@ struct LastShotThumb: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.white.opacity(0.12))
             if hidden {
                 Image(systemName: "film").font(.system(size: 18)).foregroundStyle(.white.opacity(0.8))
-            } else if let image {
+            } else if let image = preview ?? image {
                 Image(uiImage: image).resizable().scaledToFill()
             }
         }

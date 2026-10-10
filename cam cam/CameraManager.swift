@@ -68,6 +68,9 @@ import CoreLocation
     }
     /// Transient user-visible error from save / library operations. Cleared by the UI.
     var saveErrorMessage: String? = nil
+    /// Small graded preview of the latest shot, shown in the thumbnail long
+    /// before the full-res photo has rendered and reached Photos.
+    var lastShotPreview: UIImage? = nil
     var flashMode: AVCaptureDevice.FlashMode = .off
     var flashStrength: Float = 1.0 {
         didSet { UserDefaults.standard.set(flashStrength, forKey: "cc_flashStrength") }
@@ -545,6 +548,22 @@ import CoreLocation
 
     nonisolated func shotRendered() {
         rawStashLock.lock(); shotsRendering = max(0, shotsRendering - 1); rawStashLock.unlock()
+    }
+
+    /// Render a small graded copy of a just-delivered shot for the thumbnail,
+    /// so the shot is visible in well under a second instead of after the
+    /// full-res render and the Photos save.
+    nonisolated func publishQuickPreview(_ image: CIImage, recipe: ShotRecipe) {
+        let s = 360 / max(image.extent.width, image.extent.height)
+        let small = image.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        var look = renderLook(small, recipe: recipe, flatten: false)
+            .cropped(to: cropRect(for: small.extent))
+        if pendingDeviceAngle == -90 { look = look.oriented(.right) }
+        else if pendingDeviceAngle == 90 { look = look.oriented(.left) }
+        else if pendingDeviceAngle == 180 { look = look.oriented(.down) }
+        guard let cg = ciContext.createCGImage(look, from: look.extent) else { return }
+        let ui = UIImage(cgImage: cg)
+        DispatchQueue.main.async { self.lastShotPreview = ui }
     }
 
     nonisolated func stashRAW(_ data: Data, id: Int64) {
@@ -2375,11 +2394,16 @@ import CoreLocation
             let base = ciImage                                  // framed, un-graded original
             let isDoubleExposure = firstExposureCIImage != nil  // composites can't be re-graded
             let recipe = pendingRecipe()
+            if !isDoubleExposure { publishQuickPreview(ciImage, recipe: recipe) }
             if redEyeStr > 0 { ciImage = applyRedEyeCorrection(to: ciImage, strength: redEyeStr) }
 
             let processed = applySimAndGrain(to: ciImage)
+            let raw = takeRAW(id: rawID)
+            if rawID != nil, raw == nil {
+                DispatchQueue.main.async { self.saveErrorMessage = "The RAW didn't arrive, saved the photo only" }
+            }
             renderAndSave(ciImage: processed, metadata: originalMetadata,
-                          base: isDoubleExposure ? nil : base, recipe: recipe, raw: takeRAW(id: rawID))
+                          base: isDoubleExposure ? nil : base, recipe: recipe, raw: raw)
         }
     }
 
@@ -2435,6 +2459,7 @@ import CoreLocation
             let scaledDepth = depthCI.transformed(by: CGAffineTransform(scaleX: s, y: s))
             let blurred = applyPortraitBlurFromCIImage(to: ciImage, disparityCI: scaledDepth, fStop: pendingPortraitFStop)
             let recipe = pendingRecipe()
+            publishQuickPreview(blurred, recipe: recipe)
             let withSim = applySimAndGrain(to: blurred)
             renderAndSave(ciImage: withSim, metadata: originalMetadata, base: blurred, recipe: recipe, raw: takeRAW(id: rawID))
         }
@@ -2743,8 +2768,11 @@ import CoreLocation
 
         Task {
             do {
-                _ = try await PhotoSaver.save(original: original, rendered: rendered,
-                                              recipe: savedRecipe, location: location, raw: raw)
+                let result = try await PhotoSaver.save(original: original, rendered: rendered,
+                                                       recipe: savedRecipe, location: location, raw: raw)
+                if let issue = result.rawIssue {
+                    await MainActor.run { [weak self] in self?.saveErrorMessage = issue }
+                }
             } catch {
                 await MainActor.run { [weak self] in
                     self?.saveErrorMessage = "Couldn't save photo: \(error.localizedDescription)"

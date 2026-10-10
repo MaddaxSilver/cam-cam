@@ -30,6 +30,8 @@ nonisolated enum PhotoSaver {
         let assetID: String?
         let nondestructive: Bool
         let message: String
+        /// Set when a RAW + film shot's DNG couldn't be kept with its photo.
+        var rawIssue: String? = nil
     }
 
     enum SaveError: LocalizedError {
@@ -62,25 +64,36 @@ nonisolated enum PhotoSaver {
         }
 
         let base = location.flatMap { MetadataTools.addingGPS(to: original, location: $0) } ?? original
-        let assetID: String?
-        if raw != nil, let id = try? await createAsset(data: base, location: location, raw: raw) {
-            assetID = id
-        } else {
-            assetID = try await createAsset(data: base, location: location)   // never lose the photo over the DNG
+        var assetID: String?
+        var rawIssue: String?
+        if let raw {
+            do {
+                assetID = try await createAsset(data: base, location: location, raw: raw)
+            } catch {
+                // Photos refused the pair: never lose the photo or the DNG —
+                // save them as two pictures instead.
+                rawIssue = "RAW saved as a separate photo (\(error.localizedDescription))"
+                if (try? await createAsset(data: raw, location: location, uti: "com.adobe.raw-image")) == nil {
+                    rawIssue = "Couldn't save the RAW (\(error.localizedDescription))"
+                }
+            }
+        }
+        if assetID == nil {
+            assetID = try await createAsset(data: base, location: location)
         }
 
         guard let rendered, let recipe, let assetID else {
-            return Result(assetID: assetID, nondestructive: true, message: "Saved original")
+            return Result(assetID: assetID, nondestructive: true, message: "Saved original", rawIssue: rawIssue)
         }
         do {
             try await commitEdit(assetID: assetID, rendered: rendered, recipe: recipe)
             return Result(assetID: assetID, nondestructive: true,
-                          message: "Saved · \(recipe.displayName) · revertible")
+                          message: "Saved · \(recipe.displayName) · revertible", rawIssue: rawIssue)
         } catch {
             // Never lose the look: add the rendered version as its own photo.
             _ = try? await createAsset(data: rendered, location: location)
             return Result(assetID: assetID, nondestructive: false,
-                          message: "Saved (edit failed: \(error.localizedDescription))")
+                          message: "Saved (edit failed: \(error.localizedDescription))", rawIssue: rawIssue)
         }
     }
 
@@ -115,11 +128,14 @@ nonisolated enum PhotoSaver {
         return await PHPhotoLibrary.requestAuthorization(for: .readWrite)
     }
 
-    private static func createAsset(data: Data, location: CLLocation?, raw: Data? = nil) async throws -> String? {
+    private static func createAsset(data: Data, location: CLLocation?, raw: Data? = nil,
+                                    uti: String? = nil) async throws -> String? {
         var placeholder: String?
         try await PHPhotoLibrary.shared().performChanges {
             let req = PHAssetCreationRequest.forAsset()
-            req.addResource(with: .photo, data: data, options: nil)
+            let photoOpts = PHAssetResourceCreationOptions()
+            if let uti { photoOpts.uniformTypeIdentifier = uti }
+            req.addResource(with: .photo, data: data, options: photoOpts)
             if let raw {
                 // RAW + film: the DNG is the same photo's RAW, not a second picture.
                 let opts = PHAssetResourceCreationOptions()
