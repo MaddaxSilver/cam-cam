@@ -566,6 +566,17 @@ import CoreLocation
         DispatchQueue.main.async { self.lastShotPreview = ui }
     }
 
+    @ObservationIgnored nonisolated(unsafe) var wantsShutterThumb = false
+
+    nonisolated func publishShutterThumb(_ frame: CIImage) {
+        let s = 240 / max(frame.extent.width, frame.extent.height)
+        let small = frame.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        let look = applyLiveLook(small, grainTextures: false)
+        guard let cg = ciContext.createCGImage(look, from: small.extent) else { return }
+        let ui = UIImage(cgImage: cg)
+        DispatchQueue.main.async { self.lastShotPreview = ui }
+    }
+
     nonisolated func stashRAW(_ data: Data, id: Int64) {
         rawStashLock.lock()
         if rawStash.count > 6, let oldest = rawStash.keys.min() { rawStash[oldest] = nil }
@@ -1778,6 +1789,7 @@ import CoreLocation
             return
         }
         isCapturing = true   // didSet pushes Watch state — no need to call pushState again
+        wantsShutterThumb = true      // next live frame becomes the thumbnail, instantly
         // Each shot keeps its own copy of the settings: the shutter frees as soon
         // as the exposure is taken, so the next shot can start before this one
         // has rendered, and must not change its film, crop or rotation.
@@ -2989,6 +3001,14 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        // Shutter pressed: show this frame (with the look) as the thumbnail
+        // right away. iOS takes ~1.5s to deliver a Max-quality 48MP photo; the
+        // real one replaces this when it lands.
+        if wantsShutterThumb {
+            wantsShutterThumb = false
+            publishShutterThumb(CIImage(cvPixelBuffer: pixelBuffer))
+        }
+
         // Styles: keep a live person mask fresh (~6 Hz, off this queue)
         if cachedSim.styleKind != nil {
             SkinMask.shared.update(pixelBuffer, time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)))
@@ -3157,6 +3177,7 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // shot from the main lens should be ~48MP.
         let dims = photo.resolvedSettings.photoDimensions
         if output.maxPhotoQualityPrioritization == .quality, dims.width > 0,
+           ((currentDevice?.videoZoomFactor ?? 1) / virtualWideFOVCompensation) <= 1.4,   // longer zooms crop: smaller is normal
            Int(dims.width) * Int(dims.height) < 20_000_000,
            (currentDevice?.activeFormat.supportedMaxPhotoDimensions.map { Int($0.width) * Int($0.height) }.max() ?? 0) > 40_000_000 {
             print("⚠️ cam cam: photo delivered at \(dims.width)×\(dims.height) although the lens supports 48MP")
