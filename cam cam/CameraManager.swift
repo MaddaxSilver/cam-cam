@@ -573,7 +573,22 @@ import CoreLocation
         get { burstActiveLock.lock(); defer { burstActiveLock.unlock() }; return _burstActive }
         set { burstActiveLock.lock(); _burstActive = newValue; burstActiveLock.unlock() }
     }
-    @ObservationIgnored nonisolated(unsafe) var currentDevice: AVCaptureDevice?
+    @ObservationIgnored nonisolated(unsafe) var currentDevice: AVCaptureDevice? {
+        didSet { if currentDevice !== oldValue { restrictLensSwitching(currentDevice) } }
+    }
+
+    /// On the multi-lens (virtual) cameras iOS swaps lenses by itself when the
+    /// focus distance changes, e.g. focusing close at 43mm hops tele → wide,
+    /// and every hop is a visible stutter. Let it switch only when the zoom
+    /// changes; focusing then stays on the lens you're on.
+    nonisolated func restrictLensSwitching(_ device: AVCaptureDevice?) {
+        guard let device, device.isVirtualDevice,
+              device.activePrimaryConstituentDeviceSwitchingBehavior != .unsupported,
+              (try? device.lockForConfiguration()) != nil else { return }
+        device.setPrimaryConstituentDeviceSwitchingBehavior(.restricted,
+                                                            restrictedSwitchingBehaviorConditions: .videoZoomChanged)
+        device.unlockForConfiguration()
+    }
     @ObservationIgnored nonisolated(unsafe) private var isSwappingLens = false
     @ObservationIgnored nonisolated(unsafe) private var lastRequestedZoom: CGFloat = 1.0
     @ObservationIgnored nonisolated(unsafe) private var skipNextReconcile = false
