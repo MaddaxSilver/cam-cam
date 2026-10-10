@@ -1293,8 +1293,10 @@ extension CameraManager {
             return toneCurve(input: matrix.outputImage ?? image, shadows: 0.09, mid: 0.02, highlights: -0.01)
 
         case .cyanotype:
-            // Cyanotype photographic print — prussian blue sensitizer process invented 1842.
-            // Deep blue shadows, pale icy highlights, no warm tones at all.
+            // Cyanotype (1842): iron-salt print, sensitive to blue/UV, Prussian
+            // blue dye on cream rag paper — modelled in density (see
+            // shaders/FilmProcess.ci.metal). Falls back to the old tint.
+            if let printed = densityPrint(image, process: .cyanotype) { return printed }
             let mono = CIFilter.colorControls()
             mono.inputImage = image
             mono.saturation = 0.0
@@ -1311,8 +1313,15 @@ extension CameraManager {
             return toneCurve(input: matrix.outputImage ?? image, shadows: 0.02, mid: 0.0, highlights: -0.03)
 
         case .daguerreotype:
-            // Daguerreotype / ambrotype — silver-mercury plate, 1840s. Cold metallic B&W,
-            // dense blacks, slightly specular highlights, heavy corner falloff.
+            // Daguerreotype (1839): silver-mercury image on a mirrored plate.
+            // Blue-sensitive, contrasty, silver highlights; modelled in density.
+            if let printed = densityPrint(image, process: .daguerreotype) {
+                let v = CIFilter.vignette()
+                v.inputImage = printed
+                v.intensity = 1.6
+                v.radius = 0.7
+                return v.outputImage ?? printed
+            }
             let mono = CIFilter.colorControls()
             mono.inputImage = image
             mono.saturation = 0.0
@@ -2016,6 +2025,62 @@ extension CameraManager {
         }
         _rippleKernel = .some(loaded)
         return loaded
+    }
+
+    // MARK: - Physically-modelled print processes (Metal)
+
+    enum PrintProcess {
+        case cyanotype, daguerreotype
+
+        /// (spectral weights, exposure, contrast, dye at Dmax, paper, coating)
+        /// Colours are LINEAR RGB.
+        var params: (CIVector, Float, Float, CIVector, CIVector, Float) {
+            switch self {
+            case .cyanotype:
+                // Blue/UV-sensitive; Prussian blue (sRGB ≈ 8,38,92) on cream
+                // rag paper (≈ 242,238,226); long tonal scale; hand-coated.
+                return (CIVector(x: 0.05, y: 0.30, z: 0.65), 0.0, 0.95,
+                        CIVector(x: 0.0024, y: 0.019, z: 0.107),
+                        CIVector(x: 0.888, y: 0.855, z: 0.760), 0.08)
+            case .daguerreotype:
+                // Strongly blue-sensitive; near-neutral silver-mercury image
+                // (≈ 28,26,24) on a polished silver plate (≈ 222,226,232).
+                return (CIVector(x: 0.02, y: 0.18, z: 0.80), 0.2, 1.35,
+                        CIVector(x: 0.011, y: 0.010, z: 0.009),
+                        CIVector(x: 0.730, y: 0.760, z: 0.810), 0.04)
+            }
+        }
+    }
+
+    nonisolated(unsafe) static var _printKernel: CIColorKernel?? = nil
+    nonisolated static func printKernel() -> CIColorKernel? {
+        if let attempted = _printKernel { return attempted }
+        var loaded: CIColorKernel? = nil
+        #if targetEnvironment(simulator)
+        let libName = "FilmProcess-sim"
+        #else
+        let libName = "FilmProcess-ios"
+        #endif
+        if let url = Bundle.main.url(forResource: libName, withExtension: "metallib"),
+           let data = try? Data(contentsOf: url) {
+            loaded = try? CIColorKernel(functionName: "densityPrint", fromMetalLibraryData: data)
+        }
+        _printKernel = .some(loaded)
+        return loaded
+    }
+
+    /// Render `image` as a physical print process; nil if the kernel is missing.
+    nonisolated func densityPrint(_ image: CIImage, process: PrintProcess) -> CIImage? {
+        guard let kernel = CameraManager.printKernel() else { return nil }
+        let extent = image.extent
+        // Coating unevenness: soft, large-scale noise (fixed pattern).
+        let sigma = Double(max(extent.width, extent.height)) * 0.02
+        let noise = (CIFilter(name: "CIRandomGenerator")?.outputImage ?? CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5)))
+            .transformed(by: CGAffineTransform(scaleX: 4, y: 4))
+            .applyingGaussianBlur(sigma: sigma)
+            .cropped(to: extent)
+        let p = process.params
+        return kernel.apply(extent: extent, arguments: [image, noise, p.0, p.1, p.2, p.3, p.4, p.5])
     }
 
     /// Build (and cache) the rainbow gradient LUT used by the circuit-bent

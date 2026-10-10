@@ -15,7 +15,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SRC="shaders/Ripple.ci.metal"
 OUT_DIR="cam cam"
 MIN_IOS="26.2"   # keep in sync with IPHONEOS_DEPLOYMENT_TARGET
 TMP="$(mktemp -d)"
@@ -24,11 +23,13 @@ trap 'rm -rf "$TMP"' EXIT
 # Make sure the compiler is present (no-op when already installed+mounted).
 bash scripts/ensure-metal-toolchain.sh >/dev/null 2>&1 || true
 
-build() {  # $1 = sdk, $2 = air target, $3 = output name
-    xcrun -sdk "$1" metal -fcikernel -target "$2" -c "$SRC" -o "$TMP/$3.air"
+build() {  # $1 = sdk, $2 = air target, $3 = output name, $4 = source
+    xcrun -sdk "$1" metal -fcikernel -target "$2" -c "$4" -o "$TMP/$3.air"
     xcrun -sdk "$1" metallib -cikernel "$TMP/$3.air" -o "$OUT_DIR/$3.metallib"
     echo "built $OUT_DIR/$3.metallib"
 }
 
-build iphoneos          "air64-apple-ios${MIN_IOS}"           "Ripple-ios"
-build iphonesimulator   "air64-apple-ios${MIN_IOS}-simulator" "Ripple-sim"
+for name in Ripple FilmProcess; do
+    build iphoneos        "air64-apple-ios${MIN_IOS}"           "$name-ios" "shaders/$name.ci.metal"
+    build iphonesimulator "air64-apple-ios${MIN_IOS}-simulator" "$name-sim" "shaders/$name.ci.metal"
+done
