@@ -1340,6 +1340,24 @@ extension CameraManager {
             dagVig.radius = 0.65
             return dagVig.outputImage ?? dagCurved
 
+        case .tintype:
+            // Wet-collodion tintype (1856): blue-only silver image on black
+            // japanned iron. Strong falloff from the plate holder.
+            if let p = densityPrint(image, process: .tintype) {
+                let v = CIFilter.vignette(); v.inputImage = p; v.intensity = 2.0; v.radius = 0.75
+                return v.outputImage ?? p
+            }
+            return image
+        case .platinum:
+            if let p = densityPrint(image, process: .platinum) { return p }
+            return image
+        case .vanDyke:
+            if let p = densityPrint(image, process: .vanDyke) { return p }
+            return image
+        case .saltPrint:
+            if let p = densityPrint(image, process: .saltPrint) { return p }
+            return image
+
         case .duotone:
             // Duotone — indigo-purple shadows, warm amber/cream highlights.
             // Classic editorial duotone like magazine covers and art prints.
@@ -2030,7 +2048,7 @@ extension CameraManager {
     // MARK: - Physically-modelled print processes (Metal)
 
     enum PrintProcess {
-        case cyanotype, daguerreotype
+        case cyanotype, daguerreotype, tintype, platinum, vanDyke, saltPrint
 
         /// (spectral weights, exposure, contrast, dye at Dmax, paper, coating)
         /// Colours are LINEAR RGB.
@@ -2048,6 +2066,31 @@ extension CameraManager {
                 return (CIVector(x: 0.02, y: 0.18, z: 0.80), 0.2, 1.35,
                         CIVector(x: 0.011, y: 0.010, z: 0.009),
                         CIVector(x: 0.730, y: 0.760, z: 0.810), 0.04)
+            case .tintype:
+                // Collodion sees blue only. The "paper" is the creamy silver
+                // deposit (≈ 200,195,180); full density is the black-japanned
+                // iron showing through (≈ 20,17,14). Poured by hand: uneven.
+                return (CIVector(x: 0.0, y: 0.15, z: 0.85), 0.3, 1.25,
+                        CIVector(x: 0.007, y: 0.0056, z: 0.0044),
+                        CIVector(x: 0.578, y: 0.546, z: 0.457), 0.12)
+            case .platinum:
+                // Platinum/palladium: famously long, soft tonal scale; warm
+                // neutral blacks (≈ 45,38,32) on warm white rag (≈ 240,232,215).
+                return (CIVector(x: 0.10, y: 0.35, z: 0.55), 0.0, 0.80,
+                        CIVector(x: 0.026, y: 0.019, z: 0.015),
+                        CIVector(x: 0.871, y: 0.807, z: 0.680), 0.05)
+            case .vanDyke:
+                // Van Dyke brown (iron-silver): deep chocolate (≈ 52,30,18)
+                // on cream paper (≈ 238,230,212).
+                return (CIVector(x: 0.05, y: 0.30, z: 0.65), 0.0, 1.0,
+                        CIVector(x: 0.034, y: 0.012, z: 0.006),
+                        CIVector(x: 0.855, y: 0.791, z: 0.658), 0.09)
+            case .saltPrint:
+                // Salted paper (Talbot, 1840s): reddish-purple browns
+                // (≈ 90,52,40), soft and matte, image sunk into the fibres.
+                return (CIVector(x: 0.05, y: 0.30, z: 0.65), -0.2, 0.85,
+                        CIVector(x: 0.102, y: 0.034, z: 0.021),
+                        CIVector(x: 0.840, y: 0.770, z: 0.640), 0.10)
             }
         }
     }

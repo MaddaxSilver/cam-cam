@@ -180,6 +180,7 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
     // Experimental / darkroom / alternative process
     case crossProcess, bleachBypass, expiredFilm
     case cyanotype, daguerreotype, duotone
+    case tintype, platinum, vanDyke, saltPrint
     case retroChrome, neonNoir, circuitBent, circuitBentHeavy
 
     var id: String { rawValue }
@@ -245,6 +246,10 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
         case .cyanotype:            return "Cyanotype"
         case .daguerreotype:        return "Daguerreotype"
         case .duotone:              return "Duotone"
+        case .tintype:              return "Tintype"
+        case .platinum:             return "Platinum"
+        case .vanDyke:              return "Van Dyke"
+        case .saltPrint:            return "Salt Print"
         case .retroChrome:          return "RetroChrm"
         case .neonNoir:             return "Neon Noir"
         case .circuitBent:          return "Bent"
