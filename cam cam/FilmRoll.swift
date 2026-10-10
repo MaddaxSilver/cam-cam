@@ -14,6 +14,7 @@
 
 import Foundation
 import CoreLocation
+import CoreGraphics
 import Observation
 
 @MainActor @Observable
@@ -98,18 +99,36 @@ final class FilmRoll {
     /// Save every frame to Photos (in shot order), then unload the roll.
     /// Frames are removed one by one as they land, so an interrupted develop
     /// can simply be resumed.
-    func develop() async {
+    /// Develop the roll: save every frame to Photos in shot order.
+    /// - development: applied to every frame (re-rendered from its original
+    ///   with `render`); `.normal` keeps each frame as shot.
+    /// - contactSheet: also save one contact print of the whole roll.
+    func develop(development: ContactSheet.Development = .normal, contactSheet: Bool = false,
+                 render: ((Data, ShotRecipe) -> Data?)? = nil) async {
         guard !developing, let m = manifest, !m.shots.isEmpty else { return }
         developing = true; developProgress = 0
         defer { developing = false }
         let dir = Self.directory
         var remaining = m.shots
+        var sheetFrames: [CGImage] = []
+        var sheetFilm: String?
         while let shot = remaining.first {
             do {
                 let original = try Data(contentsOf: dir.appendingPathComponent(shot.original))
-                let rendered = shot.rendered.flatMap { try? Data(contentsOf: dir.appendingPathComponent($0)) }
+                var rendered = shot.rendered.flatMap { try? Data(contentsOf: dir.appendingPathComponent($0)) }
+                var recipe = rendered == nil ? nil : shot.recipe
+                if development != .normal, let render {
+                    let r = development.apply(to: shot.recipe ?? ShotRecipe())
+                    if let out = await Task.detached(priority: .userInitiated, operation: { render(original, r) }).value {
+                        rendered = out; recipe = r
+                    }
+                }
+                if contactSheet {
+                    if let t = ContactSheet.thumbnail(rendered ?? original) { sheetFrames.append(t) }
+                    if sheetFilm == nil { sheetFilm = recipe?.displayName ?? shot.recipe?.displayName }
+                }
                 _ = try await PhotoSaver.save(original: original, rendered: rendered,
-                                              recipe: rendered == nil ? nil : shot.recipe,
+                                              recipe: rendered == nil ? nil : recipe,
                                               location: shot.location)
             } catch {
                 message = "Developing stopped: \(error.localizedDescription) — \(remaining.count) frames kept"
@@ -126,6 +145,10 @@ final class FilmRoll {
             manifest?.shots = remaining
         }
         let count = m.shots.count
+        if contactSheet, let sheet = ContactSheet.render(frames: sheetFrames, film: sheetFilm ?? "cam cam",
+                                                          date: m.started) {
+            _ = try? await PhotoSaver.save(original: sheet, rendered: nil, recipe: nil, location: nil)
+        }
         lock.withLock { _store = nil }
         try? FileManager.default.removeItem(at: dir)
         manifest = nil

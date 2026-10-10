@@ -52,11 +52,15 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
     var styleColor: Float = 0
     var stylePalette: Float = 1
 
+    /// Developed as a cross-process (slide film in C-41).
+    var crossProcessed = false
+
     /// A recipe that changes nothing (no sim, no effects).
     var isIdentity: Bool {
         sim == .none && custom == nil && !grainEnabled && !crosstalkEnabled
             && !halationEnabled && !rolloffEnabled && !pushPullEnabled
             && !anamorphicFlare && !lightArtifacts && !filmScratches && !randomization
+            && !crossProcessed
     }
 
     /// Short human label, e.g. "Portra" or "Teal & Orange (LUT)".
@@ -72,7 +76,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         case crosstalkEnabled, crosstalk, halationEnabled, halation, rolloffEnabled, rolloff
         case pushPullEnabled, pushPull, anamorphicFlare, lightArtifacts, filmScratches
         case randomization, randomSeed
-        case styleTone, styleColor, stylePalette
+        case styleTone, styleColor, stylePalette, crossProcessed
     }
 
     init() {}
@@ -102,6 +106,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         styleTone        = v(.styleTone, Float(0))
         styleColor       = v(.styleColor, Float(0))
         stylePalette     = v(.stylePalette, Float(1))
+        crossProcessed   = v(.crossProcessed, false)
     }
 
     func encoded() -> Data? { try? JSONEncoder().encode(self) }

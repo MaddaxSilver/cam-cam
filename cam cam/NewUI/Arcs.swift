@@ -125,7 +125,7 @@ struct FilmArc: View {
                          selectedIndex: selectedIndex,
                          onTapItem: { i in
                              if items[i].isSetSwitch { detent.impactOccurred(intensity: 0.85); onSwitchSet() }
-                             else if i == selectedIndex { onOpenLibrary() } else {
+                             else if i == selectedIndex { /* already chosen */ } else {
                                  detent.impactOccurred(intensity: 0.85)
                                  onSelect(items[i])
                              }

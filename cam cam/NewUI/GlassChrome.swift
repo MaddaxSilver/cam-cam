@@ -134,6 +134,7 @@ struct GlassChrome<Shutter: View>: View {
             ForEach(ArcSet.allCases) { set in
                 Button(set == arcSet ? "\(set.title) ✓" : set.title) { arcSetRaw = set.rawValue }
             }
+            Button("Browse all films…") { onLibrary() }
             Button("Cancel", role: .cancel) {}
         }
         .animation(.snappy(duration: 0.3), value: showControls)

@@ -229,6 +229,11 @@ extension CameraManager {
                                           mask: SkinMask.accurate(input))
             }
         }
+        // Developed as a cross-process: slide chemistry on top of the film.
+        if r.crossProcessed {
+            image = applyFilmSim(to: image, sim: .crossProcess, grainEnabled: false, grain: 0,
+                                 digiCamQuality: r.digiCamQuality)
+        }
 
         // Live portrait depth blur — applied BEFORE film sim effects so bokeh looks natural
         if let fStop = portraitFStop {

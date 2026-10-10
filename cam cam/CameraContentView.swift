@@ -380,7 +380,7 @@ struct CameraContentView: View {
                              onImportLUT: { showLUTImporter = true })
         }
         .sheet(isPresented: $showRollSheet) {
-            RollSheet().presentationDetents([.medium, .large])
+            RollSheet(camera: camera).presentationDetents([.large])
         }
         .sheet(isPresented: $showSettings) {
             CamSettingsSheet(camera: camera,

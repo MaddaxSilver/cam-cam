@@ -8,6 +8,8 @@
 //
 
 import SwiftUI
+import CoreImage
+import ImageIO
 
 // MARK: - Film library
 
@@ -148,10 +150,13 @@ struct FilmLibrarySheet: View {
 // MARK: - Film roll
 
 struct RollSheet: View {
+    let camera: CameraManager
     @Environment(\.dismiss) private var dismiss
     @State private var roll = FilmRoll.shared
     @State private var confirmDiscard = false
     @State private var developedCount: Int?
+    @State private var development: ContactSheet.Development = .normal
+    @AppStorage("cc_rollContactSheet") private var contactSheet = true
 
     var body: some View {
         NavigationStack {
@@ -164,7 +169,8 @@ struct RollSheet: View {
                             .frame(width: 96, height: 96).background(Circle().fill(Color.yellow))
                             .symbolEffect(.bounce, value: n)
                         Text("\(n) frames developed").font(.title2.bold())
-                        Text("They’re in the cam cam album.").foregroundStyle(.secondary)
+                        Text(contactSheet ? "They’re in the cam cam album, with a contact sheet."
+                                          : "They’re in the cam cam album.").foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
                     .sensoryFeedback(.success, trigger: n)
@@ -181,10 +187,41 @@ struct RollSheet: View {
                     if roll.developing {
                         ProgressView("Developing \(roll.developProgress)…").tint(.yellow)
                     }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("DEVELOPMENT").font(.system(size: 12, weight: .semibold)).tracking(0.8)
+                            .foregroundStyle(.secondary)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(ContactSheet.Development.allCases) { d in
+                                    Button { development = d } label: {
+                                        Text(d.title).font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(development == d ? .black : .white)
+                                            .padding(.horizontal, 14).frame(height: 36)
+                                            .background(Capsule().fill(development == d ? Color.yellow : Color.white.opacity(0.12)))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        Text(development.detail).font(.footnote).foregroundStyle(.secondary)
+                        Toggle("Make a contact sheet", isOn: $contactSheet).tint(.yellow)
+                    }
                     Spacer()
                     Button {
                         let n = roll.shotCount
-                        Task { await roll.develop(); if !roll.isLoaded { developedCount = n } }
+                        nonisolated(unsafe) let cam = camera
+                        let render: (Data, ShotRecipe) -> Data? = { data, r in
+                            guard let ci = CIImage(data: data) else { return nil }
+                            let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
+                            let upright = ci.oriented(forExifOrientation: o)
+                            let out = cam.renderLook(upright, recipe: r, flatten: true).cropped(to: upright.extent)
+                            guard let cg = cam.ciContext.createCGImage(out, from: out.extent) else { return nil }
+                            return MetadataTools.jpeg(from: cg, metadataFrom: data, location: nil)
+                        }
+                        Task {
+                            await roll.develop(development: development, contactSheet: contactSheet, render: render)
+                            if !roll.isLoaded { developedCount = n }
+                        }
                     } label: {
                         Text("Develop \(roll.shotCount) frame\(roll.shotCount == 1 ? "" : "s")")
                             .font(.headline).frame(maxWidth: .infinity).frame(height: 52)
