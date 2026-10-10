@@ -17,10 +17,11 @@ import Photos
 enum CaptureMode: String { case photo, video }
 
 enum ControlKind: String, CaseIterable, Identifiable {
-    case style, halation, exposure, effects, modes, view
+    case suggest, style, halation, exposure, effects, modes, view
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .suggest: "Suggest"
         case .style: "Style"
         case .halation: "Halation"
         case .exposure: "Exposure"
@@ -31,6 +32,7 @@ enum ControlKind: String, CaseIterable, Identifiable {
     }
     var symbol: String {
         switch self {
+        case .suggest: "wand.and.stars"
         case .style: "paintpalette"
         case .halation: "sun.max"
         case .exposure: "plusminus.circle"
@@ -371,6 +373,8 @@ struct GlassChrome<Shutter: View>: View {
 
     @ViewBuilder private var controlPanel: some View {
         switch active {
+        case .suggest:
+            suggestPanel
         case .style:
             VStack(spacing: 10) {
                 StylePad(settings: styleSettings, name: camera.selectedSim.label)
@@ -459,6 +463,52 @@ struct GlassChrome<Shutter: View>: View {
                     camera.selectedAspectRatio = AspectRatio.allCases[$0]
                 }
             }
+        }
+    }
+
+    // MARK: Film suggestions
+
+    private var suggestPanel: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            let reading = FilmSuggest.read(device: camera.currentDevice, ev: camera.evReading,
+                                           faces: camera.faceDetected)
+            VStack(alignment: .leading, spacing: 10) {
+                if let reading {
+                    let s = FilmSuggest.suggest(reading)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(s.reason).font(.system(size: 14, weight: .semibold))
+                        Spacer()
+                        Text("\(Int(reading.kelvin.rounded() / 100) * 100)K · EV \(Int(reading.ev.rounded()))")
+                            .font(.system(size: 12, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.75))
+                    }
+                    HStack(spacing: 8) {
+                        ForEach(s.films) { f in
+                            let on = camera.activeCustomSim == nil && camera.selectedSim == f
+                            Button {
+                                camera.selectedSim = f
+                                customSimStore.activeCustomSimID = nil
+                                camera.activeCustomSim = nil
+                            } label: {
+                                VStack(spacing: 6) {
+                                    Circle().fill(tones.tone(FavoritesStore.key(f))).frame(width: 14, height: 14)
+                                    Text(f.label).font(.system(size: 13, weight: .semibold))
+                                        .lineLimit(1).minimumScaleFactor(0.75)
+                                }
+                                .foregroundStyle(on ? .black : .white)
+                                .frame(maxWidth: .infinity, minHeight: 64)
+                                .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(on ? Color.yellow : Color.white.opacity(0.12)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                } else {
+                    Text("Reading the light…").font(.system(size: 14, weight: .semibold))
+                }
+            }
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         }
     }
 
