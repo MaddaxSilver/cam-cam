@@ -1866,7 +1866,15 @@ import CoreLocation
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
             let codec: AVVideoCodecType = photoOutput.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
-            if useRAW, let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first {
+            // Max quality must stay full resolution with RAW on: the plain
+            // (Bayer) RAW is 12MP only and drags the processed photo down to
+            // 12MP with it, so Max uses Apple ProRAW (48MP on Pro sensors).
+            // Speed / Balanced keep the lighter 12MP Bayer RAW.
+            let rawTypes = photoOutput.availableRawPhotoPixelFormatTypes
+            let proRAW = rawTypes.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
+            let bayerRAW = rawTypes.first { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }
+            let rawChoice = quality == .quality ? (proRAW ?? bayerRAW) : (bayerRAW ?? proRAW)
+            if useRAW, let rawFormat = rawChoice {
                 // RAW + film: the DNG and a processed photo from one exposure.
                 // The processed one gets the film look; the DNG rides along as
                 // the same Photos asset's RAW (like Halide / Project Indigo).
@@ -3145,6 +3153,14 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             return
         }
 
+        // Guard against the 12MP regression (it has happened twice): a Max
+        // shot from the main lens should be ~48MP.
+        let dims = photo.resolvedSettings.photoDimensions
+        if output.maxPhotoQualityPrioritization == .quality, dims.width > 0,
+           Int(dims.width) * Int(dims.height) < 20_000_000,
+           (currentDevice?.activeFormat.supportedMaxPhotoDimensions.map { Int($0.width) * Int($0.height) }.max() ?? 0) > 40_000_000 {
+            print("⚠️ cam cam: photo delivered at \(dims.width)×\(dims.height) although the lens supports 48MP")
+        }
         let shot = takeShot(id: photo.resolvedSettings.uniqueID)
         guard let data = photo.fileDataRepresentation() else {
             if shot != nil { shotRendered() }
