@@ -27,6 +27,7 @@ import Combine
 import Darwin   // getifaddrs, inet_ntop
 import ImageIO
 import UniformTypeIdentifiers
+import Metal
 
 // MARK: - Sony Device Discovery
 
@@ -261,7 +262,12 @@ struct SonyAPIClient {
 final class SonyLiveSimSnapshot: @unchecked Sendable {
     nonisolated(unsafe) var sim: FilmSimulation = .none
     nonisolated(unsafe) var custom: CustomSimulation? = nil
-    nonisolated(unsafe) var applyClosure: ((CIImage, FilmSimulation, CustomSimulation?) -> CIImage)? = nil
+    /// Pure look renderer: (image, recipe, flatten) → image. Thread-safe.
+    nonisolated(unsafe) var renderer: ((CIImage, ShotRecipe, Bool) -> CIImage)? = nil
+    /// Builds a recipe from the LIVE settings (sim, custom, seed). Thread-safe.
+    nonisolated(unsafe) var recipeProvider: ((FilmSimulation, CustomSimulation?, UInt64) -> ShotRecipe)? = nil
+    nonisolated(unsafe) var zebras = false
+    nonisolated(unsafe) var histogram = false
 }
 
 // MARK: - Sony Connector
@@ -340,8 +346,7 @@ final class SonyConnector {
     /// look it was *taken* with — like a non-destructive RAW pipeline.
     private struct PendingDownload {
         let url: String
-        let sim: FilmSimulation
-        let custom: CustomSimulation?
+        let recipe: ShotRecipe     // full look at shutter time (sim + effects + seed)
     }
     @ObservationIgnored private var pendingDownloads: [PendingDownload] = []
     @ObservationIgnored private var downloadDrainTask: Task<Void, Never>? = nil
@@ -350,11 +355,51 @@ final class SonyConnector {
     /// SwiftUI views read this to show a "📥 N queued" badge after a burst.
     var downloadQueueDepth: Int = 0
 
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    /// Same working/output space as CameraManager's context (Display P3).
+    /// The default (linear) working space made every film sim — whose curves
+    /// and matrices are tuned in the iPhone's P3 gamma space — render
+    /// differently on Sony shots than on iPhone shots.
+    private let ciContext: CIContext = {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        if let device = MTLCreateSystemDefaultDevice() {
+            return CIContext(mtlDevice: device, options: [.workingColorSpace: p3, .outputColorSpace: p3,
+                                                          .cacheIntermediates: false])
+        }
+        return CIContext(options: [.workingColorSpace: p3, .outputColorSpace: p3])
+    }()
 
-    /// Inject the film-sim apply function from CameraManager.
-    var applySimClosure: ((CIImage, FilmSimulation, CustomSimulation?) -> CIImage)? {
-        didSet { liveSimSnapshot.applyClosure = applySimClosure }
+    /// Injected by SonyView from CameraManager: the pure, thread-safe look
+    /// renderer and a live-recipe builder. Replaces the old closure that called
+    /// `applySimAndGrainDirect`, which swapped shared capture state and raced
+    /// between the live view (off-main) and photo processing (on main).
+    var renderer: ((CIImage, ShotRecipe, Bool) -> CIImage)? {
+        didSet { liveSimSnapshot.renderer = renderer }
+    }
+    var recipeProvider: ((FilmSimulation, CustomSimulation?, UInt64) -> ShotRecipe)? {
+        didSet { liveSimSnapshot.recipeProvider = recipeProvider }
+    }
+
+    /// Exposure aids for the live view (display only).
+    var showZebras: Bool = UserDefaults.standard.bool(forKey: "cc_sonyZebras") {
+        didSet { UserDefaults.standard.set(showZebras, forKey: "cc_sonyZebras"); liveSimSnapshot.zebras = showZebras }
+    }
+    var showHistogram: Bool = UserDefaults.standard.bool(forKey: "cc_sonyHistogram") {
+        didSet {
+            UserDefaults.standard.set(showHistogram, forKey: "cc_sonyHistogram")
+            liveSimSnapshot.histogram = showHistogram
+            if !showHistogram { liveHistogram = [] }
+        }
+    }
+    /// Latest live-view luma histogram (64 bins, normalised).
+    var liveHistogram: [Float] = []
+
+    /// The recipe a shot taken RIGHT NOW would get (fresh random seed).
+    func captureRecipe() -> ShotRecipe {
+        if let recipeProvider {
+            return recipeProvider(selectedSim, activeCustomSim, UInt64.random(in: 1..<UInt64.max))
+        }
+        var r = ShotRecipe(); r.sim = selectedSim; r.custom = activeCustomSim
+        return r
     }
 
     struct LogEntry: Identifiable, Hashable {
@@ -399,7 +444,12 @@ final class SonyConnector {
     private var eventVersion: String = "1.8"
 
     /// Lock-free snapshot of sim settings used by the live-view parser.
-    private let liveSimSnapshot = SonyLiveSimSnapshot()
+    private let liveSimSnapshot: SonyLiveSimSnapshot = {
+        let s = SonyLiveSimSnapshot()
+        s.zebras = UserDefaults.standard.bool(forKey: "cc_sonyZebras")
+        s.histogram = UserDefaults.standard.bool(forKey: "cc_sonyHistogram")
+        return s
+    }()
 
     /// Wall-clock time of the most recent live-view frame.
     private var lastFrameTime: Date = .distantPast
@@ -420,11 +470,11 @@ final class SonyConnector {
 
     /// URLSession for the live-view stream. Inter-byte timeout 30s so a
     /// stalled WiFi link is detected promptly (instead of waiting 60min).
-    private let streamSession: URLSession = {
+    private let streamConfiguration: URLSessionConfiguration = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest  = 30
         config.timeoutIntervalForResource = 3600
-        return URLSession(configuration: config)
+        return config
     }()
 
     private func log(_ msg: String) {
@@ -777,11 +827,7 @@ final class SonyConnector {
         if pendingDownloads.contains(where: { $0.url == url }) { return }
         // Snapshot the sim at capture time so changing sims mid-queue
         // doesn't retroactively reprocess earlier shots with the wrong look.
-        pendingDownloads.append(
-            PendingDownload(url: url,
-                            sim: selectedSim,
-                            custom: activeCustomSim)
-        )
+        pendingDownloads.append(PendingDownload(url: url, recipe: captureRecipe()))
         downloadQueueDepth = pendingDownloads.count + activeDownloads
         if downloadDrainTask == nil {
             downloadDrainTask = Task { [weak self] in
@@ -801,9 +847,7 @@ final class SonyConnector {
             // Reset the watchdog clock so the gap caused by the download
             // doesn't trip the 5s threshold the moment the download ends.
             lastFrameTime = Date()
-            await downloadAndProcess(url: item.url,
-                                     simOverride: item.sim,
-                                     customOverride: item.custom)
+            await downloadAndProcess(url: item.url, recipe: item.recipe)
             activeDownloads -= 1
             downloadQueueDepth = pendingDownloads.count + activeDownloads
             // Nudge the watchdog forward again so it gives the stream a
@@ -813,170 +857,71 @@ final class SonyConnector {
         downloadDrainTask = nil
     }
 
-    /// `simOverride` / `customOverride` let the drain queue use the sim
-    /// that was active *when the shutter fired*, not whatever's selected
-    /// now. Pass `nil` overrides only when called from a context where the
-    /// current selection is what you want (none currently).
-    private func downloadAndProcess(url: String,
-                                    simOverride: FilmSimulation? = nil,
-                                    customOverride: CustomSimulation? = nil) async {
+    /// Download one postview and save it. Only the network wait and small UI
+    /// updates happen on the main actor; decode + full-res render + JPEG encode
+    /// run on a background task. (They used to run ON MAIN — ~1–3 s per 42MP
+    /// shot — which froze the live view and UI for every queued photo.)
+    private func downloadAndProcess(url: String, recipe: ShotRecipe) async {
         log("⬇️ Downloading: \(url)")
         guard let data = try? await SonyAPIClient.get(urlString: url) else {
             log("❌ Download failed: \(url)")
             return
         }
         log("⬇️ Downloaded \(data.count / 1024) KB")
-        guard let ciImage = CIImage(data: data) else {
-            log("❌ Not a valid image (\(data.count) bytes)")
+
+        nonisolated(unsafe) let renderer = self.renderer
+        let ctx = self.ciContext
+        let hasLook = renderer != nil && !recipe.isIdentity
+        let location = LocationTagger.shared.locationForPhoto()
+
+        struct Rendered: @unchecked Sendable { let preview: UIImage; let jpeg: Data? }
+        let rendered: Rendered? = await Task.detached(priority: .userInitiated) {
+            guard let ciImage = CIImage(data: data) else { return nil }
+            let o = (ciImage.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
+            let oriented = ciImage.oriented(forExifOrientation: o)
+            let processed = hasLook ? renderer!(oriented, recipe, true) : oriented
+            guard let cg = ctx.createCGImage(processed, from: processed.extent) else { return nil }
+            // Screen-size preview only. Holding the full-res UIImage cost
+            // ~170 MB of decoded pixels per 42MP shot, and the recents strip
+            // kept 12 of them (~2 GB) — enough to get the app killed mid-shoot.
+            let preview = UIImage(cgImage: cg).preparingThumbnail(of: CGSize(width: 2048, height: 2048))
+                ?? UIImage(cgImage: cg)
+            // Graded JPEG with the original EXIF/lens/date (+ phone GPS).
+            let jpeg = hasLook ? MetadataTools.jpeg(from: cg, metadataFrom: data, location: location) : nil
+            return Rendered(preview: preview, jpeg: jpeg)
+        }.value
+
+        guard let rendered else {
+            log("❌ Render failed")
+            shutterStatus = "❌ Render failed"
             return
         }
-
-        // EXIF orientation: CIImage stores it as NSNumber.
-        let orientationVal: Int32 = {
-            if let n = ciImage.properties[kCGImagePropertyOrientation as String] as? NSNumber {
-                return n.int32Value
-            }
-            if let i = ciImage.properties[kCGImagePropertyOrientation as String] as? Int {
-                return Int32(i)
-            }
-            return 1
-        }()
-        let oriented = ciImage.oriented(forExifOrientation: orientationVal)
-
-        // Render on main actor — applySimClosure ultimately calls @MainActor
-        // CameraManager code, so off-actor rendering would silently fail.
-        // Use the snapshotted sim (capture-time) if provided, falling back
-        // to the live selection.
-        let simToUse    = simOverride    ?? selectedSim
-        let customToUse = customOverride ?? activeCustomSim
-        let hasSim = applySimClosure != nil && (simToUse != .none || customToUse != nil)
-        let processed = hasSim ? applySimClosure!(oriented, simToUse, customToUse) : oriented
-        guard let cg = ciContext.createCGImage(processed, from: processed.extent) else {
-            log("❌ Render failed (createCGImage)")
-            return
-        }
-        let output = UIImage(cgImage: cg)
-        let thumb = output.preparingThumbnail(of: CGSize(width: 200, height: 200)) ?? output
-
         processedCount += 1
-        lastProcessedThumb = thumb
-        log("✅ Photo processed (#\(processedCount))")
+        // Film roll loaded: the frame goes onto the roll, unseen until developed.
+        if FilmRoll.shared.absorb(original: data, rendered: rendered.jpeg,
+                                  recipe: hasLook ? recipe : nil, location: location) {
+            shutterStatus = "🎞 On the roll — develop to see it"
+            log("🎞 Frame added to roll")
+            return
+        }
+        lastProcessedThumb = rendered.preview.preparingThumbnail(of: CGSize(width: 200, height: 200)) ?? rendered.preview
+        log("✅ Photo processed (#\(processedCount)) · \(hasLook ? recipe.displayName : "no look")")
 
-        // Save: original Sony JPEG bytes (lossless) when no sim, otherwise
-        // re-encode at q=1.0 *with the original EXIF spliced back in* so
-        // Photos still shows camera model, lens, aperture/shutter/ISO,
-        // capture time, GPS, etc. on sim-rendered shots.
         if autoSave {
-            if hasSim {
-                let bytes = reencodeJPEGPreservingMetadata(
-                    processed: cg, originalJPEG: data, quality: 1.0
-                )
-                await saveToPhotos(output,
-                                   fallbackData: bytes,
-                                   label: bytes != nil ? "sim-rendered (EXIF kept)" : "sim-rendered")
-            } else {
-                await saveToPhotos(output, fallbackData: data, label: "original Sony bytes")
+            shutterStatus = "💾 Saving…"
+            do {
+                let result = try await PhotoSaver.save(original: data,
+                                                       rendered: rendered.jpeg,
+                                                       recipe: hasLook ? recipe : nil,
+                                                       location: location)
+                shutterStatus = "✅ \(result.message)"
+                log("💾 \(result.message)")
+            } catch {
+                shutterStatus = "❌ \(error.localizedDescription)"
+                log("❌ Save error: \(error.localizedDescription)")
             }
         }
-
-        onPhotoProcessed?(output)
-    }
-
-    /// Re-encode a processed CGImage as JPEG, splicing the EXIF / TIFF /
-    /// GPS / Maker dictionaries from the original camera JPEG. Returns
-    /// nil on any failure so the caller can fall back to plain encoding.
-    ///
-    /// Why: `UIImage.jpegData(compressionQuality:)` does NOT carry over
-    /// metadata. Without this splice, sim-rendered photos land in Photos
-    /// with no camera/lens/exposure info, no original capture date, and
-    /// no GPS — which makes them harder to organize and breaks "Taken in
-    /// this app on this date" search behavior. We pull every property
-    /// block from the source JPEG and write them straight back out.
-    private func reencodeJPEGPreservingMetadata(processed: CGImage,
-                                                originalJPEG: Data,
-                                                quality: CGFloat) -> Data? {
-        guard let src = CGImageSourceCreateWithData(originalJPEG as CFData, nil),
-              let srcProps = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
-        else { return nil }
-
-        // Merge source metadata with our compression-quality option.
-        var props = srcProps
-        props[kCGImageDestinationLossyCompressionQuality] = quality
-        // Drop the cached orientation — we already applied it to the
-        // CIImage via .oriented(forExifOrientation:), so the pixels are
-        // upright. Leaving the original orientation tag in would cause
-        // Photos to re-rotate and end up sideways.
-        props[kCGImagePropertyOrientation] = 1
-        if var tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-            tiff[kCGImagePropertyTIFFOrientation] = 1
-            props[kCGImagePropertyTIFFDictionary] = tiff
-        }
-
-        let buf = NSMutableData()
-        guard let dst = CGImageDestinationCreateWithData(
-            buf as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil
-        ) else { return nil }
-        CGImageDestinationAddImage(dst, processed, props as CFDictionary)
-        guard CGImageDestinationFinalize(dst) else { return nil }
-        return buf as Data
-    }
-
-    /// Save to Photos with maximum quality.
-    private func saveToPhotos(_ image: UIImage,
-                              fallbackData: Data?,
-                              label: String) async {
-        log("📸 saveToPhotos start (\(label))")
-
-        var status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
-        if status == .notDetermined {
-            log("📸 Requesting Photos permission…")
-            shutterStatus = "📸 Asking Photos permission…"
-            status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
-        }
-        let authName: String = {
-            switch status {
-            case .notDetermined: return "notDetermined"
-            case .restricted:    return "restricted"
-            case .denied:        return "denied"
-            case .authorized:    return "authorized"
-            case .limited:       return "limited"
-            @unknown default:    return "unknown(\(status.rawValue))"
-            }
-        }()
-        log("📸 Photos auth: \(authName)")
-
-        guard status == .authorized || status == .limited else {
-            shutterStatus = "⚠️ Photos: \(authName) — enable in Settings"
-            log("⚠️ Photos permission denied")
-            return
-        }
-
-        let dataToSave: Data
-        if let raw = fallbackData {
-            dataToSave = raw
-            log("📸 Saving raw camera JPEG (\(raw.count / 1024) KB)")
-        } else if let encoded = image.jpegData(compressionQuality: 1.0) {
-            dataToSave = encoded
-            log("📸 Encoded JPEG q=1.0 (\(encoded.count / 1024) KB)")
-        } else {
-            shutterStatus = "❌ JPEG encode failed"
-            log("❌ JPEG encode failed")
-            return
-        }
-        let kb = dataToSave.count / 1024
-        shutterStatus = "💾 Saving (\(kb) KB)…"
-
-        do {
-            try await PHPhotoLibrary.shared().performChanges {
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: dataToSave, options: nil)
-            }
-            shutterStatus = "✅ Saved (\(kb) KB, \(label))"
-            log("💾 Saved to Photos (\(dataToSave.count) bytes, \(label))")
-        } catch {
-            shutterStatus = "❌ Save failed: \(error.localizedDescription)"
-            log("❌ Photos save error: \(error.localizedDescription)")
-        }
+        onPhotoProcessed?(rendered.preview)
     }
 
     // MARK: - Camera State Helpers
@@ -1503,11 +1448,11 @@ final class SonyConnector {
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
 
-        guard let (byteStream, _) = try? await streamSession.bytes(for: request) else {
-            liveViewStatus = "❌ Stream connection failed"
-            log("❌ Stream: could not open \(url)")
-            return
-        }
+        // Body arrives as Data CHUNKS (as they come off the socket), parsed with
+        // a moving cursor. The old loop did `for try await byte in bytes` +
+        // `append(byte)` — millions of async steps per second at MJPEG rates
+        // (worst in Debug builds) — and resynced with O(n) `removeFirst()`.
+        let chunks = ChunkStream.open(request, configuration: streamConfiguration)
 
         liveViewStatus = "Streaming…"
         log("📡 Stream open at \(url)")
@@ -1515,153 +1460,113 @@ final class SonyConnector {
         let ctx = self.ciContext
         let snapshot = self.liveSimSnapshot
 
-        // Detached so the byte-loop runs OFF the main actor. A regular
-        // `Task { … }` inside this @MainActor method would inherit MainActor
-        // isolation and pin the byte loop onto main, which made the live
-        // view feel laggy because every byte iteration starved the UI.
-        //
-        // We re-attach cancellation via withTaskCancellationHandler so when
-        // the surrounding liveViewTask is cancelled (on disconnect or
-        // watchdog restart), the detached parser also gets cancelled.
+        // Detached so parsing runs OFF the main actor; cancellation is bridged
+        // below so disconnect / watchdog restart stop it cleanly.
         let parserTask = Task.detached(priority: .userInitiated) { [weak self] in
             var buf = [UInt8]()
-            buf.reserveCapacity(1_048_576)
-            var pendingType: UInt8 = 0
-            var pendingSize: Int   = 0
-            var paddingSize: Int   = 0
-            var hasHeader          = false
-            var frameCount         = 0
-            var loggedFirstBytes   = false
+            buf.reserveCapacity(2_000_000)
+            var cursor = 0                 // start of unparsed data in buf
+            var frameCount = 0
+            var loggedFirstBytes = false
 
             do {
-                for try await byte in byteStream {
+                for try await chunk in chunks {
                     if Task.isCancelled { break }
-                    buf.append(byte)
+                    buf.append(contentsOf: chunk)
 
-                    if !hasHeader {
-                        guard buf.count >= 136 else { continue }
-
-                        if !loggedFirstBytes {
-                            loggedFirstBytes = true
-                            let hex = buf.prefix(20)
-                                        .map { String(format: "%02X", $0) }
-                                        .joined(separator: " ")
-                            Task { @MainActor [weak self] in
-                                self?.log("📡 Stream bytes[0..19]: \(hex)")
-                            }
-                        }
-
-                        // Resync: jump to next 0xFF instead of byte-by-byte slide
-                        if buf[0] != 0xFF {
-                            if let idx = buf.firstIndex(of: 0xFF), idx > 0 {
-                                buf.removeFirst(idx)
-                            } else if buf.first != 0xFF {
-                                buf.removeAll(keepingCapacity: true)
-                            }
-                            continue
-                        }
-
-                        guard buf[8]  == 0x24, buf[9]  == 0x35,
-                              buf[10] == 0x68, buf[11] == 0x79 else {
-                            buf.removeFirst()
-                            continue
-                        }
-
-                        let pType = buf[1]
-                        let pSize = (Int(buf[12]) << 16) | (Int(buf[13]) << 8) | Int(buf[14])
-                        let padSz = Int(buf[15])
-
-                        guard pSize > 0, pSize < 4_000_000 else {
-                            buf.removeFirst()
-                            continue
-                        }
-
-                        pendingType = pType
-                        pendingSize = pSize
-                        paddingSize = padSz
-                        hasHeader   = true
+                    if !loggedFirstBytes, buf.count >= 20 {
+                        loggedFirstBytes = true
+                        let hex = buf.prefix(20).map { String(format: "%02X", $0) }.joined(separator: " ")
+                        Task { @MainActor [weak self] in self?.log("📡 Stream bytes[0..19]: \(hex)") }
                     }
 
-                    guard buf.count >= 136 + pendingSize + paddingSize else { continue }
-
-                    if pendingType == 0x01 {
-                        // Read sim state once — used for both throttle
-                        // decision and rendering.
-                        let closure = snapshot.applyClosure
-                        let sim = snapshot.sim
-                        let custom = snapshot.custom
-                        let hasSim = closure != nil && (sim != .none || custom != nil)
-
-                        // BACKPRESSURE: drop if main is still showing the
-                        // previous frame.
-                        if let strong = self, strong.liveFrameQueued {
-                            buf.removeSubrange(0 ..< (136 + pendingSize + paddingSize))
-                            hasHeader = false
+                    // Parse every complete packet currently in the buffer.
+                    while buf.count - cursor >= 136 {
+                        // Resync: jump straight to the next 0xFF.
+                        if buf[cursor] != 0xFF {
+                            if let idx = buf[cursor...].firstIndex(of: 0xFF) { cursor = idx }
+                            else { cursor = buf.count; break }
                             continue
                         }
-                        // TIME THROTTLE: only when a sim is active. Without
-                        // a sim, decode + createCGImage are fast enough to
-                        // sustain the camera's native ~15 fps. With a sim,
-                        // the CIFilter chain adds 30-50 ms per frame, so we
-                        // cap to ~14 fps (70 ms) for headroom.
+                        guard buf[cursor + 8] == 0x24, buf[cursor + 9] == 0x35,
+                              buf[cursor + 10] == 0x68, buf[cursor + 11] == 0x79 else {
+                            cursor += 1; continue
+                        }
+                        let pType = buf[cursor + 1]
+                        let pSize = (Int(buf[cursor + 12]) << 16) | (Int(buf[cursor + 13]) << 8) | Int(buf[cursor + 14])
+                        let padSz = Int(buf[cursor + 15])
+                        guard pSize > 0, pSize < 4_000_000 else { cursor += 1; continue }
+                        let total = 136 + pSize + padSz
+                        guard buf.count - cursor >= total else { break }   // wait for more bytes
+
+                        let start = cursor + 136
+                        cursor += total
+                        guard pType == 0x01 else { continue }               // 0x02 = frame info
+
+                        // BACKPRESSURE: drop if main is still showing the previous frame.
+                        if let strong = self, strong.liveFrameQueued { continue }
+
+                        let renderer = snapshot.renderer
+                        let sim = snapshot.sim
+                        let custom = snapshot.custom
+                        let hasSim = renderer != nil && (sim != .none || custom != nil)
+
+                        // TIME THROTTLE: only when a sim is active. Without a sim,
+                        // decode + render sustain the camera's native ~15 fps; with
+                        // one, cap to ~14 fps (70 ms) for headroom.
                         if hasSim {
                             let now = CACurrentMediaTime()
-                            if now - (self?.lastRenderStart ?? 0) < 0.070 {
-                                buf.removeSubrange(0 ..< (136 + pendingSize + paddingSize))
-                                hasHeader = false
-                                continue
-                            }
+                            if now - (self?.lastRenderStart ?? 0) < 0.070 { continue }
                             self?.lastRenderStart = now
                         }
 
-                        let jpeg = Data(buf[136 ..< (136 + pendingSize)])
-
-                        if let ciImage = CIImage(data: jpeg) {
-                            // DO NOT apply EXIF for live view — Sony streams
-                            // a fixed-size landscape JPEG; EXIF reflects camera
-                            // tilt and reshapes the displayed frame.
-                            let oriented = ciImage
-                            let simmed: CIImage
-                            if let fn = closure, sim != .none || custom != nil {
-                                simmed = fn(oriented, sim, custom)
-                            } else {
-                                simmed = oriented
-                            }
-                            // Lift exposure for display only — Sony's live-view
-                            // stream is encoded ~half a stop dark vs the actual
-                            // metered exposure. Applied AFTER the sim filter
-                            // so the sim sees an unmodified input; only the
-                            // user's preview is brightened.  Saved photos
-                            // (which come from `actTakePicture`'s postview
-                            // URL, a separate code path) are unaffected.
-                            let out: CIImage = {
-                                guard let f = CIFilter(name: "CIExposureAdjust") else { return simmed }
-                                f.setValue(simmed, forKey: kCIInputImageKey)
-                                f.setValue(0.7, forKey: "inputEV")  // +0.7 stops
-                                return f.outputImage ?? simmed
-                            }()
-                            // Already throttled above; just render + hand to main.
-                            if let cg = ctx.createCGImage(out, from: out.extent) {
-                                let uiImg = UIImage(cgImage: cg)
-                                let isFirst = frameCount == 0
-                                self?.liveFrameQueued = true
-                                Task { @MainActor [weak self] in
-                                    guard let self else { return }
-                                    self.liveViewImage = uiImg
-                                    self.lastFrameTime = Date()
-                                    if isFirst {
-                                        self.liveViewStatus = "Live"
-                                        self.log("🎬 First live view frame!")
-                                    }
-                                    self.liveFrameQueued = false
-                                }
-                                frameCount += 1
-                            }
+                        let jpeg = Data(buf[start ..< start + pSize])
+                        guard let ciImage = CIImage(data: jpeg) else { continue }
+                        // DO NOT apply EXIF for live view — Sony streams a fixed-size
+                        // landscape JPEG; EXIF reflects camera tilt.
+                        var simmed = ciImage
+                        if hasSim, let renderer {
+                            let recipe = snapshot.recipeProvider?(sim, custom, 0)
+                                ?? { var r = ShotRecipe(); r.sim = sim; r.custom = custom; return r }()
+                            simmed = renderer(ciImage, recipe, false)
                         }
+                        // Lift exposure for display only — Sony's live-view stream is
+                        // encoded ~half a stop dark vs the metered exposure. Applied
+                        // AFTER the sim so the sim sees an unmodified input. Saved
+                        // photos (postview path) are unaffected.
+                        var out = simmed.applyingFilter("CIExposureAdjust", parameters: ["inputEV": 0.7])
+                        // Exposure aids measure `simmed` (pre-lift = what the
+                        // photo records), drawn over the lifted display frame.
+                        if snapshot.zebras {
+                            out = ExposureAids.zebras(over: out, measuring: simmed)
+                        }
+                        if snapshot.histogram, frameCount % 3 == 0,
+                           let hist = ExposureAids.histogram(simmed, context: ctx) {
+                            Task { @MainActor [weak self] in self?.liveHistogram = hist }
+                        }
+                        guard let cg = ctx.createCGImage(out, from: out.extent) else { continue }
+                        let uiImg = UIImage(cgImage: cg)
+                        let isFirst = frameCount == 0
+                        self?.liveFrameQueued = true
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.liveViewImage = uiImg
+                            self.lastFrameTime = Date()
+                            if isFirst {
+                                self.liveViewStatus = "Live"
+                                self.log("🎬 First live view frame!")
+                            }
+                            self.liveFrameQueued = false
+                        }
+                        frameCount += 1
                     }
 
-                    buf.removeSubrange(0 ..< (136 + pendingSize + paddingSize))
-                    hasHeader = false
+                    // Compact at most once per chunk (not once per byte).
+                    if cursor > 0 {
+                        if cursor >= buf.count { buf.removeAll(keepingCapacity: true) }
+                        else { buf.removeFirst(cursor) }
+                        cursor = 0
+                    }
                 }
             } catch {
                 Task { @MainActor [weak self] in
@@ -1670,13 +1575,43 @@ final class SonyConnector {
                 }
             }
         }
-        // Bridge cancellation: if the outer liveViewTask is cancelled,
-        // forward it to the detached parser. This is what makes disconnect
-        // and watchdog-restart actually stop the byte loop cleanly.
         await withTaskCancellationHandler {
             await parserTask.value
         } onCancel: {
             parserTask.cancel()
+        }
+    }
+}
+
+// MARK: - Chunked HTTP body stream
+
+/// Streams an HTTP response body as `Data` chunks (as they arrive off the
+/// socket). Used for the Sony live-view MJPEG stream so parsing works per
+/// chunk instead of per byte. Cancelling the consumer cancels the request.
+nonisolated enum ChunkStream {
+    static func open(_ request: URLRequest,
+                     configuration: URLSessionConfiguration) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            let delegate = Delegate(continuation)
+            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+            let task = session.dataTask(with: request)
+            continuation.onTermination = { _ in
+                task.cancel()
+                session.invalidateAndCancel()
+            }
+            task.resume()
+        }
+    }
+
+    private final class Delegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        let continuation: AsyncThrowingStream<Data, Error>.Continuation
+        init(_ c: AsyncThrowingStream<Data, Error>.Continuation) { continuation = c }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            continuation.yield(data)
+        }
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            continuation.finish(throwing: error)
         }
     }
 }

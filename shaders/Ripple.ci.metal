@@ -29,9 +29,13 @@ extern "C" {
 //   freq2  : high-frequency wave count (fine wobble)
 //   phase  : random phase so each frame/shot differs
 //   height : image height in pixels (to normalize y → 0..1)
-float2 rippleWarp(coreimage::destination dest,
-                  float amp, float freq1, float freq2,
-                  float phase, float height) {
+//   dest   : MUST be the last parameter — Core Image rejects the kernel at
+//            load time otherwise ("destination must be the last parameter"),
+//            which previously made the app silently fall back to the slow
+//            composite ripple. It is not passed in `arguments:` from Swift.
+float2 rippleWarp(float amp, float freq1, float freq2,
+                  float phase, float height,
+                  coreimage::destination dest) {
     float2 p = dest.coord();
     float y = (height > 0.0) ? (p.y / height) : 0.0;
 

@@ -29,5 +29,8 @@ Icon
 # ── Separate project living in this folder (not cam cam) ─
 CharacterChat/
 
+# ── Claude Code worktrees / local agent state ─────────
+.claude/
+
 # ── Local scratch / secrets ────────────────────────────
 *.log

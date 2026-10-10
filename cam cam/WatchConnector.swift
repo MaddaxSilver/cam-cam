@@ -29,7 +29,12 @@ final class WatchConnector: NSObject {
     /// Push a small state snapshot to the Watch so it can render the right pill colors.
     /// Throttled by the caller (typically: when a relevant @Observable property changes).
     func pushState() {
+        // isWatchAppInstalled: the Watch target was removed from the project, so
+        // without this guard we'd build + push a context every 0.5 s (the EV
+        // timer calls this) to an app that doesn't exist. Free no-op until a
+        // companion Watch app is installed again.
         guard WCSession.isSupported(), WCSession.default.isPaired,
+              WCSession.default.isWatchAppInstalled,
               WCSession.default.activationState == .activated,
               let camera else { return }
         // Tuple-encode films as parallel arrays since dictionaries-of-strings travel cleanly via WC.

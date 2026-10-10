@@ -66,6 +66,7 @@ struct SonyView: View {
 
     // Custom film simulations (loaded from same UserDefaults as CameraView)
     @State private var customSimStore = CustomSimStore()
+    @State private var favorites = FavoritesStore.shared
 
     // Icon rotation (same MotionManager used by CameraView)
     @State private var motion = MotionManager()
@@ -95,7 +96,14 @@ struct SonyView: View {
         case builtin(FilmSimulation)
         case custom(CustomSimulation)
     }
+    /// What the volume buttons cycle through: just your ★ favourites when any
+    /// are pinned (flip between a few looks by feel), otherwise every sim.
     private var allSimSlots: [SimSlot] {
+        let favB = favorites.builtIns
+        let favC = favorites.customs(in: customSimStore.simulations)
+        if !favB.isEmpty || !favC.isEmpty {
+            return favB.map(SimSlot.builtin) + favC.map(SimSlot.custom)
+        }
         var slots: [SimSlot] = FilmSimulation.allCases.map(SimSlot.builtin)
         slots += customSimStore.simulations.map(SimSlot.custom)
         return slots
@@ -220,10 +228,17 @@ struct SonyView: View {
             // body for live view + capture, so keeping AVCaptureSession alive
             // would just drain battery for nothing.
             camera.pauseForExternalUse()
-            sony.applySimClosure = { [weak camera] image, sim, custom in
+            // Pure, thread-safe look pipeline (no shared capture state touched),
+            // so the Sony live view and photo processing can both run off-main.
+            sony.renderer = { [weak camera] image, recipe, flatten in
                 guard let camera else { return image }
-                return camera.applySimAndGrainDirect(to: image, sim: sim, custom: custom)
+                return camera.renderLook(image, recipe: recipe, flatten: flatten)
             }
+            sony.recipeProvider = { [weak camera] sim, custom, seed in
+                guard let camera else { var r = ShotRecipe(); r.sim = sim; r.custom = custom; return r }
+                return camera.liveRecipe(sim: sim, custom: custom, seed: seed)
+            }
+            LocationTagger.shared.start()
             sony.onPhotoProcessed = { processed in
                 withAnimation { showSavedToast = true }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
@@ -351,6 +366,13 @@ struct SonyView: View {
                         }
                     }
                     .frame(width: geo.size.width, height: geo.size.height)
+                }
+
+                // Live histogram (measured pre-preview-lift)
+                if sony.showHistogram, !cleanMode, !sony.liveHistogram.isEmpty, sony.liveViewImage != nil {
+                    HistogramView(bins: sony.liveHistogram)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(.top, 70).padding(.leading, 14)
                 }
 
                 // Grid overlay (full-bleed)
@@ -581,6 +603,10 @@ struct SonyView: View {
                             sonyMenuToggle(icon: "grid",                 title: "Grid",  isOn: $showGrid)
                             sonyMenuToggle(icon: "eye.slash",            title: "Clean", isOn: $cleanMode)
                             sonyMenuToggle(icon: "hand.point.left.fill", title: "Lefty", isOn: $camera.shutterOnLeft)
+                        }
+                        HStack(spacing: 10) {
+                            sonyMenuToggle(icon: "chart.bar.fill",       title: "Histo", isOn: $sony.showHistogram)
+                            sonyMenuToggle(icon: "line.diagonal",        title: "Zebra", isOn: $sony.showZebras)
                         }
                         .padding(.bottom, 6)
                         .transition(.opacity.combined(with: .move(edge: .top)))
@@ -859,27 +885,94 @@ struct SonyView: View {
 
     // MARK: - Film sim strip
 
+    // MARK: - Sim chips (Sony)
+
+    private func selectBuiltIn(_ sim: FilmSimulation) {
+        camera.selectedSim = sim
+        camera.activeCustomSim = nil
+        customSimStore.activeCustomSimID = nil
+        sony.selectedSim = sim
+        sony.activeCustomSim = nil
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func selectCustom(_ sim: CustomSimulation) {
+        customSimStore.activeCustomSimID = sim.id
+        camera.activeCustomSim = sim
+        camera.selectedSim = .none
+        sony.activeCustomSim = sim
+        sony.selectedSim = .none
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    @ViewBuilder
+    private func sonyBuiltInChip(_ sim: FilmSimulation, starred: Bool) -> some View {
+        let isActive = camera.selectedSim == sim && camera.activeCustomSim == nil
+        Button { selectBuiltIn(sim) } label: {
+            HStack(spacing: 4) {
+                if starred { Image(systemName: "star.fill").font(.system(size: 8)) }
+                Text(sim.label).font(.system(size: 13, weight: isActive ? .bold : .regular))
+            }
+            .foregroundStyle(isActive ? .black : .white)
+            .padding(.horizontal, 14).padding(.vertical, 8)
+            .background(Capsule().fill(isActive ? Color.yellow : Color.white.opacity(0.18)))
+        }
+        .buttonStyle(.plain)
+        .contextMenu { sonyFavoriteButton(FavoritesStore.key(sim)) }
+    }
+
+    @ViewBuilder
+    private func sonyCustomChip(_ sim: CustomSimulation, starred: Bool) -> some View {
+        let isActive = customSimStore.activeCustomSimID == sim.id
+        let isLUT = sim.lutFilename != nil
+        let tint: Color = isLUT ? .orange : .cyan
+        Button { selectCustom(sim) } label: {
+            HStack(spacing: 4) {
+                Image(systemName: starred ? "star.fill" : (isLUT ? "cube.fill" : "paintbrush.fill"))
+                    .font(.system(size: 9))
+                Text(sim.name).font(.system(size: 13, weight: isActive ? .bold : .regular))
+            }
+            .foregroundStyle(isActive ? .black : tint)
+            .padding(.horizontal, 14).padding(.vertical, 8)
+            .background(Capsule().fill(isActive ? tint : tint.opacity(0.15)))
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            sonyFavoriteButton(FavoritesStore.key(sim))
+            if let name = sim.lutFilename {
+                Button(role: .destructive) {
+                    LUTManager.shared.deleteLUT(filename: name)
+                    let key = FavoritesStore.key(sim)
+                    if favorites.isFavorite(key) { favorites.toggle(key) }
+                    customSimStore.delete(sim)
+                } label: { Label("Delete LUT", systemImage: "trash") }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sonyFavoriteButton(_ key: String) -> some View {
+        let fav = favorites.isFavorite(key)
+        Button { favorites.toggle(key) } label: {
+            Label(fav ? "Unpin from Favorites" : "Pin to Favorites", systemImage: fav ? "star.slash" : "star")
+        }
+    }
+
     private var filmSimRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
+                // ★ Favorites first (shared with iPhone mode)
+                let favB = favorites.builtIns
+                let favC = favorites.customs(in: customSimStore.simulations)
+                if !favB.isEmpty || !favC.isEmpty {
+                    ForEach(favB) { sim in sonyBuiltInChip(sim, starred: true) }
+                    ForEach(favC) { sim in sonyCustomChip(sim, starred: true) }
+                    Rectangle().fill(Color.white.opacity(0.2)).frame(width: 1, height: 24)
+                }
+
                 // Built-in sims
                 ForEach(FilmSimulation.allCases) { sim in
-                    let isActive = camera.selectedSim == sim && camera.activeCustomSim == nil
-                    Button {
-                        camera.selectedSim = sim
-                        camera.activeCustomSim = nil
-                        customSimStore.activeCustomSimID = nil
-                        sony.selectedSim = sim
-                        sony.activeCustomSim = nil
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    } label: {
-                        Text(sim.label)
-                            .font(.system(size: 13, weight: isActive ? .bold : .regular))
-                            .foregroundStyle(isActive ? .black : .white)
-                            .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(Capsule().fill(isActive ? Color.yellow : Color.white.opacity(0.18)))
-                    }
-                    .buttonStyle(.plain)
+                    sonyBuiltInChip(sim, starred: favorites.isFavorite(FavoritesStore.key(sim)))
                 }
 
                 // Divider before custom sims
@@ -891,43 +984,7 @@ struct SonyView: View {
 
                 // Custom sims (param-based + LUT-based both show here)
                 ForEach(customSimStore.simulations) { sim in
-                    let isActive = customSimStore.activeCustomSimID == sim.id
-                    let isLUT = sim.lutFilename != nil
-                    Button {
-                        customSimStore.activeCustomSimID = sim.id
-                        camera.activeCustomSim = sim
-                        camera.selectedSim = .none
-                        sony.activeCustomSim = sim
-                        sony.selectedSim = .none
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: isLUT ? "cube.fill" : "paintbrush.fill")
-                                .font(.system(size: 9))
-                            Text(sim.name)
-                                .font(.system(size: 13, weight: isActive ? .bold : .regular))
-                        }
-                        .foregroundStyle(isActive ? .black : (isLUT ? .orange : .cyan))
-                        .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(Capsule().fill(
-                            isActive
-                                ? (isLUT ? Color.orange : Color.cyan)
-                                : (isLUT ? Color.orange.opacity(0.15) : Color.cyan.opacity(0.15))
-                        ))
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        if isLUT {
-                            Button(role: .destructive) {
-                                if let name = sim.lutFilename {
-                                    LUTManager.shared.deleteLUT(filename: name)
-                                }
-                                customSimStore.delete(sim)
-                            } label: {
-                                Label("Delete LUT", systemImage: "trash")
-                            }
-                        }
-                    }
+                    sonyCustomChip(sim, starred: favorites.isFavorite(FavoritesStore.key(sim)))
                 }
 
                 // "Import LUT" button — always at end of strip
