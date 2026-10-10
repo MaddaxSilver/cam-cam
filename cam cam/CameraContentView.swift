@@ -112,7 +112,12 @@ struct CameraContentView: View {
                     .gesture(
                         MagnifyGesture()
                             .onChanged { v in
-                                if pinchBaseZoom == nil { pinchBaseZoom = camera.zoom }
+                                // Start from the focal length actually on screen:
+                                // `zoom` isn't updated by lens presets, so using it
+                                // made the first frame jump (the start stutter).
+                                if pinchBaseZoom == nil { pinchBaseZoom = Double(max(camera.currentMM, 13)) / 26 }
+                                // Small dead zone so the gesture doesn't twitch as fingers land.
+                                guard abs(v.magnification - 1) > 0.03 else { return }
                                 let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
                                 camera.setZoom(CGFloat(z))
                             }
