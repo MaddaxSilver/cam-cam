@@ -117,6 +117,9 @@ extension CameraManager {
                 }
 
                 let a = Double(max(0, min(0.35, grainAmt)))
+                if let g = physicalGrain(filtered, amount: CGFloat(a), fine: grainTex) {
+                    return g.cropped(to: previewExtent)
+                }
                 let blend = CIFilter.softLightBlendMode()
                 blend.inputImage = grainTex
                 blend.backgroundImage = filtered
@@ -2111,9 +2114,12 @@ extension CameraManager {
         }
     }
 
-    nonisolated(unsafe) static var _printKernel: CIColorKernel?? = nil
-    nonisolated static func printKernel() -> CIColorKernel? {
-        if let attempted = _printKernel { return attempted }
+    nonisolated(unsafe) static var _filmKernels: [String: CIColorKernel?] = [:]
+    nonisolated static let filmKernelLock = NSLock()
+    /// A colour kernel from FilmProcess.metallib (cached; nil if unavailable).
+    nonisolated static func filmKernel(_ name: String) -> CIColorKernel? {
+        filmKernelLock.lock(); defer { filmKernelLock.unlock() }
+        if let cached = _filmKernels[name] { return cached }
         var loaded: CIColorKernel? = nil
         #if targetEnvironment(simulator)
         let libName = "FilmProcess-sim"
@@ -2122,10 +2128,23 @@ extension CameraManager {
         #endif
         if let url = Bundle.main.url(forResource: libName, withExtension: "metallib"),
            let data = try? Data(contentsOf: url) {
-            loaded = try? CIColorKernel(functionName: "densityPrint", fromMetalLibraryData: data)
+            loaded = try? CIColorKernel(functionName: name, fromMetalLibraryData: data)
         }
-        _printKernel = .some(loaded)
+        _filmKernels[name] = .some(loaded)
         return loaded
+    }
+    nonisolated static func printKernel() -> CIColorKernel? { filmKernel("densityPrint") }
+
+    /// Physically-modelled grain (see FilmProcess.ci.metal). `fine` is the
+    /// per-grain noise; clumps are the same noise at 3× scale.
+    nonisolated func physicalGrain(_ input: CIImage, amount a: CGFloat, fine: CIImage) -> CIImage? {
+        guard let k = CameraManager.filmKernel("filmGrain") else { return nil }
+        let extent = input.extent
+        let coarse = fine.clampedToExtent()
+            .transformed(by: CGAffineTransform(scaleX: 3, y: 3))
+            .applyingGaussianBlur(sigma: 1.2)
+            .cropped(to: extent)
+        return k.apply(extent: extent, arguments: [input, fine.cropped(to: extent), coarse, a * 1.2, 0.2])
     }
 
     /// Render `image` as a physical print process; nil if the kernel is missing.
@@ -2572,6 +2591,15 @@ extension CameraManager {
             .transformed(by: CGAffineTransform(translationX: ox, y: oy))
             .cropped(to: extent)
 
+        // Physical grain: grains sized ~1–2 px (bigger as the amount rises).
+        let grainSize = 1.0 + a * 3.0
+        if let g = physicalGrain(input, amount: a,
+                                 fine: rawNoise.transformed(by: CGAffineTransform(translationX: ox, y: oy))
+                                     .transformed(by: CGAffineTransform(scaleX: grainSize, y: grainSize))
+                                     .cropped(to: extent)) {
+            return g.cropped(to: extent)
+        }
+
         // Monochrome, centred at 0.5 so it both lightens and darkens
         let mono = CIFilter.colorControls()
         mono.inputImage = noise
@@ -2777,6 +2805,22 @@ extension CameraManager {
     }
 
     nonisolated func applyHalation(input: CIImage, amount: Float) -> CIImage {
+        // Physical halation: only light above the highlight threshold, spread
+        // at two radii, added back as red-orange light in linear space.
+        if let ex = CameraManager.filmKernel("halationExtract"),
+           let ap = CameraManager.filmKernel("halationApply") {
+            let extent = input.extent
+            let size = Double(max(extent.width, extent.height))
+            if let energy = ex.apply(extent: extent, arguments: [input, 0.72]) {
+                let e = energy.clampedToExtent()
+                let near = e.applyingGaussianBlur(sigma: size * 0.004).cropped(to: extent)
+                let far = e.applyingGaussianBlur(sigma: size * 0.03).cropped(to: extent)
+                if let out = ap.apply(extent: extent, arguments: [input, energy, near, far, CGFloat(amount) * 2.2,
+                                                                  CIVector(x: 1.0, y: 0.32, z: 0.08)]) {
+                    return out
+                }
+            }
+        }
         let redExtract = CIFilter.colorMatrix()
         redExtract.inputImage = input
         redExtract.rVector = CIVector(x: 1, y: 0, z: 0, w: 0)

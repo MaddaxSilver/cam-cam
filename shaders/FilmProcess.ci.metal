@@ -67,4 +67,48 @@ float4 densityPrint(sample_t s, sample_t noise,
     return float4(linearToSrgb(outLin), s.a);
 }
 
+// MARK: - Film grain
+//
+// Grain is silver/dye clumps: exposure varies a little from clump to clump.
+// We vary exposure in STOPS (multiplicative, like density), with two noise
+// scales (single grains + clumps). Visibility follows a film-like envelope:
+// strongest in the mid-tones, gentler in deep shadow and bright highlight.
+// `color` > 0 lets each dye layer vary a little on its own (colour film).
+float4 filmGrain(sample_t s, sample_t fine, sample_t coarse, float amount, float color)
+{
+    float3 lin = srgbToLinear(s.rgb);
+    float l = clamp(dot(s.rgb, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    float env = pow(clamp(4.0 * l * (1.0 - l), 0.0, 1.0), 0.6) * 0.85 + 0.15;
+    float n = (fine.r - 0.5) * 0.75 + (coarse.r - 0.5) * 0.55;
+    float3 nc = float3(fine.r, fine.g, fine.b) - 0.5;
+    float3 stops = (float3(n) * (1.0 - color) + nc * color) * amount * env * 2.0;
+    return float4(linearToSrgb(lin * exp2(stops)), s.a);
+}
+
+// MARK: - Halation
+//
+// Bright light passes through the emulsion, reflects off the film base and
+// re-exposes the red-sensitive layer: a red-orange glow around highlights
+// only. Step 1 extracts highlight ENERGY (linear, above a threshold); it is
+// then blurred at two radii outside the kernel; step 2 adds it back as light.
+float4 halationExtract(sample_t s, float threshold)
+{
+    float3 lin = srgbToLinear(s.rgb);
+    float l = dot(lin, float3(0.2126, 0.7152, 0.0722));
+    float e = max(l - threshold, 0.0) / max(1.0 - threshold, 1e-3);
+    return float4(e, e, e, 1.0);
+}
+
+float4 halationApply(sample_t s, sample_t energy, sample_t nearHalo, sample_t farHalo, float amount, float3 tint)
+{
+    float3 lin = srgbToLinear(s.rgb);
+    // Tight core plus a wide skirt, like light scattering in the base —
+    // but only the SPILL beyond the bright source, so large bright areas
+    // don't get a warm cast, only their edges glow.
+    float halo = nearHalo.r * 0.5 + farHalo.r * 0.5;
+    float spill = max(halo - energy.r * 0.85, 0.0);
+    lin += tint * spill * amount;
+    return float4(linearToSrgb(lin), s.a);
+}
+
 }}
