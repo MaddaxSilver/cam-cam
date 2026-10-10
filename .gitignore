@@ -34,3 +34,4 @@ CharacterChat/
 
 # ── Local scratch / secrets ────────────────────────────
 *.log
+audit/
