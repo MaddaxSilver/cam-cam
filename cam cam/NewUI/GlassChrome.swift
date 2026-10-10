@@ -17,10 +17,11 @@ import Photos
 enum CaptureMode: String { case photo, video }
 
 enum ControlKind: String, CaseIterable, Identifiable {
-    case halation, exposure, effects, modes, view
+    case style, halation, exposure, effects, modes, view
     var id: String { rawValue }
     var title: String {
         switch self {
+        case .style: "Style"
         case .halation: "Halation"
         case .exposure: "Exposure"
         case .effects: "Effects"
@@ -30,6 +31,7 @@ enum ControlKind: String, CaseIterable, Identifiable {
     }
     var symbol: String {
         switch self {
+        case .style: "paintpalette"
         case .halation: "sun.max"
         case .exposure: "plusminus.circle"
         case .effects: "sparkles"
@@ -69,6 +71,7 @@ struct GlassChrome<Shutter: View>: View {
     @State private var tones = FilmToneStore.shared
     @State private var thumbToken = 0
     @State private var smartAE = SmartExposure.shared
+    @State private var styleSettings = StyleSettings.shared
     @State private var showSetPicker = false
     @AppStorage("cc_arcSet") private var arcSetRaw = ArcSet.all.rawValue
     private var arcSet: ArcSet { ArcSet(rawValue: arcSetRaw) ?? .all }
@@ -136,6 +139,7 @@ struct GlassChrome<Shutter: View>: View {
         .animation(.snappy(duration: 0.3), value: showControls)
         .animation(.snappy(duration: 0.3), value: showGrain)
         .onChange(of: showControls) { _, on in if on { showGrain = false } }
+        .onChange(of: styleOn) { _, on in if !on && active == .style { active = .exposure } }
         .animation(.snappy(duration: 0.2), value: scrubStartMM == nil)
         .task(id: arcItems.count) { tones.ensure(arcItems, camera: camera) }
         .onChange(of: camera.isCapturing) { _, capturing in
@@ -335,7 +339,7 @@ struct GlassChrome<Shutter: View>: View {
     private var controlsRow: some View {
         GlassEffectContainer(spacing: 8) {
             HStack(spacing: 8) {
-                ForEach(ControlKind.allCases) { k in
+                ForEach(visibleKinds) { k in
                     let on = k == active
                     Button { active = k } label: {
                         Image(systemName: k.symbol).font(.system(size: 17, weight: .medium))
@@ -361,8 +365,18 @@ struct GlassChrome<Shutter: View>: View {
         }
     }
 
+    private var styleOn: Bool { camera.activeCustomSim == nil && camera.selectedSim.styleKind != nil }
+    private var visibleKinds: [ControlKind] { ControlKind.allCases.filter { $0 != .style || styleOn } }
+
     @ViewBuilder private var controlPanel: some View {
         switch active {
+        case .style:
+            VStack(spacing: 10) {
+                StylePad(settings: styleSettings, name: camera.selectedSim.label)
+                GlassRuler(title: "Palette", valueText: "\(Int(styleSettings.palette * 100))%",
+                           value: Binding(get: { Double(styleSettings.palette) }, set: { styleSettings.palette = Float($0) }),
+                           range: 0...1)
+            }
         case .halation:
             GlassRuler(title: "Halation", valueText: camera.halationEnabled ? "\(Int(camera.halationAmount * 100))" : "Off",
                        isOn: $camera.halationEnabled,
@@ -550,9 +564,9 @@ struct GlassChrome<Shutter: View>: View {
     private var grainButton: some View {
         Button { showGrain.toggle(); if showGrain { showControls = false } } label: {
             Image(systemName: camera.grainEnabled ? "circle.grid.3x3.fill" : "circle.grid.3x3")
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(showGrain ? .black : (camera.grainEnabled ? .yellow : .white))
-                .frame(width: 48, height: 48)
+                .frame(width: 40, height: 40)
                 .background(Circle().fill(showGrain ? Color.yellow : .clear))
         }
         .buttonStyle(.plain)
@@ -590,7 +604,8 @@ struct GlassChrome<Shutter: View>: View {
                         }
                         shutterForMode
                         // Grain sits just right of the shutter.
-                        grainButton.offset(x: 80)
+                        // Grain hugs the shutter as its accessory (10 pt gap).
+                        grainButton.offset(x: 42 + 10 + 20)
                     }
                 }
             }
@@ -663,7 +678,8 @@ struct GlassChrome<Shutter: View>: View {
         switch arcSet {
         case .all: return arcItems
         case .pinned: return arcItems.filter { favorites.isFavorite($0.key) }
-        case .builtIn: return arcItems.filter { $0.sim != nil }
+        case .builtIn: return arcItems.filter { $0.sim != nil && $0.sim?.styleKind == nil }
+        case .styles: return arcItems.filter { $0.sim?.styleKind != nil }
         case .custom: return arcItems.filter { $0.custom != nil && $0.custom?.lutFilename == nil }
         case .luts: return arcItems.filter { $0.custom?.lutFilename != nil }
         }
@@ -836,13 +852,14 @@ struct LastShotThumb: View {
 // MARK: - Dial set
 
 enum ArcSet: String, CaseIterable, Identifiable {
-    case all, pinned, builtIn, custom, luts
+    case all, pinned, builtIn, styles, custom, luts
     var id: String { rawValue }
     var title: String {
         switch self {
         case .all: "All films"
         case .pinned: "Pinned"
         case .builtIn: "Built-in"
+        case .styles: "Styles"
         case .custom: "Your films"
         case .luts: "LUTs"
         }
@@ -852,6 +869,7 @@ enum ArcSet: String, CaseIterable, Identifiable {
         case .all: "film.stack"
         case .pinned: "star.fill"
         case .builtIn: "film"
+        case .styles: "paintpalette.fill"
         case .custom: "paintbrush.fill"
         case .luts: "cube.fill"
         }
@@ -923,5 +941,73 @@ struct FocusPulse: View {
             .animation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true), value: on)
             .onAppear { on = true }
             .accessibilityLabel("Focusing")
+    }
+}
+
+
+// MARK: - Style pad
+
+/// Apple-style 2D pad: drag up/down for Tone, left/right for Colour.
+struct StylePad: View {
+    @Bindable var settings: StyleSettings
+    let name: String
+
+    var body: some View {
+        HStack(spacing: 14) {
+            GeometryReader { geo in
+                let w = geo.size.width, h = geo.size.height
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(.white.opacity(0.08))
+                    // grid
+                    Path { p in
+                        for i in 1..<4 {
+                            let x = w * CGFloat(i) / 4, y = h * CGFloat(i) / 4
+                            p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: h))
+                            p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: w, y: y))
+                        }
+                    }
+                    .stroke(.white.opacity(0.15), lineWidth: 1)
+                    Circle().fill(Color.yellow)
+                        .frame(width: 16, height: 16)
+                        .shadow(color: .black.opacity(0.4), radius: 3)
+                        .position(x: CGFloat(settings.color + 1) / 2 * w,
+                                  y: CGFloat(1 - settings.tone) / 2 * h)
+                }
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+                    settings.color = Float(min(max(g.location.x / w, 0), 1) * 2 - 1)
+                    settings.tone = Float(1 - min(max(g.location.y / h, 0), 1) * 2)
+                })
+                .onTapGesture(count: 2) { settings.tone = 0; settings.color = 0 }
+            }
+            .frame(width: 112, height: 112)
+            .accessibilityElement()
+            .accessibilityLabel("Style pad")
+            .accessibilityValue(String(format: "Tone %+.0f, Colour %+.0f", settings.tone * 100, settings.color * 100))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(name.uppercased())
+                    .font(.system(size: 13, weight: .bold)).tracking(0.8)
+                    .foregroundStyle(.yellow)
+                row("Tone", settings.tone)
+                row("Colour", settings.color)
+                Text("Drag the pad. Double-tap to reset.")
+                    .font(.system(size: 11)).foregroundStyle(.white.opacity(0.7))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+    }
+
+    private func row(_ title: String, _ v: Float) -> some View {
+        HStack {
+            Text(title).foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            Text(String(format: "%+.0f", v * 100)).foregroundStyle(.white).monospacedDigit()
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .frame(width: 120)
     }
 }

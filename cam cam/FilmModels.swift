@@ -183,7 +183,32 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
     case tintype, platinum, vanDyke, saltPrint
     case retroChrome, neonNoir, circuitBent, circuitBentHeavy
 
+    // Styles (cam cam's take on Photographic Styles)
+    case styleAmber, styleGold, styleRoseGold, styleNeutral, styleCoolRose, styleVibrant, styleNatural, styleLuminous, styleDramatic, styleQuiet, styleCozy, styleEthereal, styleMutedBW, styleStarkBW
+
     var id: String { rawValue }
+
+    /// Non-nil for the Styles (rendered by StyleEngine, skin-aware).
+    var styleKind: StyleKind? {
+        switch self {
+        case .styleAmber: return .amber
+        case .styleGold: return .gold
+        case .styleRoseGold: return .roseGold
+        case .styleNeutral: return .neutral
+        case .styleCoolRose: return .coolRose
+        case .styleVibrant: return .vibrant
+        case .styleNatural: return .natural
+        case .styleLuminous: return .luminous
+        case .styleDramatic: return .dramatic
+        case .styleQuiet: return .quiet
+        case .styleCozy: return .cozy
+        case .styleEthereal: return .ethereal
+        case .styleMutedBW: return .mutedBW
+        case .styleStarkBW: return .starkBW
+        default: return nil
+        }
+    }
+
     var label: String {
         switch self {
         case .none:           return "None"
@@ -250,6 +275,20 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
         case .platinum:             return "Platinum"
         case .vanDyke:              return "Van Dyke"
         case .saltPrint:            return "Salt Print"
+        case .styleAmber: return "Amber"
+        case .styleGold: return "Gold"
+        case .styleRoseGold: return "Rose Gold"
+        case .styleNeutral: return "Neutral"
+        case .styleCoolRose: return "Cool Rose"
+        case .styleVibrant: return "Vibrant"
+        case .styleNatural: return "Natural"
+        case .styleLuminous: return "Luminous"
+        case .styleDramatic: return "Dramatic"
+        case .styleQuiet: return "Quiet"
+        case .styleCozy: return "Cozy"
+        case .styleEthereal: return "Ethereal"
+        case .styleMutedBW: return "Muted B&W"
+        case .styleStarkBW: return "Stark B&W"
         case .retroChrome:          return "RetroChrm"
         case .neonNoir:             return "Neon Noir"
         case .circuitBent:          return "Bent"

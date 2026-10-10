@@ -2825,6 +2825,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
+        // Styles: keep a live person mask fresh (~6 Hz, off this queue)
+        if cachedSim.styleKind != nil {
+            SkinMask.shared.update(pixelBuffer, time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)))
+        }
+
         // Smart auto exposure (throttled internally to ~5 Hz)
         SmartExposure.shared.process(pixelBuffer,
                                      time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),

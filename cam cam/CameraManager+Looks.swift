@@ -41,6 +41,11 @@ extension CameraManager {
         } else {
             img = applyFilmSim(to: input, sim: sim, grainEnabled: cachedGrainEnabled,
                                grain: cachedGrainAmount, digiCamQuality: cachedDigiCamQuality)
+            if let kind = sim.styleKind {
+                img = StyleEngine.apply(img, kind: kind, tone: StyleSettings.cTone, color: StyleSettings.cColor,
+                                        palette: StyleSettings.cPalette,
+                                        mask: SkinMask.shared.live(for: img.extent))
+            }
         }
         // Under thermal pressure, keep the base look but drop the expensive
         // extras from the live path (captures are unaffected).
@@ -149,6 +154,7 @@ extension CameraManager {
         r.filmScratches = pendingFilmScratchesEnabled
         r.randomization = pendingRandomizationEnabled
         r.randomSeed = pendingRandomSeed
+        r.styleTone = StyleSettings.cTone; r.styleColor = StyleSettings.cColor; r.stylePalette = StyleSettings.cPalette
         return r
     }
 
@@ -172,6 +178,7 @@ extension CameraManager {
         r.filmScratches = cachedFilmScratches
         r.randomization = cachedFilmRandomization
         r.randomSeed = seed
+        r.styleTone = StyleSettings.cTone; r.styleColor = StyleSettings.cColor; r.stylePalette = StyleSettings.cPalette
         return r
     }
 
@@ -212,6 +219,12 @@ extension CameraManager {
         } else {
             image = applyFilmSim(to: input, sim: r.sim, grainEnabled: r.grainEnabled,
                                  grain: r.grain, digiCamQuality: r.digiCamQuality)
+            if let kind = r.sim.styleKind {
+                // Stills get an accurate person mask of their own.
+                image = StyleEngine.apply(image, kind: kind, tone: r.styleTone, color: r.styleColor,
+                                          palette: r.stylePalette,
+                                          mask: SkinMask.accurate(input))
+            }
         }
 
         // Live portrait depth blur — applied BEFORE film sim effects so bokeh looks natural
@@ -1339,6 +1352,9 @@ extension CameraManager {
             dagVig.intensity = 2.2
             dagVig.radius = 0.65
             return dagVig.outputImage ?? dagCurved
+
+        case .styleAmber, .styleGold, .styleRoseGold, .styleNeutral, .styleCoolRose, .styleVibrant, .styleNatural, .styleLuminous, .styleDramatic, .styleQuiet, .styleCozy, .styleEthereal, .styleMutedBW, .styleStarkBW:
+            return image   // styles are applied by StyleEngine after the sim pass
 
         case .tintype:
             // Wet-collodion tintype (1856): blue-only silver image on black

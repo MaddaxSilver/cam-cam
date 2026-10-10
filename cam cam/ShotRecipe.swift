@@ -47,6 +47,11 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
     /// Per-shot seed so leaks/scratches/randomization re-render identically.
     var randomSeed: UInt64 = 0
 
+    // Style controls (only used when `sim` is a Style)
+    var styleTone: Float = 0
+    var styleColor: Float = 0
+    var stylePalette: Float = 1
+
     /// A recipe that changes nothing (no sim, no effects).
     var isIdentity: Bool {
         sim == .none && custom == nil && !grainEnabled && !crosstalkEnabled
@@ -67,6 +72,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         case crosstalkEnabled, crosstalk, halationEnabled, halation, rolloffEnabled, rolloff
         case pushPullEnabled, pushPull, anamorphicFlare, lightArtifacts, filmScratches
         case randomization, randomSeed
+        case styleTone, styleColor, stylePalette
     }
 
     init() {}
@@ -93,6 +99,9 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         filmScratches    = v(.filmScratches, false)
         randomization    = v(.randomization, false)
         randomSeed       = v(.randomSeed, UInt64(0))
+        styleTone        = v(.styleTone, Float(0))
+        styleColor       = v(.styleColor, Float(0))
+        stylePalette     = v(.stylePalette, Float(1))
     }
 
     func encoded() -> Data? { try? JSONEncoder().encode(self) }
