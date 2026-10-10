@@ -41,6 +41,7 @@ struct SonyView: View {
     /// When true, the diagnostic log overlay is visible. Useful since the
     /// phone is on the camera's WiFi and not reachable from Xcode.
     @State private var showDebugLog = false
+    @AppStorage("cc_classicUI") private var classicUI = false
     /// File picker presentation for .cube LUT import.
     @State private var showLUTImporter = false
     /// Last LUT import error message — shown briefly in shutterStatus if set.
@@ -369,7 +370,7 @@ struct SonyView: View {
                 }
 
                 // Live histogram (measured pre-preview-lift)
-                if sony.showHistogram, !cleanMode, !sony.liveHistogram.isEmpty, sony.liveViewImage != nil {
+                if classicUI, sony.showHistogram, !cleanMode, !sony.liveHistogram.isEmpty, sony.liveViewImage != nil {
                     HistogramView(bins: sony.liveHistogram)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .padding(.top, 70).padding(.leading, 14)
@@ -395,77 +396,88 @@ struct SonyView: View {
                         .transition(.opacity)
                 }
 
-                // Controls — INSIDE the ZStack so they respect the safe area
-                // (no .ignoresSafeArea on this VStack or its parent).  In
-                // landscape, SwiftUI auto-insets these away from the notch.
-                VStack(spacing: 0) {
-                    connectedTopBar
-                        // Use the iOS interface orientation (not raw tilt) so
-                        // the padding doesn't jitter when the user composes a
-                        // slightly-tilted shot. Portrait needs ~80 pt to clear
-                        // the dynamic island; landscape only needs ~16 pt.
-                        .padding(.top, isInterfaceLandscape ? 16 : 80)
+                if classicUI {
+                    // Controls — INSIDE the ZStack so they respect the safe area
+                    // (no .ignoresSafeArea on this VStack or its parent).  In
+                    // landscape, SwiftUI auto-insets these away from the notch.
+                    VStack(spacing: 0) {
+                        connectedTopBar
+                            // Use the iOS interface orientation (not raw tilt) so
+                            // the padding doesn't jitter when the user composes a
+                            // slightly-tilted shot. Portrait needs ~80 pt to clear
+                            // the dynamic island; landscape only needs ~16 pt.
+                            .padding(.top, isInterfaceLandscape ? 16 : 80)
 
-                    if showViewMenu {
-                        viewMenuDropdown
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
-                    Spacer()
-
-                    if !cleanMode {
-                        VStack(spacing: 14) {
-                            cameraInfoRow
-                            filmSimRow
-                            if !sony.shutterStatus.isEmpty {
-                                Text(sony.shutterStatus)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(
-                                        sony.shutterStatus.hasPrefix("❌")
-                                            ? Color.red.opacity(0.85)
-                                            : sony.shutterStatus.hasPrefix("✅")
-                                                ? Color.green.opacity(0.85)
-                                                : Color.white.opacity(0.55)
-                                    )
-                                    .lineLimit(2)
-                                    .multilineTextAlignment(.center)
-                                    .padding(.horizontal, 24)
-                                    .transition(.opacity)
-                            }
-                            if sony.downloadQueueDepth > 0 {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "tray.and.arrow.down.fill")
-                                        .font(.system(size: 10))
-                                    Text("\(sony.downloadQueueDepth) queued")
-                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                }
-                                .foregroundStyle(Color.orange.opacity(0.9))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(
-                                    Capsule().fill(Color.orange.opacity(0.12))
-                                )
-                                .overlay(
-                                    Capsule().stroke(Color.orange.opacity(0.35), lineWidth: 0.5)
-                                )
-                                .transition(.scale.combined(with: .opacity))
-                                .animation(.easeInOut(duration: 0.2), value: sony.downloadQueueDepth)
-                            }
-                            sonyShutterRow
-                                .padding(.bottom, 8)
+                        if showViewMenu {
+                            viewMenuDropdown
+                                .transition(.opacity.combined(with: .move(edge: .top)))
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.top, 16)
-                        .background(
-                            LinearGradient(
-                                colors: [Color.black.opacity(0), Color.black.opacity(0.65)],
-                                startPoint: .top, endPoint: .bottom
+
+                        Spacer()
+
+                        if !cleanMode {
+                            VStack(spacing: 14) {
+                                cameraInfoRow
+                                filmSimRow
+                                if !sony.shutterStatus.isEmpty {
+                                    Text(sony.shutterStatus)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(
+                                            sony.shutterStatus.hasPrefix("❌")
+                                                ? Color.red.opacity(0.85)
+                                                : sony.shutterStatus.hasPrefix("✅")
+                                                    ? Color.green.opacity(0.85)
+                                                    : Color.white.opacity(0.55)
+                                        )
+                                        .lineLimit(2)
+                                        .multilineTextAlignment(.center)
+                                        .padding(.horizontal, 24)
+                                        .transition(.opacity)
+                                }
+                                if sony.downloadQueueDepth > 0 {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "tray.and.arrow.down.fill")
+                                            .font(.system(size: 10))
+                                        Text("\(sony.downloadQueueDepth) queued")
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    }
+                                    .foregroundStyle(Color.orange.opacity(0.9))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        Capsule().fill(Color.orange.opacity(0.12))
+                                    )
+                                    .overlay(
+                                        Capsule().stroke(Color.orange.opacity(0.35), lineWidth: 0.5)
+                                    )
+                                    .transition(.scale.combined(with: .opacity))
+                                    .animation(.easeInOut(duration: 0.2), value: sony.downloadQueueDepth)
+                                }
+                                sonyShutterRow
+                                    .padding(.bottom, 8)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.top, 16)
+                            .background(
+                                LinearGradient(
+                                    colors: [Color.black.opacity(0), Color.black.opacity(0.65)],
+                                    startPoint: .top, endPoint: .bottom
+                                )
+                                .allowsHitTesting(false)
                             )
-                            .allowsHitTesting(false)
-                        )
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    SonyGlassChrome(sony: sony, camera: camera, customSimStore: customSimStore,
+                                    showGrid: $showGrid, rotationLocked: $rotationLocked,
+                                    showDebugLog: $showDebugLog,
+                                    onClose: { dismiss() },
+                                    onOpenLast: {
+                                        if let p = recentPhotos.first { selectedPhoto = PhotoToView(image: p) }
+                                    },
+                                    onImportLUT: { showLUTImporter = true })
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .ignoresSafeArea()
@@ -1316,17 +1328,160 @@ struct SonyView: View {
     private var setupView: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+            if classicUI {
+                ScrollView {
+                    VStack(spacing: 24) {
+                        headerSection
+                        connectionSection
+                        instructionsSection
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 20)
+                    .padding(.bottom, 40)
+                }
+            } else {
+                glassSetup
+            }
+        }
+    }
+
+    @State private var showAdvanced = false
+
+    /// Connect screen in the glass style: three plain steps, a status card,
+    /// the camera IP tucked under Advanced, one big Connect button.
+    private var glassSetup: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.down").font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white).frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Circle())
+                .accessibilityLabel("Back to the iPhone camera")
+                Spacer()
+                Button { withAnimation { showAdvanced.toggle() } } label: {
+                    Text(showAdvanced ? "Done" : "Advanced").font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white).padding(.horizontal, 14).frame(height: 36)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Capsule())
+            }
+            .padding(.horizontal, 16).padding(.top, 58)
 
             ScrollView {
-                VStack(spacing: 24) {
-                    headerSection
-                    connectionSection
-                    instructionsSection
+                VStack(spacing: 18) {
+                    VStack(spacing: 10) {
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 34, weight: .medium)).foregroundStyle(.white)
+                            .frame(width: 84, height: 84)
+                            .glassEffect(.regular, in: Circle())
+                        Text("Connect your Sony").font(.system(size: 26, weight: .bold))
+                        Text("Three steps the first time. After that it reconnects on its own.")
+                            .font(.system(size: 15)).foregroundStyle(.white.opacity(0.7))
+                            .multilineTextAlignment(.center).padding(.horizontal, 30)
+                    }
+                    .padding(.top, 20)
+
+                    VStack(spacing: 0) {
+                        stepRow(1, "On the camera", "MENU › Network › Ctrl w/ Smartphone › Connect")
+                        Divider().overlay(Color.white.opacity(0.1))
+                        stepRow(2, "On the iPhone", "Settings › Wi-Fi › join the camera (DIRECT-…)")
+                        Divider().overlay(Color.white.opacity(0.1))
+                        stepRow(3, "Tap Connect", "Allow Local Network if iOS asks")
+                    }
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+
+                    statusCard
+
+                    if showAdvanced {
+                        HStack(spacing: 8) {
+                            Image(systemName: "network").foregroundStyle(.white.opacity(0.6))
+                            TextField("Camera address (e.g. http://192.168.122.1:10000)", text: $sony.manualIP)
+                                .font(.system(size: 13, design: .monospaced))
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                                .keyboardType(.URL)
+                        }
+                        .padding(.horizontal, 14).frame(height: 48)
+                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .transition(.opacity)
+                    }
                 }
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 40)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 20)
             }
+
+            Group {
+                if case .searching = sony.state {
+                    Button { sony.disconnect() } label: {
+                        Text("Cancel").font(.system(size: 17, weight: .semibold)).foregroundStyle(.white)
+                            .frame(maxWidth: .infinity).frame(height: 54)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: Capsule())
+                } else {
+                    Button {
+                        sony.selectedSim = camera.selectedSim
+                        sony.activeCustomSim = camera.activeCustomSim
+                        sony.connect()
+                    } label: {
+                        Text("Connect").font(.system(size: 17, weight: .semibold)).foregroundStyle(.black)
+                            .frame(maxWidth: .infinity).frame(height: 54)
+                            .background(Capsule().fill(Color.yellow))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16).padding(.bottom, 34)
+        }
+    }
+
+    private func stepRow(_ n: Int, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Text("\(n)").font(.system(size: 14, weight: .bold)).foregroundStyle(.black)
+                .frame(width: 28, height: 28).background(Circle().fill(Color.yellow))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 16, weight: .semibold))
+                Text(detail).font(.system(size: 14)).foregroundStyle(.white.opacity(0.7))
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+    }
+
+    @ViewBuilder private var statusCard: some View {
+        switch sony.state {
+        case .disconnected:
+            EmptyView()
+        case .searching:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    ProgressView().tint(.yellow)
+                    Text("Looking for the camera…").font(.system(size: 15, weight: .semibold))
+                }
+                ForEach(Array(sony.diagnosticLog.suffix(4))) { e in
+                    Text(e.text).font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.6)).lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        case .connected(let model):
+            Label("Connected to \(model)", systemImage: "checkmark.circle.fill")
+                .font(.system(size: 15, weight: .semibold)).foregroundStyle(.green)
+                .frame(maxWidth: .infinity).padding(14)
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        case .error(let msg):
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Couldn't connect", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 15, weight: .semibold)).foregroundStyle(.orange)
+                Text(msg).font(.system(size: 13)).foregroundStyle(.white.opacity(0.8))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         }
     }
 

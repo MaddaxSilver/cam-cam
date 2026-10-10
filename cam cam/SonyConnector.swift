@@ -107,16 +107,25 @@ final class SonyDiscovery: NSObject {
         }
 
         for pass in 1...2 {
-            for base in candidates {
-                guard running, !Task.isCancelled else { return }
-                log(pass == 1 ? "Trying \(base)…" : "Retry \(base)…")
-                let (device, error) = await SonyDevice.probeWithError(baseURL: base)
-                if let device {
-                    log("✓ Found \(device.model) at \(base)")
-                    onDeviceFound?(device)
-                    return
+            guard running, !Task.isCancelled else { return }
+            // Probe every candidate at once; first camera to answer wins.
+            // (One at a time with 3 s timeouts took up to ~50 s.)
+            log(pass == 1 ? "Trying \(candidates.count) addresses…" : "Retrying…")
+            let found: SonyDevice? = await withTaskGroup(of: (String, SonyDevice?, String?).self) { group in
+                for base in candidates {
+                    group.addTask { let r = await SonyDevice.probeWithError(baseURL: base); return (base, r.0, r.1) }
                 }
-                log("✗ \(error ?? "no response")")
+                for await (base, device, error) in group {
+                    if let device { group.cancelAll(); return device }
+                    log("✗ \(base): \(error ?? "no response")")
+                }
+                return nil
+            }
+            if let device = found {
+                guard running, !Task.isCancelled else { return }
+                log("✓ Found \(device.model) at \(device.baseURL)")
+                onDeviceFound?(device)
+                return
             }
             if pass == 1 {
                 log("Pass 1 done — retrying in 2 s…")
@@ -247,7 +256,11 @@ struct SonyAPIClient {
 
     static func get(urlString: String) async throws -> Data {
         guard let url = URL(string: urlString) else { throw SonyAPIError.invalidURL }
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.shared.data(from: url)
+        // A 404/500 page isn't a photo — fail clearly instead of "render failed".
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw SonyAPIError.apiError(http.statusCode, "HTTP \(http.statusCode)")
+        }
         return data
     }
 }
@@ -425,6 +438,8 @@ final class SonyConnector {
     var evMax: Int = 9
     var evStep: Int = 1
     var evRawValue: Int = 0
+    /// EV per raw unit: ⅓ stop (step index 1) or ½ stop (step index 2).
+    var evDivisor: Float { evStep == 2 ? 2 : 3 }
 
     /// Optional manual IP override.
     var manualIP: String = ""
@@ -636,19 +651,24 @@ final class SonyConnector {
             // This matches Imaging Edge Mobile's behavior exactly (confirmed
             // via packet capture).
             var first = true
+            var failures = 0
             while !Task.isCancelled {
-                await self?.pollEvent(camURL: camURL, longPoll: !first)
+                let ok = await self?.pollEvent(camURL: camURL, longPoll: !first) ?? false
                 first = false
-                // No fixed sleep — long-poll itself blocks on the server.
-                // Tiny pause to avoid tight error loops if the call errors fast.
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                // Long-poll blocks on the server, so a success needs no pause.
+                // When the camera is unreachable calls fail instantly — back off
+                // (0.25 → 4 s) instead of hammering it ten times a second.
+                failures = ok ? 0 : min(failures + 1, 5)
+                let wait: UInt64 = ok ? 50_000_000 : UInt64(250_000_000) << UInt64(max(failures - 1, 0))
+                try? await Task.sleep(nanoseconds: min(wait, 4_000_000_000))
             }
         }
     }
 
     /// getEvent — long-poll (true) blocks server-side until state changes;
     /// short-poll (false) returns the full current state immediately.
-    private func pollEvent(camURL: String, longPoll: Bool) async {
+    @discardableResult
+    private func pollEvent(camURL: String, longPoll: Bool) async -> Bool {
         let result: [String: Any]
         do {
             result = try await SonyAPIClient.call(
@@ -661,10 +681,10 @@ final class SonyConnector {
                 timeout: longPoll ? 35 : 5
             )
         } catch {
-            return
+            return false
         }
 
-        guard let results = result["result"] as? [Any] else { return }
+        guard let results = result["result"] as? [Any] else { return true }
 
         // Camera status, settings + candidates
         for slot in results {
@@ -693,16 +713,17 @@ final class SonyConnector {
                     apertureCandidates = arr.compactMap(stringValue)
                 }
             case "exposureCompensation":
+                // Step index 1 = ⅓ EV per unit, 2 = ½ EV (read it first).
+                if let st = dict["stepIndexOfExposureCompensation"] as? Int { evStep = st }
                 if let v = dict["currentExposureCompensation"] as? Int {
-                    sonyEVComp = Float(v) / 3.0
+                    sonyEVComp = Float(v) / evDivisor
                     evRawValue = v
                 } else if let n = dict["currentExposureCompensation"] as? NSNumber {
-                    sonyEVComp = n.floatValue / 3.0
+                    sonyEVComp = n.floatValue / evDivisor
                     evRawValue = n.intValue
                 }
                 if let mx = dict["maxExposureCompensation"] as? Int { evMax = mx }
                 if let mn = dict["minExposureCompensation"] as? Int { evMin = mn }
-                if let st = dict["stepIndexOfExposureCompensation"] as? Int { evStep = st }
             default: break
             }
         }
@@ -735,7 +756,7 @@ final class SonyConnector {
                             enqueueDownload(url: url)
                             enqueuedAny = true
                         }
-                        if enqueuedAny { return }
+                        if enqueuedAny { return true }
                     }
                 }
                 continue
@@ -745,7 +766,7 @@ final class SonyConnector {
                 log("📷 New photo (direct URL)")
                 lastPhotoURL = url
                 enqueueDownload(url: url)
-                return
+                return true
             }
             guard let dict = slot as? [String: Any] else { continue }
             let type_ = dict["type"] as? String ?? ""
@@ -761,7 +782,7 @@ final class SonyConnector {
                     enqueueDownload(url: url)
                     enqueuedAny = true
                 }
-                if enqueuedAny { return }
+                if enqueuedAny { return true }
             }
 
             let isPhotoSlot = type_ == "shootedImages"
@@ -778,9 +799,10 @@ final class SonyConnector {
             if let url, isNewPhotoURL(url) {
                 lastPhotoURL = url
                 enqueueDownload(url: url)
-                return
+                return true
             }
         }
+        return true
     }
 
     /// Best-effort string extraction from JSON values (String / NSNumber / Int / Double).
@@ -1045,7 +1067,7 @@ final class SonyConnector {
                 )
                 await MainActor.run { [weak self] in
                     self?.evRawValue = rawSteps
-                    self?.sonyEVComp = Float(rawSteps) / 3.0
+                    self?.sonyEVComp = Float(rawSteps) / (self?.evDivisor ?? 3)
                     self?.log("✓ setExposureCompensation(\(rawSteps))")
                 }
             } catch {
@@ -1164,7 +1186,7 @@ final class SonyConnector {
             self.log("🔍 actTakePicture result: \(result)")
             if let resultValue = result["result"],
                let photoURL = self.firstImageURL(in: resultValue),
-               photoURL != self.lastPhotoURL {
+               self.isNewPhotoURL(photoURL) {
                 self.log("📸 Inline photo URL: \(photoURL)")
                 self.shutterStatus = "⬇️ Downloading…"
                 self.lastPhotoURL = photoURL
@@ -1194,7 +1216,7 @@ final class SonyConnector {
                     guard isPhoto else { continue }
                     self.log("📡 Poll \(attempt): slot type=\"\(type_)\"")
                     if let url = self.firstImageURL(in: dict as Any),
-                       url != self.lastPhotoURL {
+                       self.isNewPhotoURL(url) {
                         self.log("📸 Photo URL (event poll): \(url)")
                         self.shutterStatus = "⬇️ Downloading…"
                         self.lastPhotoURL = url
@@ -1284,6 +1306,9 @@ final class SonyConnector {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_700_000_000)
                 guard !Task.isCancelled else { break }
+                // A postview download already saturates the camera's Wi-Fi;
+                // skip the ping rather than compete with it.
+                if (self?.activeDownloads ?? 0) > 0 { continue }
                 _ = try? await SonyAPIClient.call(
                     endpoint: camURL, method: method, params: params, timeout: 3
                 )

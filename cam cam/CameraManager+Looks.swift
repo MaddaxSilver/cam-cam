@@ -226,7 +226,7 @@ extension CameraManager {
                 // Stills get an accurate person mask of their own.
                 image = StyleEngine.apply(image, kind: kind, tone: r.styleTone, color: r.styleColor,
                                           palette: r.stylePalette,
-                                          mask: SkinMask.accurate(input))
+                                          mask: flatten ? SkinMask.accurate(input) : SkinMask.fast(input))
             }
         }
         // Developed as a cross-process: slide chemistry on top of the film.

@@ -109,6 +109,9 @@ nonisolated final class SkinMask: @unchecked Sendable {
         return SkinMask.fit(m, to: extent)
     }
 
+    /// Fast person mask (live frames from the Sony / re-grade preview).
+    static func fast(_ image: CIImage) -> CIImage? { segment(image, quality: .fast) }
+
     /// Accurate person mask for a still.
     static func accurate(_ image: CIImage) -> CIImage? { segment(image, quality: .accurate) }
 
