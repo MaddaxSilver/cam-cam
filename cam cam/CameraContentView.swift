@@ -741,313 +741,10 @@ struct CameraContentView: View {
             if showViewMenu {
                 ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 0) {
-                    // Aspect ratios
-                    HStack(spacing: 6) {
-                        ForEach(AspectRatio.allCases) { ratio in
-                            let sel = camera.selectedAspectRatio == ratio
-                            Button {
-                                camera.selectedAspectRatio = ratio
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            } label: {
-                                Text(ratio.label)
-                                    .font(.system(size: 12, weight: sel ? .bold : .regular))
-                                    .foregroundStyle(sel ? .black : .white)
-                                    .padding(.horizontal, 9).padding(.vertical, 6)
-                                    .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.vertical, 10)
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // OVERLAYS section
-                    VStack(alignment: .leading, spacing: 8) {
-                        sectionHeader("OVERLAYS", isExpanded: $sectionOverlaysExpanded, accent: .cyan)
-                        if sectionOverlaysExpanded {
-                            HStack(spacing: 10) {
-                                viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
-                                viewMenuToggle(icon: "level", title: "Level", isOn: $camera.showLevel)
-                                viewMenuToggle(icon: "eye", title: "Peaking", isOn: $camera.showPeaking)
-                            }
-                            .padding(.bottom, 6)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                        }
-                    }
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // FILM EFFECTS section
-                    VStack(alignment: .leading, spacing: 8) {
-                        sectionHeader("FILM EFFECTS", isExpanded: $sectionFilmEffectsExpanded, accent: .purple)
-                        if sectionFilmEffectsExpanded {
-                            HStack(spacing: 8) {
-                                // Halation = red bloom around highlights on film stock
-                                viewMenuToggle(icon: "drop.fill", title: "Halation",
-                                               isOn: $camera.halationEnabled, accent: .red)
-                                // Crosstalk = channels bleeding into each other → purple
-                                viewMenuToggle(icon: "paintpalette", title: "Crosstalk",
-                                               isOn: $camera.crosstalkEnabled, accent: .purple)
-                                // Rolloff = highlight shoulder → cool blue
-                                viewMenuToggle(icon: "waveform", title: "Rolloff",
-                                               isOn: $camera.rolloffEnabled, accent: .blue)
-                            }
-                            HStack(spacing: 8) {
-                                // Anamorphic flares are classic cyan streaks
-                                viewMenuToggle(icon: "aqi.medium", title: "Flares",
-                                               isOn: $camera.anamorphicFlareEnabled, accent: .cyan)
-                                // Light leaks = warm orange exposure
-                                viewMenuToggle(icon: "light.beacon.max", title: "Light Leaks",
-                                               isOn: $camera.lightArtifactsEnabled, accent: .orange)
-                                // Scratches = chemical decay green tint
-                                viewMenuToggle(icon: "line.diagonal", title: "Scratches",
-                                               isOn: $camera.filmScratchesEnabled, accent: .green)
-                            }
-                            HStack(spacing: 8) {
-                                // Randomize = chaos → pink
-                                viewMenuToggle(icon: "dice", title: "Randomize",
-                                               isOn: $camera.filmRandomizationEnabled, accent: .pink)
-                            }
-                            // DigiCam quality — only visible when DigiCam is the
-                            // active sim. 5 = crustiest disposable, 20 = clean
-                            // mid-2000s compact. Linear interpolation between.
-                            if camera.selectedSim == .digiCam {
-                                // Magenta accent — distinct from the rest of FILM EFFECTS
-                                // (which use red/purple/blue/cyan/green/pink toggles)
-                                // and signals "this is a digital glitch control, not film."
-                                let digiAccent = Color(red: 1.0, green: 0.32, blue: 0.78)
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "camera.aperture")
-                                            .font(.system(size: 12))
-                                        Text(camera.digiCamQuality < 1
-                                             ? "DigiCam Quality: Off"
-                                             : "DigiCam Quality: \(Int(camera.digiCamQuality))")
-                                            .font(.system(size: 12, weight: .medium))
-                                    }
-                                    .foregroundStyle(camera.digiCamQuality < 1 ? .white.opacity(0.5) : digiAccent)
-                                    HStack(spacing: 8) {
-                                        Text("Off")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.white.opacity(0.5))
-                                        Slider(
-                                            value: Binding(
-                                                get: { Double(camera.digiCamQuality) },
-                                                set: { camera.digiCamQuality = Float($0) }
-                                            ),
-                                            in: 0...20,
-                                            step: 1
-                                        )
-                                        .tint(digiAccent)
-                                        Text("20")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.white.opacity(0.5))
-                                    }
-                                }
-                                .padding(.vertical, 4)
-                                .transition(.opacity.combined(with: .move(edge: .top)))
-                            }
-                            // Push / Pull
-                            VStack(alignment: .leading, spacing: 6) {
-                                let pushPullLabel: String = {
-                                    if camera.pushPullAmount == 0 { return "Push / Pull" }
-                                    if camera.pushPullAmount > 0 { return "Push +\(String(format: "%.0f", camera.pushPullAmount))" }
-                                    return "Pull \(String(format: "%.0f", camera.pushPullAmount))"
-                                }()
-                                Button {
-                                    camera.pushPullEnabled.toggle()
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "arrow.up.arrow.down.circle")
-                                            .font(.system(size: 12))
-                                        Text(pushPullLabel)
-                                            .font(.system(size: 12, weight: camera.pushPullEnabled ? .bold : .regular))
-                                    }
-                                    .foregroundStyle(camera.pushPullEnabled ? .yellow : .white)
-                                    .padding(.horizontal, 10).padding(.vertical, 6)
-                                    .background(Capsule().fill(camera.pushPullEnabled ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
-                                }
-                                .buttonStyle(.plain)
-                                if camera.pushPullEnabled {
-                                    HStack(spacing: 8) {
-                                        Text("Pull")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.white.opacity(0.5))
-                                        Slider(value: $camera.pushPullAmount, in: -2...3, step: 1)
-                                            .tint(.yellow)
-                                        Text("Push")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.white.opacity(0.5))
-                                    }
-                                    .transition(.opacity.combined(with: .move(edge: .top)))
-                                }
-                            }
-                            .padding(.bottom, 6)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                        }
-                    }
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // SHOOTING section
-                    VStack(alignment: .leading, spacing: 8) {
-                        sectionHeader("SHOOTING", isExpanded: $sectionShootingExpanded, accent: .orange)
-                        if sectionShootingExpanded {
-                            HStack(spacing: 10) {
-                                // Change any shot's look after the fact (original kept)
-                                Button {
-                                    showRegrade = true
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "wand.and.stars").font(.system(size: 12))
-                                        Text("Re-grade").font(.system(size: 12, weight: .medium))
-                                    }
-                                    .foregroundStyle(Color(red: 1.0, green: 0.82, blue: 0.2))
-                                    .padding(.horizontal, 10).padding(.vertical, 6)
-                                    .background(Capsule().fill(Color(red: 1.0, green: 0.82, blue: 0.2).opacity(0.18)))
-                                }
-                                .buttonStyle(.plain)
-                                viewMenuToggle(icon: "location.fill", title: "Geotag", isOn: $geotag.enabled, accent: .green)
-                                // Film roll: shoot blind, develop later
-                                Button {
-                                    showRollOptions = true
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                } label: {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "film").font(.system(size: 12))
-                                        Text(roll.isLoaded ? "\(roll.shotCount)/\(roll.capacity)" : "Roll")
-                                            .font(.system(size: 12, weight: .medium)).monospacedDigit()
-                                    }
-                                    .foregroundStyle(roll.isLoaded ? .black : .white)
-                                    .padding(.horizontal, 10).padding(.vertical, 6)
-                                    .background(Capsule().fill(roll.isLoaded ? Color.orange : Color.white.opacity(0.14)))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            HStack(spacing: 10) {
-                                viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
-
-                                // Portrait mode — shown whenever the session supports depth output.
-                                // Dimmed (not hidden) when the current lens doesn't produce depth
-                                // so the user can see it exists and knows to switch back to the
-                                // main camera to use it.
-                                if camera.portraitModeAvailable {
-                                    viewMenuToggle(icon: "person.fill", title: "Portrait", isOn: $camera.portraitModeEnabled)
-                                        .opacity(camera.currentDeviceSupportsDepth ? 1.0 : 0.4)
-                                        .allowsHitTesting(camera.currentDeviceSupportsDepth)
-                                }
-
-                                // Macro mode — swaps to physical ultrawide for ~2cm focus distance
-                                viewMenuToggle(icon: "leaf.fill", title: "Macro", isOn: $camera.macroModeEnabled)
-                            }
-                            HStack(spacing: 10) {
-                                // Lefty mode — moves shutter cluster over to where the EV dial sits
-                                viewMenuToggle(icon: "hand.point.left.fill", title: "Lefty", isOn: $camera.shutterOnLeft)
-                                // Unified zoom — single virtual triple camera, no preset swaps
-                                viewMenuToggle(icon: "rectangle.stack", title: "1-Lens", isOn: $camera.unifiedZoomMode)
-                            }
-
-                            Spacer().frame(height: 6)
-                        }
-                    }
-
-                    // DOUBLE EXPOSURE section (only when active)
-                    if camera.doubleExposureEnabled {
-                        Divider().background(Color.white.opacity(0.2))
-                        VStack(alignment: .leading, spacing: 8) {
-                            sectionHeader("DOUBLE EXPOSURE MASK", isExpanded: $sectionDoubleExpExpanded, accent: .pink)
-                            if sectionDoubleExpExpanded {
-                                HStack(spacing: 10) {
-                                    viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
-                                }
-                                if camera.doubleExposureMaskEnabled {
-                                    maskBrushControls
-                                        .padding(.bottom, 6)
-                                        .transition(.opacity.combined(with: .move(edge: .top)))
-                                }
-                            }
-                        }
-                    }
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // PHOTO QUALITY section
-                    VStack(alignment: .leading, spacing: 6) {
-                        sectionHeader("PHOTO QUALITY", isExpanded: $sectionQualityExpanded, accent: .mint)
-                        if sectionQualityExpanded {
-                            HStack(spacing: 6) {
-                                ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
-                                    let sel = camera.photoQuality == idx
-                                    Button {
-                                        camera.photoQuality = idx
-                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                    } label: {
-                                        Text(label)
-                                            .font(.system(size: 12, weight: sel ? .bold : .regular))
-                                            .foregroundStyle(sel ? .black : .white)
-                                            .padding(.horizontal, 9).padding(.vertical, 6)
-                                            .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(.bottom, 8)
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                        }
-                    }
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // Sony camera connector
-                    Button {
-                        showSonyView = true
-                        withAnimation(.spring(duration: 0.25)) { showViewMenu = false }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "camera.on.rectangle.fill")
-                                .font(.system(size: 13))
-                            Text("Sony Camera")
-                                .font(.system(size: 13, weight: .semibold))
-                            Spacer()
-                            Image(systemName: "wifi")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.3))
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.white.opacity(0.3))
-                        }
-                        .foregroundStyle(.yellow)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
-
-                    Divider().background(Color.white.opacity(0.2))
-
-                    // Custom film editor
-                    Button {
-                        showCustomSimEditor = true
-                        withAnimation(.spring(duration: 0.25)) { showViewMenu = false }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "paintbrush.pointed.fill")
-                                .font(.system(size: 13))
-                            Text("Custom Films")
-                                .font(.system(size: 13, weight: .semibold))
-                            Spacer()
-                            Text("\(customSimStore.simulations.count)")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.white.opacity(0.4))
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.white.opacity(0.3))
-                        }
-                        .foregroundStyle(.cyan)
-                        .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.plain)
+                    viewMenuFraming
+                    viewMenuEffects
+                    viewMenuShooting
+                    viewMenuQuality
                 }
                 .padding(.horizontal, 12)
                 } // end ScrollView content (VStack)
@@ -1063,6 +760,331 @@ struct CameraContentView: View {
         }
         .padding(.trailing, 20)
         } // end ZStack
+    }
+
+    // Split out of topBar's dropdown: one giant VStack made a view type so
+    // deeply nested that resolving it at runtime overflowed the stack.
+    @ViewBuilder private var viewMenuFraming: some View {
+        @Bindable var camera = camera
+        // Aspect ratios
+        HStack(spacing: 6) {
+            ForEach(AspectRatio.allCases) { ratio in
+                let sel = camera.selectedAspectRatio == ratio
+                Button {
+                    camera.selectedAspectRatio = ratio
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } label: {
+                    Text(ratio.label)
+                        .font(.system(size: 12, weight: sel ? .bold : .regular))
+                        .foregroundStyle(sel ? .black : .white)
+                        .padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 10)
+
+        Divider().background(Color.white.opacity(0.2))
+
+        // OVERLAYS section
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("OVERLAYS", isExpanded: $sectionOverlaysExpanded, accent: .cyan)
+            if sectionOverlaysExpanded {
+                HStack(spacing: 10) {
+                    viewMenuToggle(icon: "grid", title: "Grid", isOn: $camera.showGrid)
+                    viewMenuToggle(icon: "level", title: "Level", isOn: $camera.showLevel)
+                    viewMenuToggle(icon: "eye", title: "Peaking", isOn: $camera.showPeaking)
+                }
+                .padding(.bottom, 6)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+
+        Divider().background(Color.white.opacity(0.2))
+    }
+
+    // Split out of topBar's dropdown: one giant VStack made a view type so
+    @ViewBuilder private var viewMenuEffects: some View {
+        @Bindable var camera = camera
+        // FILM EFFECTS section
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("FILM EFFECTS", isExpanded: $sectionFilmEffectsExpanded, accent: .purple)
+            if sectionFilmEffectsExpanded {
+                HStack(spacing: 8) {
+                    // Halation = red bloom around highlights on film stock
+                    viewMenuToggle(icon: "drop.fill", title: "Halation",
+                                   isOn: $camera.halationEnabled, accent: .red)
+                    // Crosstalk = channels bleeding into each other → purple
+                    viewMenuToggle(icon: "paintpalette", title: "Crosstalk",
+                                   isOn: $camera.crosstalkEnabled, accent: .purple)
+                    // Rolloff = highlight shoulder → cool blue
+                    viewMenuToggle(icon: "waveform", title: "Rolloff",
+                                   isOn: $camera.rolloffEnabled, accent: .blue)
+                }
+                HStack(spacing: 8) {
+                    // Anamorphic flares are classic cyan streaks
+                    viewMenuToggle(icon: "aqi.medium", title: "Flares",
+                                   isOn: $camera.anamorphicFlareEnabled, accent: .cyan)
+                    // Light leaks = warm orange exposure
+                    viewMenuToggle(icon: "light.beacon.max", title: "Light Leaks",
+                                   isOn: $camera.lightArtifactsEnabled, accent: .orange)
+                    // Scratches = chemical decay green tint
+                    viewMenuToggle(icon: "line.diagonal", title: "Scratches",
+                                   isOn: $camera.filmScratchesEnabled, accent: .green)
+                }
+                HStack(spacing: 8) {
+                    // Randomize = chaos → pink
+                    viewMenuToggle(icon: "dice", title: "Randomize",
+                                   isOn: $camera.filmRandomizationEnabled, accent: .pink)
+                }
+                // DigiCam quality — only visible when DigiCam is the
+                // active sim. 5 = crustiest disposable, 20 = clean
+                // mid-2000s compact. Linear interpolation between.
+                if camera.selectedSim == .digiCam {
+                    // Magenta accent — distinct from the rest of FILM EFFECTS
+                    // (which use red/purple/blue/cyan/green/pink toggles)
+                    // and signals "this is a digital glitch control, not film."
+                    let digiAccent = Color(red: 1.0, green: 0.32, blue: 0.78)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "camera.aperture")
+                                .font(.system(size: 12))
+                            Text(camera.digiCamQuality < 1
+                                 ? "DigiCam Quality: Off"
+                                 : "DigiCam Quality: \(Int(camera.digiCamQuality))")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundStyle(camera.digiCamQuality < 1 ? .white.opacity(0.5) : digiAccent)
+                        HStack(spacing: 8) {
+                            Text("Off")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.5))
+                            Slider(
+                                value: Binding(
+                                    get: { Double(camera.digiCamQuality) },
+                                    set: { camera.digiCamQuality = Float($0) }
+                                ),
+                                in: 0...20,
+                                step: 1
+                            )
+                            .tint(digiAccent)
+                            Text("20")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+                // Push / Pull
+                VStack(alignment: .leading, spacing: 6) {
+                    let pushPullLabel: String = {
+                        if camera.pushPullAmount == 0 { return "Push / Pull" }
+                        if camera.pushPullAmount > 0 { return "Push +\(String(format: "%.0f", camera.pushPullAmount))" }
+                        return "Pull \(String(format: "%.0f", camera.pushPullAmount))"
+                    }()
+                    Button {
+                        camera.pushPullEnabled.toggle()
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.up.arrow.down.circle")
+                                .font(.system(size: 12))
+                            Text(pushPullLabel)
+                                .font(.system(size: 12, weight: camera.pushPullEnabled ? .bold : .regular))
+                        }
+                        .foregroundStyle(camera.pushPullEnabled ? .yellow : .white)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(camera.pushPullEnabled ? Color.yellow.opacity(0.2) : Color.white.opacity(0.1)))
+                    }
+                    .buttonStyle(.plain)
+                    if camera.pushPullEnabled {
+                        HStack(spacing: 8) {
+                            Text("Pull")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.5))
+                            Slider(value: $camera.pushPullAmount, in: -2...3, step: 1)
+                                .tint(.yellow)
+                            Text("Push")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+                .padding(.bottom, 6)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+
+        Divider().background(Color.white.opacity(0.2))
+    }
+
+    // Split out of topBar's dropdown: one giant VStack made a view type so
+    @ViewBuilder private var viewMenuShooting: some View {
+        @Bindable var camera = camera
+        // SHOOTING section
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("SHOOTING", isExpanded: $sectionShootingExpanded, accent: .orange)
+            if sectionShootingExpanded {
+                HStack(spacing: 10) {
+                    // Change any shot's look after the fact (original kept)
+                    Button {
+                        showRegrade = true
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "wand.and.stars").font(.system(size: 12))
+                            Text("Re-grade").font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundStyle(Color(red: 1.0, green: 0.82, blue: 0.2))
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(Color(red: 1.0, green: 0.82, blue: 0.2).opacity(0.18)))
+                    }
+                    .buttonStyle(.plain)
+                    viewMenuToggle(icon: "location.fill", title: "Geotag", isOn: $geotag.enabled, accent: .green)
+                    // Film roll: shoot blind, develop later
+                    Button {
+                        showRollOptions = true
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "film").font(.system(size: 12))
+                            Text(roll.isLoaded ? "\(roll.shotCount)/\(roll.capacity)" : "Roll")
+                                .font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        }
+                        .foregroundStyle(roll.isLoaded ? .black : .white)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Capsule().fill(roll.isLoaded ? Color.orange : Color.white.opacity(0.14)))
+                    }
+                    .buttonStyle(.plain)
+                }
+                HStack(spacing: 10) {
+                    viewMenuToggle(icon: "bolt.circle", title: "Burst", isOn: $camera.burstMode)
+
+                    // Portrait mode — shown whenever the session supports depth output.
+                    // Dimmed (not hidden) when the current lens doesn't produce depth
+                    // so the user can see it exists and knows to switch back to the
+                    // main camera to use it.
+                    if camera.portraitModeAvailable {
+                        viewMenuToggle(icon: "person.fill", title: "Portrait", isOn: $camera.portraitModeEnabled)
+                            .opacity(camera.currentDeviceSupportsDepth ? 1.0 : 0.4)
+                            .allowsHitTesting(camera.currentDeviceSupportsDepth)
+                    }
+
+                    // Macro mode — swaps to physical ultrawide for ~2cm focus distance
+                    viewMenuToggle(icon: "leaf.fill", title: "Macro", isOn: $camera.macroModeEnabled)
+                }
+                HStack(spacing: 10) {
+                    // Lefty mode — moves shutter cluster over to where the EV dial sits
+                    viewMenuToggle(icon: "hand.point.left.fill", title: "Lefty", isOn: $camera.shutterOnLeft)
+                    // Unified zoom — single virtual triple camera, no preset swaps
+                    viewMenuToggle(icon: "rectangle.stack", title: "1-Lens", isOn: $camera.unifiedZoomMode)
+                }
+
+                Spacer().frame(height: 6)
+            }
+        }
+
+        // DOUBLE EXPOSURE section (only when active)
+        if camera.doubleExposureEnabled {
+            Divider().background(Color.white.opacity(0.2))
+            VStack(alignment: .leading, spacing: 8) {
+                sectionHeader("DOUBLE EXPOSURE MASK", isExpanded: $sectionDoubleExpExpanded, accent: .pink)
+                if sectionDoubleExpExpanded {
+                    HStack(spacing: 10) {
+                        viewMenuToggle(icon: "paintbrush.fill", title: "Mask Mode", isOn: $camera.doubleExposureMaskEnabled)
+                    }
+                    if camera.doubleExposureMaskEnabled {
+                        maskBrushControls
+                            .padding(.bottom, 6)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+            }
+        }
+
+        Divider().background(Color.white.opacity(0.2))
+    }
+
+    // Split out of topBar's dropdown: one giant VStack made a view type so
+    @ViewBuilder private var viewMenuQuality: some View {
+        @Bindable var camera = camera
+        // PHOTO QUALITY section
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("PHOTO QUALITY", isExpanded: $sectionQualityExpanded, accent: .mint)
+            if sectionQualityExpanded {
+                HStack(spacing: 6) {
+                    ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
+                        let sel = camera.photoQuality == idx
+                        Button {
+                            camera.photoQuality = idx
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        } label: {
+                            Text(label)
+                                .font(.system(size: 12, weight: sel ? .bold : .regular))
+                                .foregroundStyle(sel ? .black : .white)
+                                .padding(.horizontal, 9).padding(.vertical, 6)
+                                .background(Capsule().fill(sel ? Color.white : Color.white.opacity(0.12)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.bottom, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+
+        Divider().background(Color.white.opacity(0.2))
+
+        // Sony camera connector
+        Button {
+            showSonyView = true
+            withAnimation(.spring(duration: 0.25)) { showViewMenu = false }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "camera.on.rectangle.fill")
+                    .font(.system(size: 13))
+                Text("Sony Camera")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Image(systemName: "wifi")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.3))
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.3))
+            }
+            .foregroundStyle(.yellow)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+
+        Divider().background(Color.white.opacity(0.2))
+
+        // Custom film editor
+        Button {
+            showCustomSimEditor = true
+            withAnimation(.spring(duration: 0.25)) { showViewMenu = false }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "paintbrush.pointed.fill")
+                    .font(.system(size: 13))
+                Text("Custom Films")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Text("\(customSimStore.simulations.count)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.4))
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.white.opacity(0.3))
+            }
+            .foregroundStyle(.cyan)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
     }
 
     /// Format a long-exposure duration: whole seconds as "Xs", half-seconds as "X.5s".
