@@ -102,8 +102,10 @@ struct CameraContentView: View {
     @State private var recordingPendingLock = false
     @State private var startupBlackOpacity: Double = 1.0
     @State private var lockDragOffset: CGFloat = 0
-    /// Where the finger is on the preview (for long-press AE/AF lock).
-    @State private var lastTouch: CGPoint = .zero
+    /// Touch tracking on the preview: tap to focus, hold for AE/AF lock.
+    @State private var touchStart: Date? = nil
+    @State private var holdFired = false
+    @State private var holdWork: DispatchWorkItem? = nil
 
     var body: some View {
         @Bindable var camera = camera
@@ -114,7 +116,10 @@ struct CameraContentView: View {
             // preview did. Everything that maps onto the image lives in it.
             let pw = geo.size.width
             let ph = pw * 4 / 3
-            let py = min(56, max(0, geo.size.height - ph))
+            // Below the status bar and the top controls, like Apple's Camera.
+            let topInset = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+                .windows.first?.safeAreaInsets.top ?? 47
+            let py = min(topInset + 58, max(0, geo.size.height - ph))
             ZStack {
                 Color.black.ignoresSafeArea()
                 // Camera layer
@@ -141,31 +146,44 @@ struct CameraContentView: View {
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { camera.syncZoomState() }
                             }
                     )
-                    .simultaneousGesture(DragGesture(minimumDistance: 0).onChanged { lastTouch = $0.location })
-                    .onLongPressGesture(minimumDuration: 0.5) {
-                        // AE/AF lock at the pressed spot (like Apple's Camera)
-                        guard !camera.manualFocusEnabled else { return }
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        focusPoint = CGPoint(x: lastTouch.x, y: lastTouch.y + py)
-                        showFocusIndicator = true
-                        camera.lockFocusAndExposure(at: CGPoint(x: lastTouch.y / ph, y: 1.0 - lastTouch.x / pw))
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { showFocusIndicator = false }
-                    }
-                    .onTapGesture { location in
-                        guard !camera.manualFocusEnabled else { return }
-                        focusPoint = CGPoint(x: location.x, y: location.y + py)
-                        showFocusIndicator = true
-                        // Convert to camera coordinates (0...1) within the frame
-                        let camPoint = CGPoint(
-                            x: location.y / ph,
-                            y: 1.0 - location.x / pw
-                        )
-                        camera.tapToFocus(at: camPoint)
-                        // Auto-hide after 1.8s
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
-                            showFocusIndicator = false
-                        }
-                    }
+                    // One touch handler: a short touch focuses there, a half-second
+                    // hold locks focus + exposure (AE/AF LOCK). A separate tap and
+                    // long-press plus a location tracker swallowed every tap.
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { v in
+                                guard touchStart == nil else {
+                                    if hypot(v.translation.width, v.translation.height) > 12 { holdWork?.cancel() }
+                                    return
+                                }
+                                touchStart = Date(); holdFired = false
+                                let loc = v.startLocation
+                                let work = DispatchWorkItem {
+                                    guard !camera.manualFocusEnabled, pinchBaseZoom == nil else { return }
+                                    holdFired = true
+                                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                    focusPoint = CGPoint(x: loc.x, y: loc.y + py)
+                                    showFocusIndicator = true
+                                    camera.lockFocusAndExposure(at: CGPoint(x: loc.y / ph, y: 1.0 - loc.x / pw))
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { showFocusIndicator = false }
+                                }
+                                holdWork = work
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+                            }
+                            .onEnded { v in
+                                holdWork?.cancel(); holdWork = nil
+                                defer { touchStart = nil }
+                                let moved = hypot(v.translation.width, v.translation.height)
+                                guard !holdFired, moved < 12, pinchBaseZoom == nil,
+                                      !camera.manualFocusEnabled else { return }
+                                let location = v.location
+                                focusPoint = CGPoint(x: location.x, y: location.y + py)
+                                showFocusIndicator = true
+                                // Camera coordinates (0...1) within the frame
+                                camera.tapToFocus(at: CGPoint(x: location.y / ph, y: 1.0 - location.x / pw))
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { showFocusIndicator = false }
+                            }
+                    )
                     .position(x: pw / 2, y: py + ph / 2)
 
                 // AE/AF LOCK badge at the top of the frame

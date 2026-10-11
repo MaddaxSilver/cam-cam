@@ -19,7 +19,7 @@
 //      still looks like night.
 //   5. Histogram constraints: the brightest 2% must reach at least ~0.45
 //      (no muddy flat scenes; skipped at night), and the 99–99.5% band must
-//      stay under ~0.9 so skies and windows keep detail (at most −0.75 EV; skipped when a face
+//      stay under ~0.9 so skies and windows keep detail (at most −0.4 EV; skipped when a face
 //      is in frame: the face matters more than the sky). Small speculars
 //      (<0.5% of the frame) may clip.
 //   6. Smooth: do nothing inside a stable region (±0.06 EV); otherwise an
@@ -158,10 +158,11 @@ final class SmartExposure {
         }
         let highlights = bandMean(0.99, 0.995)
         if !faceHint, highlights * g > 0.9, highlights > 0.01 {
-            // Protect, but never darken the subject more than ~0.75 EV below
-            // the mean solution for the sake of a window or lamp.
+            // Protect, but never darken the subject more than ~0.4 EV below
+            // the mean solution for the sake of a window or lamp (users found
+            // stronger protection made everyday shots look dark).
             let protect = 0.9 / highlights
-            g = max(protect, g * 0.6)
+            g = max(protect, g * 0.76)
             reason = "Protecting highlights"
         }
 
@@ -201,7 +202,7 @@ final class SmartExposure {
         // Calibrated on device: under Apple's own AE a normal daylight/indoor
         // frame meters ~0.26 here, so that's "no correction"; darker scenes
         // are aimed progressively darker than Apple would make them.
-        let pts: [(Float, Float)] = [(0, 0.12), (3, 0.17), (6, 0.22), (8, 0.26), (11, 0.27)]
+        let pts: [(Float, Float)] = [(0, 0.14), (3, 0.20), (6, 0.26), (8, 0.29), (11, 0.30)]
         if ev <= pts[0].0 { return pts[0].1 }
         for i in 1..<pts.count where ev <= pts[i].0 {
             let (e0, t0) = pts[i - 1], (e1, t1) = pts[i]
