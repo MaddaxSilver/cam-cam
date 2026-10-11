@@ -175,6 +175,8 @@ struct CameraContentView: View {
                                 let moved = hypot(v.translation.width, v.translation.height)
                                 guard !holdFired, moved < 12, pinchBaseZoom == nil,
                                       !camera.manualFocusEnabled else { return }
+                                // A tap elsewhere releases a Frame guide lock.
+                                if frameAdvisor.stage != .suggesting { frameAdvisor.unlock() }
                                 let location = v.location
                                 focusPoint = CGPoint(x: location.x, y: location.y + py)
                                 showFocusIndicator = true
@@ -185,24 +187,25 @@ struct CameraContentView: View {
                     )
                     .position(x: pw / 2, y: py + ph / 2)
 
-                // Framing box: the suggested shot (group / subject). Tap it to zoom in.
-                if frameAdvisor.enabled, let box = frameAdvisor.suggestedFrame {
+                // Frame guide box: yellow = suggestion (tap to lock on), white =
+                // guiding you (haptics + hint), green = lined up (fires the shutter).
+                if frameAdvisor.enabled, let box = frameAdvisor.box {
                     let a = frameAdvisor.imageAspect
                     let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
                     let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
                     let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
                                    width: box.width * dispW, height: box.height * dispH)
-                    FramingBox()
+                    FramingBox(color: frameAdvisor.stage == .aligned ? .green
+                               : frameAdvisor.stage == .locked ? .white : .yellow)
                         .frame(width: r.width, height: r.height)
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            guard let z = frameAdvisor.suggestedZoom else { return }
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            camera.setZoom(CGFloat(Double(max(camera.currentMM, 13)) / 26 * z))
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { camera.syncZoomState() }
+                            if frameAdvisor.stage == .suggesting { frameAdvisor.lock(camera: camera) }
+                            else { frameAdvisor.unlock() }
                         }
                         .position(x: r.midX, y: r.midY)
-                        .animation(.easeOut(duration: 0.35), value: box)
+                        .animation(.easeOut(duration: 0.25), value: box)
+                        .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
                 }
 
                 // AE/AF LOCK badge at the top of the frame

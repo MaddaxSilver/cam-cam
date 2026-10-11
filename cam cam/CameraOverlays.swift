@@ -134,34 +134,45 @@ struct GridOverlay: View {
 struct LevelOverlay: View {
     let roll: Double // degrees
 
+    /// Redesigned level: a centre bar that stays put and two arms that tilt
+    /// with the phone. Off by more than 15° it gets out of the way. Within
+    /// half a degree the arms snap in line with the bar, everything turns
+    /// yellow and you feel a tick — like a camera's electronic level.
+    @State private var wasLevel = false
+
     var body: some View {
         GeometryReader { geo in
-            let centerX = geo.size.width / 2
-            let centerY = geo.size.height / 2
-            let lineLength: CGFloat = 80
-            let isLevel = abs(roll) < 1.0
-
+            let cx = geo.size.width / 2, cy = geo.size.height / 2
+            let level = abs(roll) < 0.5
+            let show = abs(roll) < 15
+            let tint: Color = level ? .yellow : .white
             ZStack {
-                // Center dot
-                Circle()
-                    .fill(isLevel ? Color.green : Color.white)
-                    .frame(width: 6, height: 6)
-                    .position(x: centerX, y: centerY)
-
-                // Horizon line
-                Path { path in
-                    path.move(to: CGPoint(x: centerX - lineLength, y: centerY))
-                    path.addLine(to: CGPoint(x: centerX + lineLength, y: centerY))
+                // Fixed centre bar
+                Capsule().fill(tint)
+                    .frame(width: 34, height: 3)
+                    .position(x: cx, y: cy)
+                // Tilting arms, gap in the middle
+                HStack(spacing: 44) {
+                    Capsule().fill(tint.opacity(level ? 1 : 0.75)).frame(width: 64, height: 2)
+                    Capsule().fill(tint.opacity(level ? 1 : 0.75)).frame(width: 64, height: 2)
                 }
-                .stroke(isLevel ? Color.green : Color.white.opacity(0.5), lineWidth: 1)
-                .rotationEffect(.degrees(-roll), anchor: UnitPoint(x: 0.5, y: centerY / geo.size.height))
-
-                // Reference line (always horizontal)
-                Path { path in
-                    path.move(to: CGPoint(x: centerX - lineLength * 0.4, y: centerY))
-                    path.addLine(to: CGPoint(x: centerX + lineLength * 0.4, y: centerY))
+                .rotationEffect(.degrees(level ? 0 : -roll))
+                .position(x: cx, y: cy)
+                .animation(.interactiveSpring(response: 0.18, dampingFraction: 0.85), value: roll)
+                // Degrees off, only when close but not level
+                if !level {
+                    Text(String(format: "%.0f°", abs(roll)))
+                        .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.85))
+                        .position(x: cx, y: cy + 16)
                 }
-                .stroke(Color.yellow.opacity(0.5), lineWidth: 0.5)
+            }
+            .opacity(show ? 1 : 0)
+            .animation(.easeOut(duration: 0.2), value: show)
+            .animation(.easeOut(duration: 0.15), value: level)
+            .onChange(of: level) { _, now in
+                if now && !wasLevel { UIImpactFeedbackGenerator(style: .light).impactOccurred() }
+                wasLevel = now
             }
         }
         .allowsHitTesting(false)
@@ -599,6 +610,7 @@ class PeakingUIView: UIView {
 /// The suggested framing: thin yellow corner brackets, like the iPhone's
 /// framing suggestion box.
 struct FramingBox: View {
+    var color: Color = .yellow
     var body: some View {
         GeometryReader { g in
             let w = g.size.width, h = g.size.height
@@ -609,8 +621,8 @@ struct FramingBox: View {
                 p.move(to: CGPoint(x: w, y: h - c)); p.addLine(to: CGPoint(x: w, y: h)); p.addLine(to: CGPoint(x: w - c, y: h))
                 p.move(to: CGPoint(x: c, y: h)); p.addLine(to: CGPoint(x: 0, y: h)); p.addLine(to: CGPoint(x: 0, y: h - c))
             }
-            .stroke(Color.yellow, style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
-            Rectangle().stroke(Color.yellow.opacity(0.35), lineWidth: 1)
+            .stroke(color, style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+            Rectangle().stroke(color.opacity(0.35), lineWidth: 1)
         }
         .allowsHitTesting(true)
     }
