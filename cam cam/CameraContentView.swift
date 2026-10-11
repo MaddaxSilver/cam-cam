@@ -102,6 +102,8 @@ struct CameraContentView: View {
     @State private var recordingPendingLock = false
     @State private var startupBlackOpacity: Double = 1.0
     @State private var lockDragOffset: CGFloat = 0
+    @State private var smartTake = SmartTake.shared
+    @State private var frameAdvisor = FrameAdvisor.shared
     /// Touch tracking on the preview: tap to focus, hold for AE/AF lock.
     @State private var touchStart: Date? = nil
     @State private var holdFired = false
@@ -182,6 +184,26 @@ struct CameraContentView: View {
                             }
                     )
                     .position(x: pw / 2, y: py + ph / 2)
+
+                // Framing box: the suggested shot (group / subject). Tap it to zoom in.
+                if frameAdvisor.enabled, let box = frameAdvisor.suggestedFrame {
+                    let a = frameAdvisor.imageAspect
+                    let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
+                    let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
+                    let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
+                                   width: box.width * dispW, height: box.height * dispH)
+                    FramingBox()
+                        .frame(width: r.width, height: r.height)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            guard let z = frameAdvisor.suggestedZoom else { return }
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            camera.setZoom(CGFloat(Double(max(camera.currentMM, 13)) / 26 * z))
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { camera.syncZoomState() }
+                        }
+                        .position(x: r.midX, y: r.midY)
+                        .animation(.easeOut(duration: 0.35), value: box)
+                }
 
                 // AE/AF LOCK badge at the top of the frame
                 if camera.focusLocked {
@@ -1879,17 +1901,19 @@ struct CameraContentView: View {
                     lineWidth: 3
                 )
                 .frame(width: 84, height: 84)
-            RoundedRectangle(cornerRadius: camera.isRecording ? 8 : 35)
+            RoundedRectangle(cornerRadius: camera.isRecording ? 8 : smartTake.enabled ? 14 : 35)
                 .fill(
                     camera.isRecording  ? Color.red :
                     camera.isBursting   ? Color.yellow :
+                    smartTake.enabled   ? Color.yellow :
                     camera.isCapturing  ? Color.gray :
                                           Color.white
                 )
                 .frame(
-                    width:  camera.isRecording ? 28 : 70,
-                    height: camera.isRecording ? 28 : 70
+                    width:  camera.isRecording ? 28 : smartTake.sessionActive ? 34 : smartTake.enabled ? 50 : 70,
+                    height: camera.isRecording ? 28 : smartTake.sessionActive ? 34 : smartTake.enabled ? 50 : 70
                 )
+                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: smartTake.sessionActive)
                 .animation(.spring(response: 0.3, dampingFraction: 0.7), value: camera.isRecording)
                 .animation(.easeInOut(duration: 0.12), value: camera.isCapturing)
             if camera.isCapturing && !camera.isBursting && !camera.isRecording {
@@ -1952,6 +1976,12 @@ struct CameraContentView: View {
                         t.invalidate()
                         shutterPressTimer = nil
                         shutterIsHolding = false
+                        // Smart Take: the yellow shutter starts / stops a session.
+                        if smartTake.enabled {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            smartTake.toggleSession()
+                            return
+                        }
                         guard !camera.isCapturing else { return }
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         if camera.doubleExposureEnabled && camera.firstExposurePreview == nil {

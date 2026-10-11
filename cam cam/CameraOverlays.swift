@@ -593,3 +593,25 @@ class PeakingUIView: UIView {
         }
     }
 }
+
+// MARK: - Framing box
+
+/// The suggested framing: thin yellow corner brackets, like the iPhone's
+/// framing suggestion box.
+struct FramingBox: View {
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width, h = g.size.height
+            let c = min(22, min(w, h) * 0.25)
+            Path { p in
+                p.move(to: CGPoint(x: 0, y: c)); p.addLine(to: .zero); p.addLine(to: CGPoint(x: c, y: 0))
+                p.move(to: CGPoint(x: w - c, y: 0)); p.addLine(to: CGPoint(x: w, y: 0)); p.addLine(to: CGPoint(x: w, y: c))
+                p.move(to: CGPoint(x: w, y: h - c)); p.addLine(to: CGPoint(x: w, y: h)); p.addLine(to: CGPoint(x: w - c, y: h))
+                p.move(to: CGPoint(x: c, y: h)); p.addLine(to: CGPoint(x: 0, y: h)); p.addLine(to: CGPoint(x: 0, y: h - c))
+            }
+            .stroke(Color.yellow, style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+            Rectangle().stroke(Color.yellow.opacity(0.35), lineWidth: 1)
+        }
+        .allowsHitTesting(true)
+    }
+}

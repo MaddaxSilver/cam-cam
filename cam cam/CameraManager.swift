@@ -3152,6 +3152,16 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             SkinMask.shared.update(pixelBuffer, time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)))
         }
 
+        // Framing box / suggestions (rear camera)
+        FrameAdvisor.shared.process(pixelBuffer,
+                                    time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                                    camera: self)
+
+        // Smart Take: fires the shutter when everyone in frame is posed
+        SmartTake.shared.process(pixelBuffer,
+                                 time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                                 camera: self)
+
         // Smart auto exposure (throttled internally to ~5 Hz)
         SmartExposure.shared.process(pixelBuffer,
                                      time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),

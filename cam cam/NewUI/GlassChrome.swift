@@ -73,6 +73,8 @@ struct GlassChrome<Shutter: View>: View {
     @State private var tones = FilmToneStore.shared
     @State private var thumbToken = 0
     @State private var smartAE = SmartExposure.shared
+    @State private var smartTake = SmartTake.shared
+    @State private var frameAdvisor = FrameAdvisor.shared
     @State private var styleSettings = StyleSettings.shared
     @State private var showSetPicker = false
     @AppStorage("cc_arcSet") private var arcSetRaw = ArcSet.all.rawValue
@@ -102,6 +104,42 @@ struct GlassChrome<Shutter: View>: View {
                     .padding(.bottom, 14)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
+                // Smart Take: who's posed, and the hold before the shutter fires.
+                if smartTake.enabled {
+                    HStack(spacing: 8) {
+                        Text("Smart Take")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Color.yellow, in: Capsule())
+                        if smartTake.sessionActive {
+                            ZStack {
+                                Circle().stroke(.white.opacity(0.25), lineWidth: 3)
+                                Circle().trim(from: 0, to: smartTake.holdProgress)
+                                    .stroke(Color.yellow, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                                    .rotationEffect(.degrees(-90))
+                            }
+                            .frame(width: 16, height: 16)
+                        }
+                        Text(smartTakeStatus)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .contentTransition(.numericText())
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 7)
+                    .glassEffect(.regular, in: Capsule())
+                    .padding(.bottom, 8)
+                    .animation(.easeOut(duration: 0.2), value: smartTake.ready)
+                    .transition(.opacity)
+                } else if frameAdvisor.enabled, let hint = frameAdvisor.hint {
+                    Label(hint, systemImage: "viewfinder")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .glassEffect(.regular, in: Capsule())
+                        .padding(.bottom, 8)
+                        .transition(.opacity)
+                }
                 // The lens pill sits in the dial, under the film names: the
                 // dial turns behind it, the pill stays put (and takes its own
                 // taps and scrubs, since it's on top).
@@ -250,6 +288,7 @@ struct GlassChrome<Shutter: View>: View {
             out.append(.init(id: "pp", symbol: "plusminus", text: String(format: "%+d", Int(camera.pushPullAmount))))
         }
         if camera.rawEnabled { out.append(.init(id: "raw", symbol: "r.square")) }
+        if smartTake.enabled { out.append(.init(id: "smarttake", symbol: "person.2.badge.gearshape")) }
         if camera.thermalWarning != nil { out.append(.init(id: "heat", symbol: "thermometer.medium", tint: .orange)) }
         if camera.isFocusing { out.append(.init(id: "focus", symbol: "scope", pulse: true)) }
         else if camera.faceDetected && !camera.manualFocusEnabled { out.append(.init(id: "face", symbol: "face.dashed")) }
@@ -373,6 +412,16 @@ struct GlassChrome<Shutter: View>: View {
     }
 
     private var styleOn: Bool { camera.activeCustomSim == nil && camera.selectedSim.styleKind != nil }
+    /// Smart Take status line, like the Duo's: waiting, who's ready, hold still.
+    private var smartTakeStatus: String {
+        guard smartTake.sessionActive else { return "Tap the shutter to start" }
+        let n = smartTake.shots > 0 ? " · \(smartTake.shots)/\(SmartTake.maxShots)" : ""
+        if smartTake.faces == 0 { return "Waiting for everyone" + n }
+        if smartTake.ready < smartTake.faces { return "\(smartTake.ready) of \(smartTake.faces) ready" + n }
+        if smartTake.someoneMoving { return "Wait — someone's still moving" + n }
+        return (smartTake.faces == 1 ? "Hold still" : "Everyone hold still") + n
+    }
+
     private var visibleKinds: [ControlKind] { ControlKind.allCases.filter { $0 != .style || styleOn } }
 
     @ViewBuilder private var controlPanel: some View {
@@ -441,6 +490,10 @@ struct GlassChrome<Shutter: View>: View {
                     Tile(title: "Manual focus", symbol: "scope",
                          isOn: Binding(get: { camera.manualFocusEnabled }, set: { camera.setManualFocusEnabled($0) })),
                     Tile(title: "One lens", symbol: "arrow.left.and.right.circle", isOn: $camera.unifiedZoomMode),
+                    Tile(title: "Smart Take", symbol: "person.2.badge.gearshape",
+                         isOn: Binding(get: { smartTake.enabled }, set: { smartTake.enabled = $0 })),
+                    Tile(title: "Frame guide", symbol: "viewfinder.rectangular",
+                         isOn: Binding(get: { frameAdvisor.enabled }, set: { frameAdvisor.enabled = $0 })),
                 ])
                 GlassRuler(title: "Development",
                            valueText: camera.development == 0 ? "Off"
