@@ -88,7 +88,7 @@ final class SmartTake {
     nonisolated private static let queue = DispatchQueue(label: "cam.smarttake", qos: .userInitiated)
 
     /// How long everyone must be posed and still before the shutter fires.
-    nonisolated static let holdTime = 0.6
+    nonisolated static let holdTime = 1.2
 
     /// Called for every video frame; analyses ~6 times a second off the camera queue.
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
@@ -108,7 +108,9 @@ final class SmartTake {
         let landmarks = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(ciImage: image)
         guard (try? handler.perform([landmarks])) != nil,
-              let found = landmarks.results, !found.isEmpty else {
+              let all = landmarks.results, !all.isEmpty,
+              // Ignore tiny faces in the background (posters, people far behind).
+              case let found = Self.mainFaces(all), !found.isEmpty else {
             readySince = nil
             armed = true            // nobody in frame: re-arm for the next group
             lastCentres = []
@@ -131,7 +133,7 @@ final class SmartTake {
         let centres = scored.map { CGPoint(x: $0.boundingBox.midX, y: $0.boundingBox.midY) }
         let still = centres.count == lastCentres.count && zip(centres.sorted { $0.x < $1.x },
                                                              lastCentres.sorted { $0.x < $1.x })
-            .allSatisfy { hypot($0.x - $1.x, $0.y - $1.y) < 0.025 }
+            .allSatisfy { hypot($0.x - $1.x, $0.y - $1.y) < 0.012 }
         lastCentres = centres
 
         let allPosed = readyCount == scored.count && still
@@ -139,7 +141,7 @@ final class SmartTake {
         if allPosed {
             if readySince == nil { readySince = time }
             progress = min(1, (time - readySince!) / Self.holdTime)
-            if progress >= 1, armed, time - lastFire > 2.5 {
+            if progress >= 1, armed, time - lastFire > 3 {
                 armed = false
                 lastFire = time
                 readySince = nil
@@ -164,11 +166,18 @@ final class SmartTake {
     /// Facing the camera, eyes open, decent capture quality.
     nonisolated static func isPosed(_ face: VNFaceObservation, quality: Float?) -> Bool {
         let yaw = abs(face.yaw?.doubleValue ?? 0), pitch = abs(face.pitch?.doubleValue ?? 0)
-        guard yaw < 0.35, pitch < 0.35 else { return false }
-        if let q = quality, q < 0.3 { return false }
+        guard yaw < 0.26, pitch < 0.26 else { return false }
+        if let q = quality, q < 0.42 { return false }
         guard let lm = face.landmarks,
               eyeOpen(lm.leftEye), eyeOpen(lm.rightEye) else { return false }
         return true
+    }
+
+    /// Faces that are part of the shot: at least ~35% the size of the largest
+    /// face and not tiny overall.
+    nonisolated static func mainFaces(_ faces: [VNFaceObservation]) -> [VNFaceObservation] {
+        let biggest = faces.map { $0.boundingBox.width }.max() ?? 0
+        return faces.filter { $0.boundingBox.width >= max(0.035, biggest * 0.35) }
     }
 
     /// Eye openness from the eye contour's height-to-width ratio.
@@ -177,7 +186,7 @@ final class SmartTake {
         let xs = pts.map(\.x), ys = pts.map(\.y)
         let w = (xs.max() ?? 0) - (xs.min() ?? 0), h = (ys.max() ?? 0) - (ys.min() ?? 0)
         guard w > 0 else { return true }
-        return h / w > 0.16
+        return h / w > 0.2
     }
 
     /// The rear flash blinks after each shot so the group knows it fired.
