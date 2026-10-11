@@ -338,9 +338,13 @@ extension CameraManager {
         let speckle: CGFloat = grainEnabled ? min(1.0, CGFloat(grain) / 0.5) : 0
         // Stocks on the film engine (modelled in exposure, see FilmEngine).
         if let film = FilmEngine.apply(image, sim: sim) { return film }
+        if let lut = sim.bundledLUT { return LUTManager.shared.apply(filename: lut, to: image) }
         switch sim {
         case .none:
             return image
+        case .kodakPortra800, .kodakPortra800Push1, .kodakPortra800Push2, .kodakVerita200D,
+             .fujiXtra400, .fujiC200, .kodakVision3_50D, .kodakVision3_200T, .kodakVision3_250D:
+            return image   // bundled LUT applied above; missing file = untouched
 
         case .leica:
             // Leica M: microcontrast 3D pop, cool-neutral cast, shadow-cool/highlight-warm split,

@@ -2,23 +2,29 @@
 //  SmartExposure.swift
 //  cam cam
 //
-//  "Smart" auto exposure, layered on top of Apple's continuous AE.
+//  "Smart" auto exposure, layered on top of Apple's continuous AE through the
+//  exposure target bias. Modelled on the open camera stacks' AGC (libcamera
+//  AgcMeanLuminance and the Raspberry Pi AGC), adapted to a phone that runs
+//  its own AE underneath:
 //
-//  Apple's AE aims the average at middle grey. That's safe but it clips
-//  bright skies and windows, and underexposes dark scenes that could take
-//  more light. Smart mode watches the live luma histogram ~5×/s and nudges
-//  the exposure target bias:
-//
-//   • Highlight protection (expose-to-the-right, the approach pro camera apps
-//     use): place the 99.5th-percentile luma just under clipping. Film looks
-//     roll highlights off nicely only if they weren't clipped by the sensor.
-//   • Shadow lift: if there's headroom and the frame is mostly dark, brighten,
-//     but never so far that mid-tones wash out (median capped).
-//   • Face priority: when a face is in frame, Apple's face-driven AE already
-//     meters on it, so smart mode won't darken more than −0.5 EV for sky.
-//   • Calm: changes are smoothed and small ones ignored, so the preview
-//     doesn't pump; it stands still while capturing, recording, during a
-//     long exposure or while you've tapped to lock focus/exposure.
+//   1. Meter: a 64×48 luminance grid of the live frame, centre-weighted, and
+//      weighted toward the subject by Vision attention saliency (~2×/s).
+//   2. Predict: Apple's AE is usually still converging; its exposure target
+//      offset says by how much, so we judge the frame as it will look once
+//      Apple settles. Without this the two loops chase each other (pumping).
+//   3. Solve the gain to the target in one go (iterated, because clipped
+//      areas don't brighten) instead of nudging a fraction of the error.
+//   4. Target by light level: night is aimed darker than daylight, so night
+//      still looks like night.
+//   5. Histogram constraints: the brightest 2% must reach at least ~0.45
+//      (no muddy flat scenes; skipped at night), and the 99–99.5% band must
+//      stay under ~0.9 so skies and windows keep detail (skipped when a face
+//      is in frame: the face matters more than the sky). Small speculars
+//      (<0.5% of the frame) may clip.
+//   6. Smooth: do nothing inside a stable region (±0.06 EV); otherwise an
+//      exponential filter that finishes small moves quickly instead of
+//      creeping, is instant for the first ticks, and cuts exposure in one
+//      step when the frame is clipping badly.
 //
 //  Your exposure ruler still works: it's an offset added on top.
 //
@@ -26,6 +32,7 @@
 import AVFoundation
 import CoreImage
 import Observation
+import Vision
 
 @MainActor @Observable
 final class SmartExposure {
@@ -48,64 +55,156 @@ final class SmartExposure {
     @ObservationIgnored nonisolated(unsafe) var faceHint = false
     @ObservationIgnored nonisolated(unsafe) private var needsReset = false
     @ObservationIgnored nonisolated(unsafe) private var lastTick: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var lastSaliency: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var ticks = 0
     @ObservationIgnored nonisolated(unsafe) private var smart: Float = 0
     @ObservationIgnored nonisolated(unsafe) private var lastApplied: Float = .nan
     @ObservationIgnored nonisolated(unsafe) private var lastStatus = ""
+    /// Saliency weights on the metering grid (gw×gh), nil until the first pass.
+    @ObservationIgnored nonisolated(unsafe) private var saliency: [Float]?
+
+    nonisolated static let gw = 64, gh = 48
 
     nonisolated private static let context = CIContext(options: [
         .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!,
         .cacheIntermediates: false,
     ])
 
-    /// Called for every video frame; does real work ~5 times a second.
+    /// Centre weighting: a broad Gaussian with a floor, so edges still count.
+    nonisolated private static let centreWeights: [Float] = {
+        var w = [Float](repeating: 0, count: gw * gh)
+        for y in 0..<gh {
+            for x in 0..<gw {
+                let dx = (Float(x) + 0.5) / Float(gw) - 0.5
+                let dy = (Float(y) + 0.5) / Float(gh) - 0.5
+                w[y * gw + x] = 0.35 + 0.65 * exp(-(dx * dx + dy * dy) / (2 * 0.22 * 0.22))
+            }
+        }
+        return w
+    }()
+
+    /// Called for every video frame; meters ~7 times a second.
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         if needsReset {
             needsReset = false
-            smart = 0
+            smart = 0; ticks = 0
             apply(bias: camera.cachedUserBias, camera: camera)
             publish(status: "", correction: 0)
         }
-        guard cachedEnabled, time - lastTick >= 0.2 else { return }
+        guard cachedEnabled, time - lastTick >= 0.15 else { return }
         lastTick = time
         guard let device = camera.currentDevice,
               device.exposureMode == .continuousAutoExposure,
-              !camera.cachedIsRecording, !camera.isCollectingFrames,
-              let h = Self.histogram(pixelBuffer) else { return }
+              !camera.cachedIsRecording, !camera.isCollectingFrames else { return }
 
-        let median = Self.percentile(h, 0.5)
-        let p995 = Self.percentile(h, 0.995)
-        let clipped = h.suffix(2).reduce(0, +)          // share of pixels at the very top
-
-        // Expose-to-the-right: put the brightest 0.5% just under clipping.
-        // Histogram is gamma-encoded; ×2.2 converts the ratio to stops.
-        var target: Float
-        if clipped > 0.01 {
-            target = -0.33 - min(clipped * 10, 0.67)       // genuinely clipping: step down
-        } else {
-            target = 2.2 * log2(0.93 / max(p995, 0.05))
+        let frame = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let grid = Self.lumaGrid(frame) else { return }
+        if time - lastSaliency > 0.5 {
+            lastSaliency = time
+            updateSaliency(frame)
         }
-        // Don't let shadows-lifting wash out the mid-tones.
-        let maxUp = 2.2 * log2(0.56 / max(median, 0.02))
-        target = min(target, max(maxUp, 0))
-        if faceHint { target = max(target, -0.5) }
 
-        // Calm: ignore small errors (dead zone), move gently, and cap each
-        // step — Apple's AE is adapting at the same time while you move the
-        // phone, and a fast loop on top of it makes the picture pump.
-        guard abs(target) > 0.2 else { return }
-        let step = max(-0.12, min(0.12, 0.2 * target))
-        let next = max(-2.0, min(1.0, smart + step))
-        smart = next
-        let status: String
-        if next < -0.15 { status = faceHint ? "Face priority" : "Protecting highlights" }
-        else if next > 0.15 { status = "Lifting shadows" }
-        else { status = "" }
-        apply(bias: next + camera.cachedUserBias, camera: camera)
-        if status != lastStatus { lastStatus = status; publish(status: status, correction: next) }
+        // 2. Judge the frame as it will be once Apple's AE has settled.
+        let pending = max(-2, min(2, device.exposureTargetOffset))
+        let settle = pow(2, -pending)
+        let lum = grid.map { min($0 * settle, 4) }
+
+        // Weights: centre × subject (saliency); faces are already metered by
+        // Apple's AE (we point its metering at the largest face).
+        var w = Self.centreWeights
+        if !faceHint, let sal = saliency {
+            for i in w.indices { w[i] *= 0.4 + 1.6 * sal[i] }
+        }
+        let wSum = w.reduce(0, +)
+
+        // 4. Target by light level (EV100 of the scene).
+        let ev = Self.sceneEV(device)
+        let target = Self.target(ev: ev)
+
+        // 3. Solve the gain, accounting for clipping.
+        var g: Float = 1
+        for _ in 0..<8 {
+            var y: Float = 0
+            for i in lum.indices { y += w[i] * min(lum[i] * g, 1) }
+            y /= max(wSum, 1e-6)
+            let step = max(0.1, min(10, target / max(y, 1e-4)))
+            g *= step
+            if abs(step - 1) < 0.01 { break }
+        }
+
+        // 5. Histogram constraints (unweighted).
+        let sorted = lum.sorted()
+        func bandMean(_ lo: Float, _ hi: Float) -> Float {
+            let a = Int(Float(sorted.count) * lo), b = max(a + 1, Int(Float(sorted.count) * hi))
+            return sorted[a..<min(b, sorted.count)].reduce(0, +) / Float(min(b, sorted.count) - a)
+        }
+        var reason = ""
+        let top = bandMean(0.98, 1.0)
+        if ev >= 4, top * g < 0.45, top > 0.01 {
+            g = 0.45 / top; reason = "Lifting shadows"
+        }
+        let highlights = bandMean(0.99, 0.995)
+        if !faceHint, highlights * g > 0.9, highlights > 0.01 {
+            // Protect, but never darken the subject more than ~1.3 EV below
+            // the mean solution for the sake of the sky.
+            let protect = 0.9 / highlights
+            g = max(protect, g * 0.4)
+            reason = "Protecting highlights"
+        }
+
+        let delta = log2(max(g, 1e-3))
+        let desired = max(-2.5, min(1.5, smart + delta))
+        let error = desired - smart
+
+        // 6. Stable region, then the adaptive filter.
+        ticks += 1
+        guard abs(error) > 0.06 || ticks <= 3 else { return }
+        var speed: Float = 0.35
+        if ticks <= 4 { speed = 1 }                                 // startup: go straight there
+        else if abs(error) < 0.26 { speed = speed.squareRoot() }    // close: finish the move
+        let clipped = Float(sorted.reversed().prefix { $0 >= 0.98 }.count) / Float(sorted.count)
+        if clipped > 0.04 && error < -0.3 { speed = 1 }             // badly over: cut at once
+        smart += speed * error
+
+        if reason.isEmpty {
+            if faceHint { reason = "Face priority" }
+            else if ev < 4 { reason = "Night" }
+            else if smart > 0.15 { reason = "Brightening" }
+            else if smart < -0.15 { reason = "Darkening" }
+        }
+        print(String(format: "CCAE ev=%.1f target=%.3f pending=%.2f g=%.2f desired=%.2f smart=%.2f speed=%.2f clip=%.3f top=%.2f hi=%.2f %@", ev, target, pending, g, desired, smart, speed, clipped, top, highlights, reason))
+        apply(bias: smart + camera.cachedUserBias, camera: camera)
+        if reason != lastStatus || abs(smart - lastApplied) > 0.05 {
+            lastStatus = reason
+            publish(status: reason, correction: smart)
+        }
     }
 
+    // MARK: Light-level target
+
+    /// Linear mean-luminance target: night is aimed darker than daylight.
+    nonisolated static func target(ev: Float) -> Float {
+        let pts: [(Float, Float)] = [(0, 0.055), (3, 0.085), (6, 0.13), (9, 0.17), (11, 0.18)]
+        if ev <= pts[0].0 { return pts[0].1 }
+        for i in 1..<pts.count where ev <= pts[i].0 {
+            let (e0, t0) = pts[i - 1], (e1, t1) = pts[i]
+            return t0 + (t1 - t0) * (ev - e0) / (e1 - e0)
+        }
+        return pts.last!.1
+    }
+
+    /// Scene EV100 from the current exposure (aperture, shutter, ISO).
+    nonisolated static func sceneEV(_ device: AVCaptureDevice) -> Float {
+        let n = max(device.lensAperture, 1)
+        let t = max(Float(CMTimeGetSeconds(device.exposureDuration)), 1e-5)
+        let iso = max(device.iso, 1)
+        return log2(n * n / t) - log2(iso / 100)
+    }
+
+    // MARK: Apply / publish
+
     nonisolated private func apply(bias: Float, camera: CameraManager) {
-        guard lastApplied.isNaN || abs(bias - lastApplied) > 0.08 else { return }
+        guard lastApplied.isNaN || abs(bias - lastApplied) > 0.03 else { return }
         lastApplied = bias
         camera.sessionQueue.async {
             guard let device = camera.currentDevice,
@@ -122,32 +221,39 @@ final class SmartExposure {
         }
     }
 
-    // MARK: Histogram (64 bins, fractions summing to 1)
+    // MARK: Metering grid + saliency
 
-    nonisolated private static func histogram(_ pb: CVPixelBuffer) -> [Float]? {
-        let img = CIImage(cvPixelBuffer: pb)
-        let s = 160 / max(img.extent.width, 1)
-        let small = ExposureAids.luma(img).transformed(by: CGAffineTransform(scaleX: s, y: s))
-        guard let hist = CIFilter(name: "CIAreaHistogram", parameters: [
-            kCIInputImageKey: small, "inputExtent": CIVector(cgRect: small.extent),
-            "inputCount": 64, "inputScale": 1,
-        ])?.outputImage else { return nil }
-        var buf = [Float](repeating: 0, count: 64 * 4)
-        context.render(hist, toBitmap: &buf, rowBytes: 64 * 16,
-                       bounds: CGRect(x: 0, y: 0, width: 64, height: 1), format: .RGBAf, colorSpace: nil)
-        var out = (0..<64).map { buf[$0 * 4] }
-        let sum = out.reduce(0, +)
-        guard sum > 0 else { return nil }
-        out = out.map { $0 / sum }
-        return out
+    /// Linear luminance on a gw×gh grid.
+    nonisolated private static func lumaGrid(_ img: CIImage) -> [Float]? {
+        let sx = CGFloat(gw) / max(img.extent.width, 1), sy = CGFloat(gh) / max(img.extent.height, 1)
+        let small = ExposureAids.luma(img)
+            .transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+            .transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+        var buf = [Float](repeating: 0, count: gw * gh * 4)
+        context.render(small, toBitmap: &buf, rowBytes: gw * 16,
+                       bounds: CGRect(x: 0, y: 0, width: gw, height: gh), format: .RGBAf, colorSpace: nil)
+        // The luma is gamma-encoded; meter in linear light.
+        return (0..<(gw * gh)).map { pow(max(buf[$0 * 4], 0), 2.2) }
     }
 
-    nonisolated private static func percentile(_ h: [Float], _ p: Float) -> Float {
-        var acc: Float = 0
-        for (i, v) in h.enumerated() {
-            acc += v
-            if acc >= p { return (Float(i) + 0.5) / Float(h.count) }
-        }
-        return 1
+    /// Vision attention saliency resampled onto the metering grid (0…1).
+    nonisolated private func updateSaliency(_ frame: CIImage) {
+        let s = 256 / max(frame.extent.width, frame.extent.height)
+        let small = frame.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        let request = VNGenerateAttentionBasedSaliencyImageRequest()
+        guard (try? VNImageRequestHandler(ciImage: small).perform([request])) != nil,
+              let obs = request.results?.first as? VNSaliencyImageObservation else { return }
+        let map = CIImage(cvPixelBuffer: obs.pixelBuffer)
+        let gw = Self.gw, gh = Self.gh
+        let scaled = map.transformed(by: CGAffineTransform(scaleX: CGFloat(gw) / map.extent.width,
+                                                           y: CGFloat(gh) / map.extent.height))
+        var buf = [Float](repeating: 0, count: gw * gh * 4)
+        Self.context.render(scaled, toBitmap: &buf, rowBytes: gw * 16,
+                            bounds: CGRect(x: 0, y: 0, width: gw, height: gh), format: .RGBAf, colorSpace: nil)
+        var vals = (0..<(gw * gh)).map { buf[$0 * 4] }
+        let mx = vals.max() ?? 0
+        guard mx > 0.05 else { saliency = nil; return }
+        vals = vals.map { $0 / mx }
+        saliency = vals
     }
 }

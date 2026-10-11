@@ -201,10 +201,14 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
     // Kodak color negatives — pro to consumer
     case kodakPortra, kodakEktar, kodakGold, kodakUltramax, kodakColorplus
     case kodakPortra160, kodakProImage100, kodakAdvantix
+    // Spectral (spektrafilm data, baked to LUTs) — Portra 800 and its pushes
+    case kodakPortra800, kodakPortra800Push1, kodakPortra800Push2, kodakVerita200D
+    case fujiXtra400, fujiC200
 
     // Cinema / Cinestill — daylight then tungsten
     case cinestill50D, cinestill400D, cinestill800T, kodakVision3
     case kodak2383, fujiEternaVivid
+    case kodakVision3_50D, kodakVision3_200T, kodakVision3_250D
 
     // Slide film
     case kodachrome64, ektachrome100
@@ -236,6 +240,23 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
 
     var id: String { rawValue }
 
+    /// Bundled film LUT (Films/*.cube), baked from spektrafilm's spectral
+    /// film + print models (CC BY-SA 4.0, Andrea Volpato). Nil for the rest.
+    var bundledLUT: String? {
+        switch self {
+        case .kodakPortra800:      return "Portra800.cube"
+        case .kodakPortra800Push1: return "Portra800Push1.cube"
+        case .kodakPortra800Push2: return "Portra800Push2.cube"
+        case .kodakVerita200D:     return "Verita200D.cube"
+        case .fujiXtra400:         return "FujiXtra400.cube"
+        case .fujiC200:            return "FujiC200.cube"
+        case .kodakVision3_50D:    return "Vision3_50D.cube"
+        case .kodakVision3_200T:   return "Vision3_200T.cube"
+        case .kodakVision3_250D:   return "Vision3_250D.cube"
+        default: return nil
+        }
+    }
+
     /// Non-nil for the Styles (rendered by StyleEngine, skin-aware).
     var styleKind: StyleKind? {
         switch self {
@@ -260,6 +281,15 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
     var label: String {
         switch self {
         case .none:           return "None"
+        case .kodakPortra800:      return "Portra 800"
+        case .kodakPortra800Push1: return "Portra 800 +1"
+        case .kodakPortra800Push2: return "Portra 800 +2"
+        case .kodakVerita200D:     return "Verita 200D"
+        case .fujiXtra400:         return "Xtra 400"
+        case .fujiC200:            return "C200"
+        case .kodakVision3_50D:    return "Vision3 50D"
+        case .kodakVision3_200T:   return "Vision3 200T"
+        case .kodakVision3_250D:   return "Vision3 250D"
         case .leica:          return "Leica M"
         case .fujiProvia:     return "Provia"
         case .fujiVelvia:     return "Velvia"

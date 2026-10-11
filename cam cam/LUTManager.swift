@@ -126,7 +126,14 @@ final class LUTManager: @unchecked Sendable {
     // MARK: - .cube parsing
 
     nonisolated private func parseCubeFile(_ filename: String) -> CubeLUT? {
-        let url = directory.appendingPathComponent(filename)
+        // Imported LUTs live in Documents/LUTs; built-in film LUTs ship in
+        // the app bundle.
+        var url = directory.appendingPathComponent(filename)
+        if !FileManager.default.fileExists(atPath: url.path),
+           let bundled = Bundle.main.url(forResource: (filename as NSString).deletingPathExtension,
+                                         withExtension: (filename as NSString).pathExtension) {
+            url = bundled
+        }
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         return parseCube(content)
     }
