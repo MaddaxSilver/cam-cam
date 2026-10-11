@@ -324,6 +324,17 @@ struct CamSettingsSheet: View {
                         Stepper("\(camera.pushPullAmount >= 0 ? "+" : "")\(Int(camera.pushPullAmount)) stop",
                                 value: $camera.pushPullAmount, in: -2...3, step: 1)
                     }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Development")
+                        Picker("Development", selection: Binding(
+                            get: { camera.development == 0 ? 0 : camera.development < 0.35 ? 1 : camera.development < 0.75 ? 2 : 3 },
+                            set: { camera.development = [0, 0.3, 0.6, 1.0][$0] })) {
+                            Text("Normal").tag(0); Text("Light").tag(1); Text("Semi-stand").tag(2); Text("Stand").tag(3)
+                        }
+                        .pickerStyle(.segmented)
+                        Text("Developer exhaustion: highlights compress, edges gain film's natural pop.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                 }
                 Section("Display") {
                     Toggle("Grid", isOn: $camera.showGrid)
