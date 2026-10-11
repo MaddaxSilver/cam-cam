@@ -33,6 +33,8 @@ import Vision
 final class FrameAdvisor {
     static let shared = FrameAdvisor()
 
+    init() { _ = FrameLearning.folder }   // exists from the start, so the Mac can pull it
+
     enum Stage: Equatable { case suggesting, locked, aligned }
 
     /// Where the subject should sit when the shot is right (not just centred):
@@ -43,6 +45,10 @@ final class FrameAdvisor {
         var anchor = CGPoint(x: 0.5, y: 0.5)
         var target = CGPoint(x: 0.5, y: 0.5)
         var fill: CGFloat = 0.82
+        /// Shortest focal length that suits the subject (faces and food look
+        /// distorted on the 13 mm), and whether the subject runs off the frame.
+        var minMM: Int = 13
+        var cutOff = false
     }
     typealias Subject = (box: CGRect, isGroup: Bool, comp: Composition)
 
@@ -93,6 +99,20 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) private var frameAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
     @ObservationIgnored nonisolated(unsafe) private var frameFov: Double = 70
     @ObservationIgnored nonisolated(unsafe) private var shownAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
+    // Orientation: analysis runs on an upright copy of the frame (the way
+    // you hold the phone), so thirds, hints and the horizon are right in
+    // landscape. Boxes are kept upright and converted for display.
+    @ObservationIgnored nonisolated(unsafe) var cachedAngle: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var frameAngle: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var bufferAspect: CGFloat = 3.0 / 4.0
+    // Auto zoom while locked
+    @ObservationIgnored nonisolated(unsafe) private var offFillSince: Double?
+    @ObservationIgnored nonisolated(unsafe) private var lastZoomAt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var zoomSteps = 0
+    // Learning
+    @ObservationIgnored nonisolated(unsafe) private var lastUpright: CIImage?
+    @ObservationIgnored nonisolated(unsafe) private var lockContext: (image: CIImage, box: CGRect)?
+    @ObservationIgnored nonisolated(unsafe) private var learned: (box: CGRect, comp: Composition, at: Double)?
 
     nonisolated private static let queue = DispatchQueue(label: "cam.frameadvisor", qos: .userInitiated)
     /// How much of the frame the subject should fill when lined up.
@@ -106,21 +126,57 @@ final class FrameAdvisor {
         stage = .locked; cachedLocked = true
         alignedSince = nil; lostSince = nil; fired = false
         tracked = nil; tracker = nil
+        offFillSince = nil; zoomSteps = 0
+        if let img = lastUpright, let u = shown { lockContext = (img, u) } else { lockContext = nil }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         camera.tapToFocus(at: CGPoint(x: b.midY, y: 1 - b.midX))   // focus on the subject
-        // Auto zoom so the subject fills the frame (the zoom is centred, so
-        // you then move the phone to centre it).
-        let z = min(max(Double(lastComp.fill / max(b.width, b.height)), 1), 4)
-        if z > 1.08 {
-            camera.setZoom(CGFloat(Double(max(camera.currentMM, 13)) / 26 * z))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { camera.syncZoomState() }
+        // Auto zoom — in OR out — so the subject fills what suits it. A
+        // subject running off the frame (a group cut at the edges) zooms out,
+        // switching to the 13 mm if it has to; faces and food never go wider
+        // than ~24 mm (wide-angle distortion).
+        var comp = lastComp
+        if let down = Self.downAngle(SceneMotion.attitude), down < 35 { comp.minMM = max(comp.minMM, 24) }
+        var ratio = Double(comp.fill / max(b.width, b.height))
+        if comp.cutOff { ratio = min(ratio, 0.7) }
+        let swapped = zoom(by: ratio, minMM: comp.minMM, camera: camera)
+        // Start tracking once the zoom (or lens switch) has settled.
+        trackStartAt = CACurrentMediaTime() + (swapped ? 0.9 : 0.6)
+    }
+
+    /// Zoom by `ratio` (>1 in, <1 out) within the subject's lens range.
+    /// Returns true if it changed the zoom.
+    @discardableResult
+    func zoom(by ratio: Double, minMM: Int, camera: CameraManager) -> Bool {
+        let cur = Double(max(camera.currentMM, 13))
+        let lo = Double(max(minMM, 13)), hi = min(cur * 4, 120)
+        let want = min(max(cur * ratio, lo), max(hi, lo))
+        guard abs(want / cur - 1) > 0.08 else { return false }
+        camera.setZoom(CGFloat(want / 26))
+        lastZoomAt = CACurrentMediaTime()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { camera.syncZoomState() }
+        return true
+    }
+
+    /// The phone turned (portrait ⇄ landscape): boxes are in the old upright
+    /// frame, so start over.
+    func orientationChanged(_ angle: Double) {
+        cachedAngle = angle
+        if stage != .suggesting { unlock() }
+        box = nil; hint = nil
+    }
+
+    /// A photo was taken with Frame guide on: log it as a framing example.
+    func noteShot(camera: CameraManager) {
+        guard cachedEnabled, camera.currentDevice?.position == .back else { return }
+        let mm = camera.currentMM
+        if let img = lastUpright {
+            FrameLearning.log(img, view: CGRect(x: 0, y: 0, width: 1, height: 1), kind: "shot", mm: mm, subject: nil)
         }
-        // Start tracking once the zoom has settled.
-        trackStartAt = CACurrentMediaTime() + (z > 1.08 ? 0.6 : 0.1)
     }
 
     func unlock() {
         stage = .suggesting; cachedLocked = false
+        lockContext = nil
         alignedSince = nil; lostSince = nil
         tracked = nil; tracker = nil
     }
@@ -134,13 +190,24 @@ final class FrameAdvisor {
         lastTick = time
         busy = true
         let s = 512 / CGFloat(max(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer)))
-        let small = CIImage(cvPixelBuffer: pixelBuffer).transformed(by: CGAffineTransform(scaleX: s, y: s))
-        let aspect = CGFloat(CVPixelBufferGetWidth(pixelBuffer)) / CGFloat(max(CVPixelBufferGetHeight(pixelBuffer), 1))
+        let angle = cachedAngle
+        var small = CIImage(cvPixelBuffer: pixelBuffer).transformed(by: CGAffineTransform(scaleX: s, y: s))
+        if let o = Self.orientation(angle) {
+            small = small.oriented(o)
+            small = small.transformed(by: CGAffineTransform(translationX: -small.extent.minX, y: -small.extent.minY))
+        }
+        let bufAspect = CGFloat(CVPixelBufferGetWidth(pixelBuffer)) / CGFloat(max(CVPixelBufferGetHeight(pixelBuffer), 1))
+        let aspect = small.extent.width / max(small.extent.height, 1)     // upright
         SceneMotion.start()
         frameAttitude = SceneMotion.attitude          // attitude when this frame was seen
         frameFov = SceneMotion.fovLong(camera.currentDevice)
         Self.queue.async { [self] in
             defer { busy = false }
+            if angle != frameAngle {           // turned since the last frame
+                frameAngle = angle; shown = nil; rival = nil; tracked = nil; learned = nil
+            }
+            bufferAspect = bufAspect
+            lastUpright = small
             analyse(small, time: time, aspect: aspect, camera: camera)
         }
     }
@@ -179,7 +246,19 @@ final class FrameAdvisor {
         }
 
         try? handler.perform([horizonReq])
-        suggest(Self.detect(handler, preferCentre: false), tilt: Self.tilt(horizonReq), time: time, aspect: aspect, image: image)
+        var found = Self.detect(handler, preferCentre: false)
+        // Learned placement (trained on the Mac from your shots), refreshed
+        // every ~1.5 s for the same subject.
+        if let f = found {
+            if let l = learned, Self.iou(l.box, f.box) > 0.4, time - l.at < 1.5 {
+                found!.comp = l.comp
+            } else if let c = FrameLearning.refine(f.box, comp: f.comp, handler: handler) {
+                learned = (f.box, c, time); found!.comp = c
+            } else {
+                learned = (f.box, f.comp, time)
+            }
+        }
+        suggest(found, tilt: Self.tilt(horizonReq), time: time, aspect: aspect, image: image)
     }
 
     // MARK: Stage 1 — suggest (calm)
@@ -255,7 +334,22 @@ final class FrameAdvisor {
         let fill = max(b.width, b.height)
         let fillErr = fill - Self.targetFill
         let tiltErr = tilt ?? 0
-        _ = fillErr   // zoom is handled by the lock's auto zoom (and your pinch)
+        // Keep the size right as the subject moves closer / further (or the
+        // lock's first zoom wasn't enough): re-zoom after it's been off ~1 s.
+        if (fillErr > 0.18 || fill > 0.97 || fillErr < -0.3), zoomSteps < 3, time - lastZoomAt > 2 {
+            if offFillSince == nil { offFillSince = time }
+            if time - offFillSince! > 1 {
+                offFillSince = nil; zoomSteps += 1
+                let ratio = Double(c.fill / max(fill, 0.05)) * (fill > 0.97 ? 0.8 : 1)
+                let minMM = c.minMM
+                lastZoomAt = time
+                DispatchQueue.main.async {
+                    if FrameAdvisor.shared.zoom(by: ratio, minMM: minMM, camera: camera) {
+                        FrameAdvisor.shared.retrack(after: 0.8)
+                    }
+                }
+            }
+        } else { offFillSince = nil }
         let centred = abs(dx) < 0.05 && abs(dy) < 0.065
         let level = abs(tiltErr) < 1.0
         let aligned = centred && level
@@ -270,6 +364,7 @@ final class FrameAdvisor {
             if alignedSince == nil { alignedSince = time }
             if time - alignedSince! > 0.4, !fired {
                 fired = true
+                logGuided(final: b, comp: c, camera: camera)
                 DispatchQueue.main.async {
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
                     if !camera.isCapturing { camera.capturePhoto() }
@@ -295,6 +390,56 @@ final class FrameAdvisor {
         }
     }
 
+    /// After a zoom: detect the subject again and track it from there.
+    func retrack(after delay: Double) {
+        trackStartAt = CACurrentMediaTime() + delay
+        tracked = nil; tracker = nil
+    }
+
+    /// Guided shot: in the wide view seen at the lock, mark where the final
+    /// framing ended up (subject anchor on its target, at today's fill).
+    nonisolated private func logGuided(final b: CGRect, comp c: Composition, camera: CameraManager) {
+        guard let ctx = lockContext else { return }
+        let fillNow = max(b.width, b.height)
+        var cc = c; cc.fill = max(fillNow, 0.05)
+        // The subject's box in the lock-time view, scaled to the final fill.
+        if let v = FrameLearning.view(for: ctx.box, comp: cc) {
+            let subj = lockedIsGroup ? "people" : "object"
+            DispatchQueue.main.async {
+                FrameLearning.log(ctx.image, view: v, kind: "guided", mm: camera.currentMM, subject: subj)
+            }
+        }
+    }
+
+    /// Image orientation that turns the (portrait) camera buffer upright for
+    /// the way the phone is held. `iconAngle`: 90 = top of the phone to the left.
+    nonisolated static func orientation(_ angle: Double) -> CGImagePropertyOrientation? {
+        switch angle {
+        case 90: return .left
+        case -90: return .right
+        case 180: return .down
+        default: return nil
+        }
+    }
+
+    /// Upright ⇄ buffer coordinates (top-left normalized rects).
+    nonisolated static func toBuffer(_ r: CGRect, angle: Double) -> CGRect {
+        switch angle {
+        case 90: return CGRect(x: 1 - r.maxY, y: r.minX, width: r.height, height: r.width)
+        case -90: return CGRect(x: r.minY, y: 1 - r.maxX, width: r.height, height: r.width)
+        case 180: return CGRect(x: 1 - r.maxX, y: 1 - r.maxY, width: r.width, height: r.height)
+        default: return r
+        }
+    }
+    nonisolated static func toUpright(_ r: CGRect, angle: Double) -> CGRect {
+        switch angle {
+        case 90: return CGRect(x: r.minY, y: 1 - r.maxX, width: r.height, height: r.width)
+        case -90: return CGRect(x: 1 - r.maxY, y: r.minX, width: r.height, height: r.width)
+        case 180: return CGRect(x: 1 - r.maxX, y: 1 - r.maxY, width: r.width, height: r.height)
+        default: return r
+        }
+    }
+
     // MARK: Detection
 
     /// The thing to frame, smartest first: faces (group, padded for bodies),
@@ -314,6 +459,8 @@ final class FrameAdvisor {
         if !faceObs.isEmpty {
             let faces = faceObs.map(\.boundingBox)
             let u = faces.dropFirst().reduce(faces[0]) { $0.union($1) }
+            let edge: CGFloat = 0.04
+            let facesCut = u.minX < edge || u.maxX > 1 - edge || u.maxY > 1 - edge
             let fh = faces.map(\.height).max() ?? 0.1
             let body = CGRect(x: u.minX - fh * 0.6, y: u.minY - fh * 2.2,
                               width: u.width + fh * 1.2, height: u.height + fh * 2.6)
@@ -330,10 +477,12 @@ final class FrameAdvisor {
                     let x: CGFloat = abs(yaw) > 0.25 ? (yaw > 0 ? third : 1 - third) : 0.5
                     comp.target = CGPoint(x: x, y: third)
                     comp.fill = 0.7
+                    comp.minMM = 24
                 } else {
                     // Group: centred, eyes a little under the upper third (headroom).
                     comp.target = CGPoint(x: 0.5, y: 0.36)
                     comp.fill = 0.82
+                    comp.cutOff = facesCut
                 }
                 return (b, true, comp)
             }
@@ -346,6 +495,7 @@ final class FrameAdvisor {
                 comp.anchor = CGPoint(x: 0.5, y: 0.12)            // roughly the head
                 comp.target = CGPoint(x: b.width > 0.45 ? 0.5 : nearestThird(b.midX), y: 0.28)
                 comp.fill = 0.8
+                comp.cutOff = u.minX < 0.03 || u.maxX > 0.97 || u.maxY > 0.97
                 return (b, true, comp)
             }
         }
@@ -359,7 +509,10 @@ final class FrameAdvisor {
             return comp
         }
         let animals = (animalReq.results ?? []).filter { $0.confidence > 0.6 }.map(\.boundingBox)
-        if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) { return (b, false, objectComp(b)) }
+        if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) {
+            var c = objectComp(b); c.minMM = 24
+            return (b, false, c)
+        }
 
         let salReq = VNGenerateObjectnessBasedSaliencyImageRequest()
         try? handler.perform([salReq])
@@ -399,7 +552,9 @@ final class FrameAdvisor {
         // Row luminance (row 0 = bottom) and per-row detail (variation across the row).
         var lum = [Float](repeating: 0, count: n), detail = [Float](repeating: 0, count: n)
         for r in 0..<n {
-            let row = (0..<8).map { c -> Float in let i = (r * 8 + c) * 4; return 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2] }
+            // Bitmap memory row 0 is the top of the image; index rows from the bottom.
+            let mr = n - 1 - r
+            let row = (0..<8).map { c -> Float in let i = (mr * 8 + c) * 4; return 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2] }
             lum[r] = row.reduce(0, +) / 8
             let m = lum[r]; detail[r] = row.map { abs($0 - m) }.reduce(0, +) / 8
         }
@@ -449,22 +604,26 @@ final class FrameAdvisor {
 
     /// Carry the stored box to this frame's attitude (the phone moved since).
     nonisolated private func anchorShown(aspect: CGFloat) {
-        if let b = shown {
-            shown = SceneMotion.reproject(b, from: shownAttitude, to: frameAttitude, fovLong: frameFov, aspect: Double(aspect))
+        // Reprojection works in the camera buffer's frame (the gyro's portrait axes).
+        let a = frameAngle, ba = Double(bufferAspect)
+        func carry(_ r: CGRect) -> CGRect {
+            Self.toUpright(SceneMotion.reproject(Self.toBuffer(r, angle: a), from: shownAttitude, to: frameAttitude,
+                                                 fovLong: frameFov, aspect: ba), angle: a)
         }
-        if let r = rival {
-            rival = SceneMotion.reproject(r, from: shownAttitude, to: frameAttitude, fovLong: frameFov, aspect: Double(aspect))
-        }
+        if let b = shown { shown = carry(b) }
+        if let r = rival { rival = carry(r) }
         shownAttitude = frameAttitude
     }
 
     nonisolated private func publish(box: CGRect?, stage: Stage, hint: String?, aspect: CGFloat) {
         let att = frameAttitude, fov = frameFov
         let comp = cachedLocked ? lockedComp : shownComp
+        let angle = frameAngle, bufAspect = bufferAspect
+        let box = box.map { Self.toBuffer($0, angle: angle) }      // screen draws buffer coords
         Task { @MainActor in
             let a = FrameAdvisor.shared
-            guard a.cachedEnabled else { return }
-            a.imageAspect = aspect
+            guard a.cachedEnabled, a.cachedAngle == angle else { return }
+            a.imageAspect = bufAspect
             a.boxAttitude = att
             a.fovLong = fov
             a.lastComp = comp

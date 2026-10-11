@@ -346,6 +346,17 @@ struct CamSettingsSheet: View {
                     Toggle("Volume buttons take the photo", isOn: $camera.volumeShutterEnabled)
                     Toggle("Left-handed shutter", isOn: $camera.shutterOnLeft)
                 }
+                Section("Frame guide learning") {
+                    let n = FrameLearning.sampleCount
+                    LabeledContent("Framings logged", value: "\(n)")
+                    if let sc = FrameLearning.scorer {
+                        LabeledContent("Learned model", value: "\(sc.samples ?? 0) shots · \(Int((sc.accuracy ?? 0) * 100))%")
+                    } else {
+                        LabeledContent("Learned model", value: n < 30 ? "needs \(30 - n) more shots" : "plug into the Mac")
+                    }
+                    Text("Shots taken with Frame guide on teach it your framing. Training runs on the Mac whenever the phone is plugged in, never on the phone.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Location") {
                     Toggle("Tag photos with location", isOn: $geotag.enabled)
                 }

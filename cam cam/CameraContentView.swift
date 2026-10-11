@@ -496,6 +496,7 @@ struct CameraContentView: View {
         }
         .onChange(of: motion.iconAngle) { _, newValue in
             camera.deviceAngle = newValue
+            frameAdvisor.orientationChanged(newValue)
         }
         .onChange(of: cleanMode) { _, isClean in
             if isClean && !camera.showZoomSlider {

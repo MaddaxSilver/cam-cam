@@ -39,20 +39,21 @@ import CoreLocation
             self.roll = motion.attitude.roll * 180.0 / .pi
             self.pitch = motion.attitude.pitch * 180.0 / .pi
 
-            // Determine device orientation from gravity
+            // Device orientation from gravity, with hysteresis: switch only
+            // once the phone is well past the diagonal (within 30° of the new
+            // orientation), and never while it's held flat (food, documents),
+            // where gravity's x/y are just noise. Without this the UI and the
+            // saved photo's rotation flicker near 45° and when shooting down.
             let g = motion.gravity
-            let newAngle: Double
-            if abs(g.x) > abs(g.y) {
-                // Landscape — negate to counter the tilt so text stays upright
-                newAngle = g.x > 0 ? -90 : 90
-            } else if g.y > 0.8 {
-                // Upside down
-                newAngle = 180
-            } else {
-                // Portrait (normal)
-                newAngle = 0
+            let planar = hypot(g.x, g.y)
+            // 0 = portrait, 90 = top pointing left, -90 = top right, 180 = upside down
+            let phi = atan2(-g.x, -g.y) * 180 / .pi
+            func diff(_ a: Double, _ b: Double) -> Double { abs(remainder(a - b, 360)) }
+            var newAngle = self.iconAngle
+            if planar > 0.5, diff(phi, self.iconAngle) > 45 + 15 {
+                for cand in [0.0, 90, -90, 180] where diff(phi, cand) < 30 { newAngle = cand }
             }
-            let landscape = abs(g.x) > abs(g.y)
+            let landscape = abs(newAngle) == 90
 
             // Compute orientation-aware level tilt from gravity. The screen's "down"
             // direction in device coords depends on current rotation:

@@ -1924,6 +1924,7 @@ import CoreLocation
             return
         }
         isCapturing = true   // didSet pushes Watch state — no need to call pushState again
+        FrameAdvisor.shared.noteShot(camera: self)   // framing example for the Mac-side training
         wantsShutterThumb = true      // next live frame becomes the thumbnail, instantly
         // Each shot keeps its own copy of the settings: the shutter frees as soon
         // as the exposure is taken, so the next shot can start before this one
