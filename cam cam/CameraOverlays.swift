@@ -367,6 +367,8 @@ extension UIImage {
 
 struct FocusIndicator: View {
     let position: CGPoint
+    /// Stays on screen (AE/AF lock) instead of fading out.
+    var persistent = false
     @State private var scale: CGFloat = 1.5
     @State private var opacity: Double = 1.0
 
@@ -381,8 +383,10 @@ struct FocusIndicator: View {
                 withAnimation(.easeOut(duration: 0.3)) {
                     scale = 1.0
                 }
-                withAnimation(.easeOut(duration: 1.5).delay(0.5)) {
-                    opacity = 0.0
+                if !persistent {
+                    withAnimation(.easeOut(duration: 1.5).delay(0.5)) {
+                        opacity = 0.0
+                    }
                 }
             }
     }

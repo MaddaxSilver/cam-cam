@@ -106,6 +106,8 @@ struct CameraContentView: View {
     @State private var touchStart: Date? = nil
     @State private var holdFired = false
     @State private var holdWork: DispatchWorkItem? = nil
+    /// Where AE/AF lock was set; its square stays until the lock is released.
+    @State private var lockPoint: CGPoint? = nil
 
     var body: some View {
         @Bindable var camera = camera
@@ -158,10 +160,9 @@ struct CameraContentView: View {
                                     guard !camera.manualFocusEnabled, pinchBaseZoom == nil else { return }
                                     holdFired = true
                                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                    focusPoint = CGPoint(x: loc.x, y: loc.y + py)
-                                    showFocusIndicator = true
+                                    showFocusIndicator = false
+                                    lockPoint = CGPoint(x: loc.x, y: loc.y + py)
                                     camera.lockFocusAndExposure(at: CGPoint(x: loc.y / ph, y: 1.0 - loc.x / pw))
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { showFocusIndicator = false }
                                 }
                                 holdWork = work
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
@@ -237,6 +238,12 @@ struct CameraContentView: View {
                 // Focus indicator (tap-to-focus square)
                 if showFocusIndicator, let pt = focusPoint {
                     FocusIndicator(position: pt)
+                        .allowsHitTesting(false)
+                }
+                // AE/AF lock square: stays while locked (like Apple's Camera)
+                if camera.focusLocked, let pt = lockPoint {
+                    FocusIndicator(position: pt, persistent: true)
+                        .id(pt.x + pt.y)
                         .allowsHitTesting(false)
                 }
 
