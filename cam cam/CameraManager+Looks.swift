@@ -49,6 +49,7 @@ extension CameraManager {
         }
         // Under thermal pressure, keep the base look but drop the expensive
         // extras from the live path (captures are unaffected).
+        if cachedDevelopment > 0 { img = applyDevelopment(img, strength: cachedDevelopment) }
         let throttled = cachedThermalThrottle
         if !throttled {
             if cachedCrosstalkEnabled { img = applyColorCrosstalk(input: img, amount: cachedCrosstalkAmount) }
@@ -152,6 +153,7 @@ extension CameraManager {
         r.halationEnabled = pendingHalationEnabled;   r.halation = pendingHalation
         r.rolloffEnabled = pendingRolloffEnabled;     r.rolloff = pendingRolloff
         r.pushPullEnabled = pendingPushPullEnabled;   r.pushPull = pendingPushPullAmount
+        r.development = pendingDevelopment
         r.anamorphicFlare = pendingAnamorphicFlareEnabled
         r.lightArtifacts = pendingLightArtifactsEnabled
         r.filmScratches = pendingFilmScratchesEnabled
@@ -176,6 +178,7 @@ extension CameraManager {
         r.halationEnabled = cachedHalationEnabled;   r.halation = cachedHalationAmount
         r.rolloffEnabled = cachedRolloffEnabled;     r.rolloff = cachedRolloffThreshold
         r.pushPullEnabled = cachedPushPullEnabled;   r.pushPull = cachedPushPullAmount
+        r.development = cachedDevelopment
         r.anamorphicFlare = cachedAnamorphicFlare
         r.lightArtifacts = cachedLightArtifacts
         r.filmScratches = cachedFilmScratches
@@ -240,6 +243,7 @@ extension CameraManager {
             image = applyLivePortraitBlur(to: image, fStop: fStop)
         }
 
+        if r.development > 0 { image = applyDevelopment(image, strength: r.development) }
         if r.crosstalkEnabled { image = applyColorCrosstalk(input: image, amount: r.crosstalk) }
         if r.halationEnabled  { image = applyHalation(input: image, amount: r.halation) }
         if r.rolloffEnabled   { image = applyHighlightRolloff(input: image, threshold: r.rolloff) }
@@ -2266,6 +2270,25 @@ extension CameraManager {
         return loaded
     }
     nonisolated static func printKernel() -> CIColorKernel? { filmKernel("densityPrint") }
+
+    /// Developer exhaustion / adjacency effects (see filmDevelop in
+    /// FilmProcess.ci.metal). Diffusion distances scale with the frame, so the
+    /// live preview and the full-res photo match.
+    nonisolated func applyDevelopment(_ input: CIImage, strength: Float) -> CIImage {
+        guard strength > 0, let k = CameraManager.filmKernel("filmDevelop") else { return input }
+        let extent = input.extent
+        let size = Double(max(extent.width, extent.height))
+        let luma = input.applyingFilter("CISRGBToneCurveToLinear")
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0),
+                "inputGVector": CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0),
+                "inputBVector": CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0),
+            ])
+            .clampedToExtent()
+        let near = luma.applyingGaussianBlur(sigma: size * 0.006).cropped(to: extent)
+        let far = luma.applyingGaussianBlur(sigma: size * 0.035).cropped(to: extent)
+        return k.apply(extent: extent, arguments: [input, near, far, CGFloat(min(max(strength, 0), 1))]) ?? input
+    }
 
     /// Physically-modelled grain (see FilmProcess.ci.metal). `fine` is the
     /// per-grain noise; clumps are the same noise at 3× scale.

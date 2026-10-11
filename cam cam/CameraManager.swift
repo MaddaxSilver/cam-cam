@@ -265,6 +265,12 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) var cachedRolloffThreshold: Float = 0.9
     @ObservationIgnored nonisolated(unsafe) var cachedPushPullEnabled: Bool = false
     @ObservationIgnored nonisolated(unsafe) var cachedPushPullAmount: Float = 0.0
+    /// Development: 0 = agitated (normal) … 1 = stand development.
+    var development: Float = UserDefaults.standard.float(forKey: "cc_development") {
+        didSet { UserDefaults.standard.set(development, forKey: "cc_development"); cachedDevelopment = development }
+    }
+    @ObservationIgnored nonisolated(unsafe) var cachedDevelopment: Float = UserDefaults.standard.float(forKey: "cc_development")
+    @ObservationIgnored nonisolated(unsafe) var pendingDevelopment: Float = 0
 
     // Cached rainbow gradient for the circuit-bent thermal LUT. Built once
     // (CGContext draw is expensive) and reused every frame via CIColorMap.
@@ -1881,6 +1887,7 @@ import CoreLocation
         let shotLongExposureDuration = longExposureDuration
         let shotPushPullEnabled = pushPullEnabled
         let shotPushPullAmount = pushPullAmount
+        let shotDevelopment = development
         let shotAnamorphicFlareEnabled = anamorphicFlareEnabled
         let shotLightArtifactsEnabled = lightArtifactsEnabled
         let shotFilmScratchesEnabled = filmScratchesEnabled
@@ -1911,6 +1918,7 @@ import CoreLocation
             pendingLongExposureDuration = shotLongExposureDuration
             pendingPushPullEnabled = shotPushPullEnabled
             pendingPushPullAmount = shotPushPullAmount
+            pendingDevelopment = shotDevelopment
             pendingAnamorphicFlareEnabled = shotAnamorphicFlareEnabled
             pendingLightArtifactsEnabled = shotLightArtifactsEnabled
             pendingFilmScratchesEnabled = shotFilmScratchesEnabled
@@ -2028,6 +2036,7 @@ import CoreLocation
         pendingRolloffEnabled = rolloffEnabled
         pendingPushPullEnabled = pushPullEnabled
         pendingPushPullAmount = pushPullAmount
+        pendingDevelopment = development
         pendingAnamorphicFlareEnabled = anamorphicFlareEnabled
         pendingLightArtifactsEnabled = lightArtifactsEnabled
         pendingFilmScratchesEnabled = filmScratchesEnabled

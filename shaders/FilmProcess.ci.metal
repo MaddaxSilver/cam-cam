@@ -150,4 +150,24 @@ float4 filmEngine(sample_t s,
     return float4(linearToSrgb(outLin), s.a);
 }
 
+// MARK: - Development (developer exhaustion / adjacency effects)
+//
+// Developer is used up where the film got a lot of light, and fresh developer
+// diffuses in from darker neighbours. So development depends on the
+// NEIGHBOURHOOD's exposure, not just the pixel's: large bright areas develop
+// less (highlights compress and keep detail), and along a bright/dark edge the
+// bright side gets fresh developer and develops more (edge "pop", Mackie
+// lines) — film's natural local contrast. Stand development (no agitation)
+// makes it strong; frequent agitation keeps it weak.
+//   near, far: linear luminance blurred at a short and a long diffusion
+//              distance (developer spreading during development).
+//   strength:  0 = fully agitated (no effect) … 1 = stand development.
+float4 filmDevelop(sample_t s, sample_t near, sample_t far, float strength)
+{
+    float3 lin = srgbToLinear(s.rgb);
+    float exhaustion = 0.6 * near.r + 0.4 * far.r;
+    float gain = pow((0.18 + 0.05) / (max(exhaustion, 0.0) + 0.05), 0.5 * strength);
+    return float4(linearToSrgb(lin * clamp(gain, 0.35, 2.5)), s.a);
+}
+
 }}

@@ -171,6 +171,8 @@ nonisolated enum LookAudit {
         v("Scratches") { $0.filmScratches = true; $0.randomSeed = 7 }
         v("Randomize") { $0.randomization = true; $0.randomSeed = 7 }
         v("Cross-dev") { $0.crossProcessed = true }
+        v("Develop 0.5") { $0.development = 0.5 }
+        v("Stand dev") { $0.development = 1 }
         for kind in LensKind.allCases where kind != .none {
             v("Lens \(kind.label)") { r in
                 var c = CustomSimulation(); c.name = "Audit"; c.baseSim = .kodakPortra; c.lens = kind.rawValue

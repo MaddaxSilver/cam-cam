@@ -39,6 +39,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
     var halationEnabled = false;   var halation: Float = 0.2
     var rolloffEnabled = false;    var rolloff: Float = 0.9
     var pushPullEnabled = false;   var pushPull: Float = 0
+    var development: Float = 0          // 0 agitated … 1 stand development
     var anamorphicFlare = false
     var lightArtifacts = false
     var filmScratches = false
@@ -58,7 +59,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
     /// A recipe that changes nothing (no sim, no effects).
     var isIdentity: Bool {
         sim == .none && custom == nil && !grainEnabled && !crosstalkEnabled
-            && !halationEnabled && !rolloffEnabled && !pushPullEnabled
+            && !halationEnabled && !rolloffEnabled && !pushPullEnabled && development == 0
             && !anamorphicFlare && !lightArtifacts && !filmScratches && !randomization
             && !crossProcessed
     }
@@ -76,7 +77,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         case crosstalkEnabled, crosstalk, halationEnabled, halation, rolloffEnabled, rolloff
         case pushPullEnabled, pushPull, anamorphicFlare, lightArtifacts, filmScratches
         case randomization, randomSeed
-        case styleTone, styleColor, stylePalette, crossProcessed
+        case styleTone, styleColor, stylePalette, crossProcessed, development
     }
 
     init() {}
@@ -107,6 +108,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         styleColor       = v(.styleColor, Float(0))
         stylePalette     = v(.stylePalette, Float(1))
         crossProcessed   = v(.crossProcessed, false)
+        development      = v(.development, Float(0))
     }
 
     func encoded() -> Data? { try? JSONEncoder().encode(self) }

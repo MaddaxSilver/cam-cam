@@ -442,6 +442,13 @@ struct GlassChrome<Shutter: View>: View {
                          isOn: Binding(get: { camera.manualFocusEnabled }, set: { camera.setManualFocusEnabled($0) })),
                     Tile(title: "One lens", symbol: "arrow.left.and.right.circle", isOn: $camera.unifiedZoomMode),
                 ])
+                GlassRuler(title: "Development",
+                           valueText: camera.development == 0 ? "Off"
+                               : camera.development < 0.35 ? "Light" : camera.development < 0.75 ? "Semi-stand" : "Stand",
+                           isOn: Binding(get: { camera.development > 0 },
+                                         set: { camera.development = $0 ? 0.6 : 0 }),
+                           value: Binding(get: { Double(camera.development) }, set: { camera.development = Float($0) }),
+                           range: 0...1)
                 if camera.pushPullEnabled {
                     segmentRow(title: "Push / pull",
                                options: [(-2, "−2"), (-1, "−1"), (0, "0"), (1, "+1"), (2, "+2"), (3, "+3")],
