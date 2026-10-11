@@ -179,12 +179,12 @@ final class FrameAdvisor {
         }
 
         try? handler.perform([horizonReq])
-        suggest(Self.detect(handler, preferCentre: false), tilt: Self.tilt(horizonReq), time: time, aspect: aspect)
+        suggest(Self.detect(handler, preferCentre: false), tilt: Self.tilt(horizonReq), time: time, aspect: aspect, image: image)
     }
 
     // MARK: Stage 1 — suggest (calm)
 
-    nonisolated private func suggest(_ found: Subject?, tilt: Double?, time: Double, aspect: CGFloat) {
+    nonisolated private func suggest(_ found: Subject?, tilt: Double?, time: Double, aspect: CGFloat, image: CIImage) {
         anchorShown(aspect: aspect)
         if let f = found, Self.worthFraming(f.box) {
             lastSeen = time
@@ -206,8 +206,24 @@ final class FrameAdvisor {
             shown = nil                                        // linger ~4 s after it's gone
         }
         var tip: String? = nil
-        if let t = tilt, abs(t) > 1.5 { tip = String(format: "Tilt %.0f° %@", abs(t), t > 0 ? "right" : "left") }
-        else if shown != nil { tip = (found?.isGroup ?? false) ? "Tap the box to frame the group" : "Tap the box to frame this shot" }
+        if let down = Self.downAngle(frameAttitude), down < 35 {
+            // Overhead / flat lay (food, table): hold the phone parallel to it.
+            tip = down < 2 ? "Flat ✓" : String(format: "Hold it flat — %.0f°", down)
+        } else if let t = tilt, abs(t) > 1.5 {
+            tip = String(format: "Tilt %.0f° %@", abs(t), t > 0 ? "right" : "left")
+        } else if shown == nil, tilt != nil, let h = Self.horizonPlacement(image) {
+            // Landscape: horizon on a third — more of whichever half has more
+            // going on. Busy sky → horizon on the lower third (more sky);
+            // busy ground → horizon on the upper third (more foreground).
+            // Tilting the phone up moves the horizon DOWN the frame.
+            let want: CGFloat = h.skyBusier ? 2.0 / 3 : 1.0 / 3       // top-left y
+            if abs(h.y - want) > 0.08 {
+                if h.y < want { tip = h.skyBusier ? "Tilt up — more sky" : "Tilt up a little" }
+                else { tip = h.skyBusier ? "Tilt down a little" : "Tilt down — more foreground" }
+            }
+        } else if shown != nil {
+            tip = (found?.isGroup ?? false) ? "Tap the box to frame the group" : "Tap the box to frame this shot"
+        }
         publish(box: shown, stage: .suggesting, hint: tip, aspect: aspect)
     }
 
@@ -360,6 +376,42 @@ final class FrameAdvisor {
             return rects.min { hypot($0.midX - 0.5, $0.midY - 0.5) < hypot($1.midX - 0.5, $1.midY - 0.5) }
         }
         return rects.max { $0.width * $0.height < $1.width * $1.height }
+    }
+
+    /// Degrees between the camera's view and straight down (nil when it's
+    /// not pointing downward at all).
+    nonisolated static func downAngle(_ q: simd_quatd) -> Double? {
+        let view = q.act(simd_double3(0, 0, -1))        // camera direction in the world (z up)
+        guard view.z < 0 else { return nil }
+        return acos(min(1, -view.z)) * 180 / .pi
+    }
+
+    /// Where the horizon sits (top-left y) and whether the sky half has more
+    /// detail than the ground half — from luminance down the frame.
+    nonisolated static func horizonPlacement(_ image: CIImage) -> (y: CGFloat, skyBusier: Bool)? {
+        let n = 48
+        let e = image.extent
+        let strip = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+            .transformed(by: CGAffineTransform(scaleX: 8 / e.width, y: CGFloat(n) / e.height))
+        var buf = [Float](repeating: 0, count: 8 * n * 4)
+        CIContext(options: [.cacheIntermediates: false]).render(strip, toBitmap: &buf, rowBytes: 8 * 16,
+            bounds: CGRect(x: 0, y: 0, width: 8, height: n), format: .RGBAf, colorSpace: nil)
+        // Row luminance (row 0 = bottom) and per-row detail (variation across the row).
+        var lum = [Float](repeating: 0, count: n), detail = [Float](repeating: 0, count: n)
+        for r in 0..<n {
+            let row = (0..<8).map { c -> Float in let i = (r * 8 + c) * 4; return 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2] }
+            lum[r] = row.reduce(0, +) / 8
+            let m = lum[r]; detail[r] = row.map { abs($0 - m) }.reduce(0, +) / 8
+        }
+        var best = 0, bestStep: Float = 0
+        for i in 2..<(n - 2) {
+            let step = (lum[i + 1] + lum[i + 2]) - (lum[i - 1] + lum[i - 2])     // brighter above
+            if step > bestStep { bestStep = step; best = i }
+        }
+        guard bestStep > 0.2 else { return nil }
+        let skyDetail = detail[(best + 1)...].reduce(0, +) / Float(n - best - 1)
+        let groundDetail = detail[..<best].reduce(0, +) / Float(max(best, 1))
+        return (1 - CGFloat(best) / CGFloat(n - 1), skyDetail > groundDetail * 1.15)
     }
 
     nonisolated static func tilt(_ req: VNDetectHorizonRequest) -> Double? {
