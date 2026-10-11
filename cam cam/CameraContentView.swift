@@ -110,16 +110,12 @@ struct CameraContentView: View {
     var body: some View {
         @Bindable var camera = camera
         GeometryReader { geo in
-            // The preview is the camera's own 3:4 frame (like Apple's Camera in
-            // Photo mode), not stretched across the tall screen: filling the
-            // screen cut ~40% off the sides, so photos showed far more than the
-            // preview did. Everything that maps onto the image lives in it.
-            let pw = geo.size.width
-            let ph = pw * 4 / 3
-            // Below the status bar and the top controls, like Apple's Camera.
+            // Full-screen preview (aspect-filled to the screen).
             let topInset = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
                 .windows.first?.safeAreaInsets.top ?? 47
-            let py = min(topInset + 58, max(0, geo.size.height - ph))
+            let pw = geo.size.width
+            let ph = geo.size.height
+            let py: CGFloat = 0
             ZStack {
                 Color.black.ignoresSafeArea()
                 // Camera layer
@@ -193,7 +189,7 @@ struct CameraContentView: View {
                         .foregroundStyle(.black)
                         .padding(.horizontal, 10).padding(.vertical, 4)
                         .background(Color.yellow, in: RoundedRectangle(cornerRadius: 5))
-                        .position(x: pw / 2, y: py + 22)
+                        .position(x: pw / 2, y: topInset + 70)
                         .allowsHitTesting(false)
                         .transition(.opacity)
                 }
