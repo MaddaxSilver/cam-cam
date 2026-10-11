@@ -19,6 +19,7 @@
 //
 
 import CoreImage
+import ImageIO
 import Foundation
 import UIKit
 import Vision
@@ -46,11 +47,14 @@ nonisolated enum FrameLearning {
         queue.async {
             let id = String(format: "%.0f-%04d", Date().timeIntervalSince1970 * 1000, Int.random(in: 0..<10000))
             let e = image.extent
-            let im = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
-            guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
-                  let jpg = ctx.jpegRepresentation(of: im, colorSpace: cs,
-                                                   options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.8])
-            else { return }
+            // CPU JPEG encode of the already-copied frame — no GPU work while
+            // the photo itself is processing.
+            let cg = image.cgImage ?? ctx.createCGImage(image, from: e)
+            let jpgData = NSMutableData()
+            guard let cg, let dest = CGImageDestinationCreateWithData(jpgData, "public.jpeg" as CFString, 1, nil) else { return }
+            CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+            guard CGImageDestinationFinalize(dest) else { return }
+            let jpg = jpgData as Data
             let meta: [String: Any] = [
                 "kind": kind, "mm": mm, "subject": subject ?? "",
                 "view": [view.minX, view.minY, view.width, view.height],

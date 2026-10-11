@@ -115,6 +115,8 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) private var learned: (box: CGRect, comp: Composition, at: Double)?
 
     nonisolated private static let queue = DispatchQueue(label: "cam.frameadvisor", qos: .userInitiated)
+    /// One shared context (making one per frame is slow and memory-hungry).
+    nonisolated static let ciContext = CIContext(options: [.cacheIntermediates: false])
     /// How much of the frame the subject should fill when lined up.
     nonisolated static let targetFill: CGFloat = 0.82
 
@@ -207,8 +209,14 @@ final class FrameAdvisor {
                 frameAngle = angle; shown = nil; rival = nil; tracked = nil; learned = nil
             }
             bufferAspect = bufAspect
-            lastUpright = small
-            analyse(small, time: time, aspect: aspect, camera: camera)
+            // Copy the small frame out of the camera's buffer before keeping
+            // it: holding a reference to a live camera buffer (for logging and
+            // the lock context) starves the camera's small buffer pool and the
+            // preview stutters — most visibly right after a shot.
+            guard let cg = Self.ciContext.createCGImage(small, from: small.extent) else { return }
+            let frame = CIImage(cgImage: cg)
+            lastUpright = frame
+            analyse(frame, time: time, aspect: aspect, camera: camera)
         }
     }
 
@@ -547,7 +555,7 @@ final class FrameAdvisor {
         let strip = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
             .transformed(by: CGAffineTransform(scaleX: 8 / e.width, y: CGFloat(n) / e.height))
         var buf = [Float](repeating: 0, count: 8 * n * 4)
-        CIContext(options: [.cacheIntermediates: false]).render(strip, toBitmap: &buf, rowBytes: 8 * 16,
+        ciContext.render(strip, toBitmap: &buf, rowBytes: 8 * 16,
             bounds: CGRect(x: 0, y: 0, width: 8, height: n), format: .RGBAf, colorSpace: nil)
         // Row luminance (row 0 = bottom) and per-row detail (variation across the row).
         var lum = [Float](repeating: 0, count: n), detail = [Float](repeating: 0, count: n)
