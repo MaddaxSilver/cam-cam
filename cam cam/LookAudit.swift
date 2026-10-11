@@ -203,7 +203,7 @@ nonisolated enum LookAudit {
         inputs.append(("effects", scene))
 
         // Film engine pilot: each pilot stock's old look next to the engine.
-        let pilot: [FilmSimulation] = [.kodakPortra, .kodakEktar, .kodakGold, .fujiSuperia, .kodakTriX]
+        let pilot: [FilmSimulation] = [.kodakPortra, .kodakEktar, .kodakGold, .fujiVelvia, .kodakVision3, .fujiSuperia, .kodakTriX]
         let photoInputs = inputs.filter { $0.0 != "effects" }
         for input in photoInputs {
             var row: [(String, CIImage)] = [("Original", input.1)]
@@ -221,7 +221,7 @@ nonisolated enum LookAudit {
         // Contact sheets: 8 per row, labelled.
         for (k, input) in inputs.enumerated() {
             let w = input.1.extent.width, h = input.1.extent.height
-            let perRow = inputs[k].0.hasPrefix("pilot-") ? 11 : 8, labelH: CGFloat = 22
+            let perRow = inputs[k].0.hasPrefix("pilot-") ? 15 : 8, labelH: CGFloat = 22
             let rows = Int(ceil(Double(tiles[k].count) / Double(perRow)))
             let size = CGSize(width: CGFloat(perRow) * (w + 6) + 6, height: CGFloat(rows) * (h + labelH + 6) + 6)
             let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1

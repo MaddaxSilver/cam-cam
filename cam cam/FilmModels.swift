@@ -253,7 +253,28 @@ nonisolated enum FilmSimulation: String, CaseIterable, Identifiable, Sendable, C
         case .kodakVision3_50D:    return "Vision3_50D.cube"
         case .kodakVision3_200T:   return "Vision3_200T.cube"
         case .kodakVision3_250D:   return "Vision3_250D.cube"
+        // Measured replacements for hand-built looks
+        case .kodakPortra:         return "Portra400.cube"
+        case .kodakPortra160:      return "Portra160.cube"
+        case .kodakEktar:          return "Ektar100.cube"
+        case .kodakGold:           return "Gold200.cube"
+        case .kodakUltramax:       return "Ultramax400.cube"
+        case .fujiPro400H:         return "FujiPro400H.cube"
+        case .kodakVision3:        return "Vision3_500T.cube"
+        case .ektachrome100:       return "Ektachrome100.cube"
+        case .kodachrome64:        return "Kodachrome64.cube"
+        case .fujiVelvia:          return "Velvia100.cube"
+        case .fujiProvia:          return "Provia100F.cube"
         default: return nil
+        }
+    }
+
+    /// Stocks that only exist as measured LUTs (no hand-built fallback).
+    var spectralOnly: Bool {
+        switch self {
+        case .kodakPortra800, .kodakPortra800Push1, .kodakPortra800Push2, .kodakVerita200D,
+             .fujiXtra400, .fujiC200, .kodakVision3_50D, .kodakVision3_200T, .kodakVision3_250D: return true
+        default: return false
         }
     }
 

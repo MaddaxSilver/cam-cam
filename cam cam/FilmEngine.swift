@@ -7,8 +7,9 @@
 //  shaders/FilmProcess.ci.metal for the model; this file holds each stock's
 //  numbers and solves its print curve so mid grey prints neutral.
 //
-//  Pilot stocks: Portra, Ektar, Gold, Superia, Tri-X. Everything else still
-//  uses its hand-built look in applyFilmSim.
+//  Engine stocks: Superia, Tri-X (no measured data for them). Stocks with
+//  spektrafilm data use baked LUTs (FilmSimulation.bundledLUT) instead;
+//  everything else still uses its hand-built look in applyFilmSim.
 //
 
 import CoreImage
@@ -45,23 +46,6 @@ nonisolated enum FilmEngine {
     static let baseSlope: Float = 0.55, baseToe: Float = 0.85, baseShoulder: Float = 1.55
 
     static let stocks: [FilmSimulation: Stock] = [
-        // Portra 400: long latitude, soft shoulder, warm skin, gently muted
-        // colour; red layer steeper than blue = cyan-ish shadows, warm highlights.
-        .kodakPortra: Stock(
-            sensitivity: [[0.90, 0.10, 0.00], [0.06, 0.88, 0.06], [0.00, 0.10, 0.90]],
-            slope: [0.90, 0.87, 0.84], toe: 1.071, shoulder: 0.842, saturation: -0.05,
-            black: [0.006, 0.006, 0.007], white: [0.975, 0.962, 0.92], mid: [0.194, 0.18, 0.162]),
-        // Ektar 100: steep, saturated (strong inter-layer effects), crisp reds,
-        // neutral-cool balance.
-        .kodakEktar: Stock(
-            sensitivity: [[1.07, -0.05, -0.02], [-0.03, 1.05, -0.02], [-0.01, -0.05, 1.06]],
-            slope: [1.10, 1.08, 1.08], saturation: 0.17,
-            black: [0.002, 0.002, 0.003], white: [0.985, 0.98, 0.985], mid: [0.182, 0.18, 0.182]),
-        // Gold 200: warm, creamy-yellow highlights (flatter blue layer), good colour.
-        .kodakGold: Stock(
-            sensitivity: [[0.94, 0.06, 0.00], [0.04, 0.92, 0.04], [0.00, 0.08, 0.92]],
-            slope: [1.02, 1.0, 0.90], toe: 1.029, shoulder: 0.947, saturation: 0.10,
-            black: [0.006, 0.005, 0.003], white: [0.985, 0.962, 0.88], mid: [0.205, 0.182, 0.144]),
         // Superia 400: punchy greens, slightly green-cool, magenta-leaning reds.
         .fujiSuperia: Stock(
             sensitivity: [[0.93, 0.05, 0.02], [0.03, 0.95, 0.02], [0.00, 0.06, 0.94]],

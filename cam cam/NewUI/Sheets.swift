@@ -346,7 +346,7 @@ struct CamSettingsSheet: View {
                 }
                 Section("Film data") {
                     // Required attribution (CC BY-SA 4.0) for the spectral stocks.
-                    Text("Portra 800 (+1, +2), Verita 200D, Xtra 400, C200 and Vision3 50D / 200T / 250D are rendered from spektrafilm film and print profiles by Andrea Volpato, licensed CC BY-SA 4.0.")
+                    Text("Portra 160 / 400 / 800 (+1, +2), Ektar, Gold, Ultramax, Verita 200D, Pro 400H, Xtra 400, C200, Vision3 50D / 200T / 250D / 500T, Ektachrome, Kodachrome, Velvia and Provia are rendered from spektrafilm film and print profiles by Andrea Volpato, licensed CC BY-SA 4.0.")
                         .font(.footnote)
                     Link("github.com/andreavolpato/spektrafilm",
                          destination: URL(string: "https://github.com/andreavolpato/spektrafilm")!)

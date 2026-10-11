@@ -338,7 +338,11 @@ extension CameraManager {
         let speckle: CGFloat = grainEnabled ? min(1.0, CGFloat(grain) / 0.5) : 0
         // Stocks on the film engine (modelled in exposure, see FilmEngine).
         if let film = FilmEngine.apply(image, sim: sim) { return film }
-        if let lut = sim.bundledLUT { return LUTManager.shared.apply(filename: lut, to: image) }
+        // Measured (spektrafilm) stocks; the audit turns `FilmEngine.enabled`
+        // off to compare against the old hand-built looks.
+        if let lut = sim.bundledLUT, FilmEngine.enabled || sim.spectralOnly {
+            return LUTManager.shared.apply(filename: lut, to: image)
+        }
         switch sim {
         case .none:
             return image
