@@ -102,6 +102,27 @@ struct CameraContentView: View {
     @State private var recordingPendingLock = false
     @State private var startupBlackOpacity: Double = 1.0
     @State private var lockDragOffset: CGFloat = 0
+    /// Pinch to zoom, shared by the preview and the Frame guide box.
+    private var pinchGesture: some Gesture {
+        MagnifyGesture()
+            .onChanged { v in
+                // Start from the focal length actually on screen:
+                // `zoom` isn't updated by lens presets, so using it
+                // made the first frame jump (the start stutter).
+                if pinchBaseZoom == nil { pinchBaseZoom = Double(max(camera.currentMM, 13)) / 26 }
+                // Small dead zone so the gesture doesn't twitch as fingers land.
+                guard abs(v.magnification - 1) > 0.03 else { return }
+                let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
+                camera.setZoom(CGFloat(z))
+            }
+            .onEnded { v in
+                let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
+                camera.zoom = z
+                pinchBaseZoom = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { camera.syncZoomState() }
+            }
+    }
+
     @State private var smartTake = SmartTake.shared
     @State private var frameAdvisor = FrameAdvisor.shared
     /// Touch tracking on the preview: tap to focus, hold for AE/AF lock.
@@ -127,25 +148,7 @@ struct CameraContentView: View {
                     .frame(width: pw, height: ph)
                     .clipped()
                     .contentShape(Rectangle())
-                    .gesture(
-                        MagnifyGesture()
-                            .onChanged { v in
-                                // Start from the focal length actually on screen:
-                                // `zoom` isn't updated by lens presets, so using it
-                                // made the first frame jump (the start stutter).
-                                if pinchBaseZoom == nil { pinchBaseZoom = Double(max(camera.currentMM, 13)) / 26 }
-                                // Small dead zone so the gesture doesn't twitch as fingers land.
-                                guard abs(v.magnification - 1) > 0.03 else { return }
-                                let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
-                                camera.setZoom(CGFloat(z))
-                            }
-                            .onEnded { v in
-                                let z = min(max((pinchBaseZoom ?? 1) * v.magnification, 0.5), camera.maxManualZoom)
-                                camera.zoom = z
-                                pinchBaseZoom = nil
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { camera.syncZoomState() }
-                            }
-                    )
+                    .gesture(pinchGesture)
                     // One touch handler: a short touch focuses there, a half-second
                     // hold locks focus + exposure (AE/AF LOCK). A separate tap and
                     // long-press plus a location tracker swallowed every tap.
@@ -203,6 +206,7 @@ struct CameraContentView: View {
                             if frameAdvisor.stage == .suggesting { frameAdvisor.lock(camera: camera) }
                             else { frameAdvisor.unlock() }
                         }
+                        .simultaneousGesture(pinchGesture)   // pinch still zooms over the box
                         .position(x: r.midX, y: r.midY)
                         .animation(.easeOut(duration: 0.25), value: box)
                         .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
