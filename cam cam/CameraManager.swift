@@ -799,12 +799,14 @@ import CoreLocation
             let bPhoto = b.supportedMaxPhotoDimensions
                 .map { Int($0.width) * Int($0.height) }.max() ?? 0
             if aPhoto != bPhoto { return aPhoto < bPhoto }
-            // Same photo size: prefer the SMALLER live feed (still ≥1080p).
-            // Every frame is filtered for the preview, so a 12MP feed costs
-            // ~4× the bandwidth, heat and battery of a 1920-wide one.
+            // Same photo size: the widest field of view first. Smaller feeds
+            // are often a cropped sensor readout, so the preview showed less
+            // than the photo (seen on the ultra-wide, where every format makes
+            // a 12MP photo). Then the larger feed.
+            if abs(a.videoFieldOfView - b.videoFieldOfView) > 0.5 { return a.videoFieldOfView < b.videoFieldOfView }
             let aVid = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let bVid = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-            return Int(aVid.width) * Int(aVid.height) > Int(bVid.width) * Int(bVid.height)
+            return Int(aVid.width) * Int(aVid.height) < Int(bVid.width) * Int(bVid.height)
         }
         guard let best else { return }
         device.activeFormat = best
