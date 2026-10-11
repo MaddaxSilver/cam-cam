@@ -9,6 +9,7 @@
 //
 //   1. Meter: a 64×48 luminance grid of the live frame, centre-weighted, and
 //      weighted toward the subject by Vision attention saliency (~2×/s).
+//      With a face in frame, smart mode steps aside: Apple's AE meters the face.
 //   2. Predict: Apple's AE is usually still converging; its exposure target
 //      offset says by how much, so we judge the frame as it will look once
 //      Apple settles. Without this the two loops chase each other (pumping).
@@ -18,7 +19,7 @@
 //      still looks like night.
 //   5. Histogram constraints: the brightest 2% must reach at least ~0.45
 //      (no muddy flat scenes; skipped at night), and the 99–99.5% band must
-//      stay under ~0.9 so skies and windows keep detail (skipped when a face
+//      stay under ~0.9 so skies and windows keep detail (at most −0.75 EV; skipped when a face
 //      is in frame: the face matters more than the sky). Small speculars
 //      (<0.5% of the frame) may clip.
 //   6. Smooth: do nothing inside a stable region (±0.06 EV); otherwise an
@@ -106,6 +107,9 @@ final class SmartExposure {
 
         // 2. Judge the frame as it will be once Apple's AE has settled.
         let pending = max(-2, min(2, device.exposureTargetOffset))
+        // Apple is still mid-move: wait for it, or the two loops fight
+        // (our correction lands on top of its own and overshoots).
+        guard abs(pending) < 0.3 else { return }
         let settle = pow(2, -pending)
         let lum = grid.map { min($0 * settle, 4) }
 
@@ -145,22 +149,24 @@ final class SmartExposure {
         }
         let highlights = bandMean(0.99, 0.995)
         if !faceHint, highlights * g > 0.9, highlights > 0.01 {
-            // Protect, but never darken the subject more than ~1.3 EV below
-            // the mean solution for the sake of the sky.
+            // Protect, but never darken the subject more than ~0.75 EV below
+            // the mean solution for the sake of a window or lamp.
             let protect = 0.9 / highlights
-            g = max(protect, g * 0.4)
+            g = max(protect, g * 0.6)
             reason = "Protecting highlights"
         }
 
         let delta = log2(max(g, 1e-3))
-        let desired = max(-2.5, min(1.5, smart + delta))
+        // A face is in frame: Apple's AE is already metering it (we point it
+        // at the largest face). Ease our correction back out of its way.
+        let desired = faceHint ? 0 : max(-2.0, min(1.0, smart + delta))
         let error = desired - smart
 
         // 6. Stable region, then the adaptive filter.
         ticks += 1
-        guard abs(error) > 0.06 || ticks <= 3 else { return }
+        guard abs(error) > 0.06 || ticks <= 1 else { return }
         var speed: Float = 0.35
-        if ticks <= 4 { speed = 1 }                                 // startup: go straight there
+        if ticks <= 1 { speed = 1 }                                 // startup: go straight there
         else if abs(error) < 0.26 { speed = speed.squareRoot() }    // close: finish the move
         let clipped = Float(sorted.reversed().prefix { $0 >= 0.98 }.count) / Float(sorted.count)
         if clipped > 0.04 && error < -0.3 { speed = 1 }             // badly over: cut at once
@@ -172,7 +178,6 @@ final class SmartExposure {
             else if smart > 0.15 { reason = "Brightening" }
             else if smart < -0.15 { reason = "Darkening" }
         }
-        print(String(format: "CCAE ev=%.1f target=%.3f pending=%.2f g=%.2f desired=%.2f smart=%.2f speed=%.2f clip=%.3f top=%.2f hi=%.2f %@", ev, target, pending, g, desired, smart, speed, clipped, top, highlights, reason))
         apply(bias: smart + camera.cachedUserBias, camera: camera)
         if reason != lastStatus || abs(smart - lastApplied) > 0.05 {
             lastStatus = reason
@@ -184,7 +189,10 @@ final class SmartExposure {
 
     /// Linear mean-luminance target: night is aimed darker than daylight.
     nonisolated static func target(ev: Float) -> Float {
-        let pts: [(Float, Float)] = [(0, 0.055), (3, 0.085), (6, 0.13), (9, 0.17), (11, 0.18)]
+        // Calibrated on device: under Apple's own AE a normal daylight/indoor
+        // frame meters ~0.26 here, so that's "no correction"; darker scenes
+        // are aimed progressively darker than Apple would make them.
+        let pts: [(Float, Float)] = [(0, 0.12), (3, 0.17), (6, 0.22), (8, 0.26), (11, 0.27)]
         if ev <= pts[0].0 { return pts[0].1 }
         for i in 1..<pts.count where ev <= pts[i].0 {
             let (e0, t0) = pts[i - 1], (e1, t1) = pts[i]
