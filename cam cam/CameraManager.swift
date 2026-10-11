@@ -620,7 +620,12 @@ import CoreLocation
         set { burstActiveLock.lock(); _burstActive = newValue; burstActiveLock.unlock() }
     }
     @ObservationIgnored nonisolated(unsafe) var currentDevice: AVCaptureDevice? {
-        didSet { if currentDevice !== oldValue { restrictLensSwitching(currentDevice) } }
+        didSet {
+            if currentDevice !== oldValue {
+                restrictLensSwitching(currentDevice)
+                SmartExposure.shared.deviceChanged()
+            }
+        }
     }
 
     /// On the multi-lens (virtual) cameras iOS swaps lenses by itself when the

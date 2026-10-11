@@ -84,6 +84,15 @@ final class SmartExposure {
         return w
     }()
 
+    /// The camera switched lens/device: the new device starts with no bias,
+    /// so forget what we applied and re-solve from scratch on the next tick.
+    nonisolated func deviceChanged() {
+        smart = 0
+        ticks = 0
+        lastApplied = .nan
+        saliency = nil
+    }
+
     /// Called for every video frame; meters ~7 times a second.
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         if needsReset {
