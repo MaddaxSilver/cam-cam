@@ -192,24 +192,30 @@ struct CameraContentView: View {
 
                 // Frame guide box: yellow = suggestion (tap to lock on), white =
                 // guiding you (haptics + hint), green = lined up (fires the shutter).
-                if frameAdvisor.enabled, let box = frameAdvisor.box {
-                    let a = frameAdvisor.imageAspect
-                    let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
-                    let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
-                    let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
-                                   width: box.width * dispW, height: box.height * dispH)
-                    FramingBox(color: frameAdvisor.stage == .aligned ? .green
-                               : frameAdvisor.stage == .locked ? .white : .yellow)
-                        .frame(width: r.width, height: r.height)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            if frameAdvisor.stage == .suggesting { frameAdvisor.lock(camera: camera) }
-                            else { frameAdvisor.unlock() }
-                        }
-                        .simultaneousGesture(pinchGesture)   // pinch still zooms over the box
-                        .position(x: r.midX, y: r.midY)
-                        .animation(.easeOut(duration: 0.25), value: box)
-                        .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
+                if frameAdvisor.enabled, let measured = frameAdvisor.box {
+                    // Pinned to the scene: re-projected with the gyro every frame,
+                    // so the box stays on the subject as the phone moves.
+                    TimelineView(.animation) { _ in
+                        let a = frameAdvisor.imageAspect
+                        let box = SceneMotion.reproject(measured, from: frameAdvisor.boxAttitude,
+                                                        to: SceneMotion.attitude,
+                                                        fovLong: frameAdvisor.fovLong, aspect: Double(a))
+                        let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
+                        let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
+                        let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
+                                       width: box.width * dispW, height: box.height * dispH)
+                        FramingBox(color: frameAdvisor.stage == .aligned ? .green
+                                   : frameAdvisor.stage == .locked ? .white : .yellow)
+                            .frame(width: r.width, height: r.height)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if frameAdvisor.stage == .suggesting { frameAdvisor.lock(camera: camera) }
+                                else { frameAdvisor.unlock() }
+                            }
+                            .simultaneousGesture(pinchGesture)   // pinch still zooms over the box
+                            .position(x: r.midX, y: r.midY)
+                    }
+                    .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
                 }
 
                 // AE/AF LOCK badge at the top of the frame

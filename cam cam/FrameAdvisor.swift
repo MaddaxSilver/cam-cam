@@ -39,7 +39,7 @@ final class FrameAdvisor {
         didSet {
             UserDefaults.standard.set(enabled, forKey: "cc_frameAdvisor")
             cachedEnabled = enabled
-            if !enabled { unlock(); box = nil; hint = nil }
+            if !enabled { unlock(); box = nil; hint = nil; SceneMotion.stop() } else { SceneMotion.start() }
         }
     }
     /// The box on screen, normalized image coordinates (top-left origin).
@@ -49,6 +49,10 @@ final class FrameAdvisor {
     private(set) var hint: String?
     /// Width / height of the analysed camera image, to map the box on screen.
     private(set) var imageAspect: CGFloat = 3.0 / 4.0
+    /// Phone attitude when `box` was measured, and the lens field of view —
+    /// the screen re-projects the box with the gyro so it stays on the scene.
+    private(set) var boxAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
+    private(set) var fovLong: Double = 70
 
     // Read on the analysis queue.
     @ObservationIgnored nonisolated(unsafe) var cachedEnabled = UserDefaults.standard.object(forKey: "cc_frameAdvisor") as? Bool ?? false
@@ -70,6 +74,10 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) private var tracked: VNDetectedObjectObservation?
     @ObservationIgnored nonisolated(unsafe) private var trackStartAt: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var lockedIsGroup = false
+    // Attitude / FOV of the frame being analysed, and of the stored `shown` box
+    @ObservationIgnored nonisolated(unsafe) private var frameAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
+    @ObservationIgnored nonisolated(unsafe) private var frameFov: Double = 70
+    @ObservationIgnored nonisolated(unsafe) private var shownAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
 
     nonisolated private static let queue = DispatchQueue(label: "cam.frameadvisor", qos: .userInitiated)
     /// How much of the frame the subject should fill when lined up.
@@ -113,6 +121,9 @@ final class FrameAdvisor {
         let s = 512 / CGFloat(max(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer)))
         let small = CIImage(cvPixelBuffer: pixelBuffer).transformed(by: CGAffineTransform(scaleX: s, y: s))
         let aspect = CGFloat(CVPixelBufferGetWidth(pixelBuffer)) / CGFloat(max(CVPixelBufferGetHeight(pixelBuffer), 1))
+        SceneMotion.start()
+        frameAttitude = SceneMotion.attitude          // attitude when this frame was seen
+        frameFov = SceneMotion.fovLong(camera.currentDevice)
         Self.queue.async { [self] in
             defer { busy = false }
             analyse(small, time: time, aspect: aspect, camera: camera)
@@ -158,6 +169,7 @@ final class FrameAdvisor {
     // MARK: Stage 1 — suggest (calm)
 
     nonisolated private func suggest(_ found: (box: CGRect, isGroup: Bool)?, tilt: Double?, time: Double, aspect: CGFloat) {
+        anchorShown(aspect: aspect)
         if let f = found, Self.worthFraming(f.box) {
             lastSeen = time
             if let cur = shown {
@@ -197,6 +209,7 @@ final class FrameAdvisor {
             return
         }
         lostSince = nil
+        anchorShown(aspect: aspect)
         shown = shown.map { Self.lerp($0, f.box, 0.6) } ?? f.box
         let b = shown!
 
@@ -323,14 +336,101 @@ final class FrameAdvisor {
                width: a.width + (b.width - a.width) * t, height: a.height + (b.height - a.height) * t)
     }
 
+    /// Carry the stored box to this frame's attitude (the phone moved since).
+    nonisolated private func anchorShown(aspect: CGFloat) {
+        if let b = shown {
+            shown = SceneMotion.reproject(b, from: shownAttitude, to: frameAttitude, fovLong: frameFov, aspect: Double(aspect))
+        }
+        if let r = rival {
+            rival = SceneMotion.reproject(r, from: shownAttitude, to: frameAttitude, fovLong: frameFov, aspect: Double(aspect))
+        }
+        shownAttitude = frameAttitude
+    }
+
     nonisolated private func publish(box: CGRect?, stage: Stage, hint: String?, aspect: CGFloat) {
+        let att = frameAttitude, fov = frameFov
         Task { @MainActor in
             let a = FrameAdvisor.shared
             guard a.cachedEnabled else { return }
             a.imageAspect = aspect
+            a.boxAttitude = att
+            a.fovLong = fov
             a.box = box
             if a.cachedLocked || stage == .suggesting { a.stage = stage }
             if a.hint != hint { a.hint = hint }
         }
+    }
+}
+
+// MARK: - Scene anchoring (gyro reprojection)
+//
+// Keeps the box pinned to the scene between Vision updates, like AR: the box
+// is stored with the phone's attitude at the moment it was measured, and
+// every display frame its corners are turned into 3D view directions, rotated
+// by how far the phone has turned since, and projected back to the screen.
+
+import CoreMotion
+import simd
+
+nonisolated enum SceneMotion {
+    private static let manager = CMMotionManager()
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var latest = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
+    nonisolated(unsafe) private static var running = false
+
+    static func start() {
+        lock.lock(); defer { lock.unlock() }
+        guard !running, manager.isDeviceMotionAvailable else { return }
+        running = true
+        manager.deviceMotionUpdateInterval = 1.0 / 60.0
+        let q = OperationQueue(); q.qualityOfService = .userInteractive
+        manager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: q) { m, _ in
+            guard let a = m?.attitude.quaternion else { return }
+            lock.lock(); latest = simd_quatd(ix: a.x, iy: a.y, iz: a.z, r: a.w); lock.unlock()
+        }
+    }
+
+    static func stop() {
+        lock.lock(); defer { lock.unlock() }
+        guard running else { return }
+        running = false
+        manager.stopDeviceMotionUpdates()
+    }
+
+    /// Device attitude (device → reference frame).
+    static var attitude: simd_quatd { lock.lock(); defer { lock.unlock() }; return latest }
+
+    /// Move a top-left normalized image rect measured at attitude `from` to
+    /// where that part of the scene appears at attitude `to`.
+    /// - fovLong: field of view of the image's long side (degrees), after zoom.
+    /// - aspect: image width / height (portrait < 1).
+    static func reproject(_ r: CGRect, from: simd_quatd, to: simd_quatd, fovLong: Double, aspect: Double) -> CGRect {
+        let tanLong = tan(fovLong * .pi / 360)
+        // Portrait image: the long side is vertical.
+        let ty = aspect < 1 ? tanLong : tanLong * (1 / aspect)
+        let tx = aspect < 1 ? tanLong * aspect : tanLong
+        let delta = to.inverse * from      // rotates directions from the old device frame to the new
+        func move(_ u: Double, _ v: Double) -> (Double, Double)? {
+            // Device frame (portrait): x right, y up, camera looks along -z.
+            let d = simd_double3(tx * (2 * u - 1), -ty * (2 * v - 1), -1)
+            let n = delta.act(d)
+            guard n.z < -0.05 else { return nil }   // behind the camera
+            let x = n.x / -n.z, y = n.y / -n.z
+            return ((x / tx + 1) / 2, (-y / ty + 1) / 2)
+        }
+        let pts = [(r.minX, r.minY), (r.maxX, r.minY), (r.minX, r.maxY), (r.maxX, r.maxY)].compactMap { move($0.0, $0.1) }
+        guard pts.count == 4 else { return r }
+        let xs = pts.map(\.0), ys = pts.map(\.1)
+        // Keep the size (rotation would inflate an axis-aligned bound); move the centre.
+        let cx = (xs.min()! + xs.max()!) / 2, cy = (ys.min()! + ys.max()!) / 2
+        return CGRect(x: cx - r.width / 2, y: cy - r.height / 2, width: r.width, height: r.height)
+    }
+
+    /// Long-side field of view of the current camera image, after zoom.
+    static func fovLong(_ device: AVCaptureDevice?) -> Double {
+        guard let d = device else { return 70 }
+        let fov = Double(d.activeFormat.videoFieldOfView)
+        let z = Double(max(d.videoZoomFactor, 1))
+        return 2 * atan(tan(fov * .pi / 360) / z) * 180 / .pi
     }
 }
