@@ -103,6 +103,7 @@ final class FrameAdvisor {
     // you hold the phone), so thirds, hints and the horizon are right in
     // landscape. Boxes are kept upright and converted for display.
     @ObservationIgnored nonisolated(unsafe) var cachedAngle: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var pauseUntil: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var frameAngle: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var bufferAspect: CGFloat = 3.0 / 4.0
     // Auto zoom while locked
@@ -170,6 +171,7 @@ final class FrameAdvisor {
     /// A photo was taken with Frame guide on: log it as a framing example.
     func noteShot(camera: CameraManager) {
         guard cachedEnabled, camera.currentDevice?.position == .back else { return }
+        pauseUntil = CACurrentMediaTime() + 1.0
         let mm = camera.currentMM
         if let img = lastUpright {
             FrameLearning.log(img, view: CGRect(x: 0, y: 0, width: 1, height: 1), kind: "shot", mm: mm, subject: nil)
@@ -187,6 +189,9 @@ final class FrameAdvisor {
 
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         let interval = cachedLocked ? 0.08 : 0.3
+        // Stand aside while a photo is being processed: Vision competing with
+        // the film render for the GPU / Neural Engine drops preview frames.
+        guard CACurrentMediaTime() >= pauseUntil else { return }
         guard cachedEnabled, !busy, time - lastTick >= interval,
               camera.currentDevice?.position == .back else { return }
         lastTick = time
@@ -454,11 +459,10 @@ final class FrameAdvisor {
     /// people's bodies, cats and dogs, then the single strongest stand-out
     /// object. Top-left normalized box out.
     nonisolated static func detect(_ handler: VNImageRequestHandler, preferCentre: Bool) -> Subject? {
+        // One detector at a time, stopping at the first that finds something
+        // (faces are cheap; bodies, animals and saliency only run when needed).
         let faceReq = VNDetectFaceRectanglesRequest()
-        let humanReq = VNDetectHumanRectanglesRequest()
-        humanReq.upperBodyOnly = false
-        let animalReq = VNRecognizeAnimalsRequest()
-        try? handler.perform([faceReq, humanReq, animalReq])
+        try? handler.perform([faceReq])
 
         let third: CGFloat = 1.0 / 3
         func nearestThird(_ v: CGFloat) -> CGFloat { v < 0.5 ? third : 1 - third }
@@ -495,6 +499,9 @@ final class FrameAdvisor {
                 return (b, true, comp)
             }
         }
+        let humanReq = VNDetectHumanRectanglesRequest()
+        humanReq.upperBodyOnly = false
+        try? handler.perform([humanReq])
         let people = (humanReq.results ?? []).filter { $0.confidence > 0.6 && $0.boundingBox.height > 0.15 }.map(\.boundingBox)
         if !people.isEmpty {
             let u = people.dropFirst().reduce(people[0]) { $0.union($1) }
@@ -516,6 +523,8 @@ final class FrameAdvisor {
             comp.fill = 0.6
             return comp
         }
+        let animalReq = VNRecognizeAnimalsRequest()
+        try? handler.perform([animalReq])
         let animals = (animalReq.results ?? []).filter { $0.confidence > 0.6 }.map(\.boundingBox)
         if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) {
             var c = objectComp(b); c.minMM = 24
