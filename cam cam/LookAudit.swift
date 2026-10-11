@@ -1,0 +1,248 @@
+//
+//  LookAudit.swift
+//  cam cam
+//
+//  DEBUG-only: renders every film simulation and Style through the real
+//  pipeline and writes contact sheets + measurements to Documents/audit.
+//  Run in the simulator with the launch argument `-lookAudit`; test photos
+//  are read from Documents/audit-in (any images), plus a built-in chart.
+//
+//  Measured per look, on a ColorChecker-style chart:
+//   • neutral patches' colour cast and tone (does grey stay grey? lifted
+//     blacks, clipped whites)
+//   • skin patches' hue/sat
+//   • NaN / out-of-range pixels
+//   • how far the live preview path differs from the saved-photo path
+//   • render time at 12MP
+//
+
+#if DEBUG
+import UIKit
+import CoreImage
+
+nonisolated enum LookAudit {
+
+    // ColorChecker 24 (sRGB 8-bit), row-major from dark skin to black.
+    static let patches: [(String, Int, Int, Int)] = [
+        ("dark skin", 115, 82, 68), ("light skin", 194, 150, 130), ("blue sky", 98, 122, 157),
+        ("foliage", 87, 108, 67), ("blue flower", 133, 128, 177), ("bluish green", 103, 189, 170),
+        ("orange", 214, 126, 44), ("purplish blue", 80, 91, 166), ("moderate red", 193, 90, 99),
+        ("purple", 94, 60, 108), ("yellow green", 157, 188, 64), ("orange yellow", 224, 163, 46),
+        ("blue", 56, 61, 150), ("green", 70, 148, 73), ("red", 175, 54, 60),
+        ("yellow", 231, 199, 31), ("magenta", 187, 86, 149), ("cyan", 8, 133, 161),
+        ("white", 243, 243, 242), ("n8", 200, 200, 200), ("n6.5", 160, 160, 160),
+        ("n5", 122, 122, 121), ("n3.5", 85, 85, 85), ("black", 52, 52, 52),
+    ]
+    static let cell: CGFloat = 60
+
+    /// 6×4 chart (360×240) with a grey ramp strip underneath (360×40).
+    static func chart() -> CIImage {
+        var img = CIImage.empty()
+        for (i, p) in patches.enumerated() {
+            let col = i % 6, row = i / 6
+            let c = CIColor(red: CGFloat(p.1) / 255, green: CGFloat(p.2) / 255, blue: CGFloat(p.3) / 255,
+                            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)!
+            let r = CGRect(x: CGFloat(col) * cell, y: 40 + CGFloat(3 - row) * cell, width: cell, height: cell)
+            img = CIImage(color: c).cropped(to: r).composited(over: img)
+        }
+        let ramp = CIFilter(name: "CILinearGradient", parameters: [
+            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 360, y: 0),
+            "inputColor0": CIColor(red: 0, green: 0, blue: 0), "inputColor1": CIColor(red: 1, green: 1, blue: 1),
+        ])!.outputImage!.cropped(to: CGRect(x: 0, y: 0, width: 360, height: 40))
+        return ramp.composited(over: img)
+    }
+
+    static func patchRect(_ i: Int) -> CGRect {
+        let col = i % 6, row = i / 6
+        return CGRect(x: CGFloat(col) * cell + 15, y: 40 + CGFloat(3 - row) * cell + 15, width: 30, height: 30)
+    }
+
+    static func run(camera: CameraManager) {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let outDir = docs.appendingPathComponent("audit")
+        try? fm.removeItem(at: outDir)
+        try? fm.createDirectory(at: outDir, withIntermediateDirectories: true)
+        let ctx = camera.ciContext
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+
+        // Neutral live settings so the preview path matches a plain recipe.
+        camera.cachedActiveCustomSim = nil
+        camera.cachedGrainEnabled = false; camera.cachedGrainAmount = 0
+        camera.cachedContextAwareGrain = false
+        camera.cachedCrosstalkEnabled = false; camera.cachedHalationEnabled = false
+        camera.cachedRolloffEnabled = false; camera.cachedPushPullEnabled = false
+        camera.cachedThermalThrottle = false
+        StyleSettings.cTone = 0; StyleSettings.cColor = 0; StyleSettings.cPalette = 1
+
+        var inputs: [(String, CIImage)] = [("chart", chart())]
+        let inDir = docs.appendingPathComponent("audit-in")
+        for f in ((try? fm.contentsOfDirectory(atPath: inDir.path)) ?? []).sorted() {
+            if let img = CIImage(contentsOf: inDir.appendingPathComponent(f)) {
+                let s = 300 / max(img.extent.width, img.extent.height)
+                let small = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
+                inputs.append((f, small.transformed(by: CGAffineTransform(translationX: -small.extent.minX, y: -small.extent.minY))))
+            }
+        }
+        let big = chart().transformed(by: CGAffineTransform(scaleX: 4032 / 360, y: 3024 / 280))
+
+        func avg(_ img: CIImage, _ r: CGRect, _ cs: CGColorSpace = srgb) -> [Float] {
+            let a = img.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: r)])
+            var px = [Float](repeating: 0, count: 4)
+            ctx.render(a, toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                       format: .RGBAf, colorSpace: cs)
+            return px
+        }
+        func minMax(_ img: CIImage) -> (Float, Float) {
+            let mn = img.applyingFilter("CIAreaMinimum", parameters: [kCIInputExtentKey: CIVector(cgRect: img.extent)])
+            let mx = img.applyingFilter("CIAreaMaximum", parameters: [kCIInputExtentKey: CIVector(cgRect: img.extent)])
+            var a = [Float](repeating: 0, count: 4), b = [Float](repeating: 0, count: 4)
+            ctx.render(mn, toBitmap: &a, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+            ctx.render(mx, toBitmap: &b, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBAf, colorSpace: nil)
+            return (min(a[0], a[1], a[2]), max(b[0], b[1], b[2]))
+        }
+        func hsv(_ c: [Float]) -> (Float, Float, Float) {
+            let ui = UIColor(red: CGFloat(c[0]), green: CGFloat(c[1]), blue: CGFloat(c[2]), alpha: 1)
+            var h: CGFloat = 0, s: CGFloat = 0, v: CGFloat = 0, a: CGFloat = 0
+            ui.getHue(&h, saturation: &s, brightness: &v, alpha: &a)
+            return (Float(h * 360), Float(s), Float(v))
+        }
+
+        let chartImg = chart()
+        let baseline = (0..<24).map { avg(chartImg, patchRect($0)) }
+        var csv = "sim,label,greyCast,blackOut,whiteOut,n5Out,midContrast,skinHueShift,skinSatX,meanSatX,minVal,maxVal,nan,livePhotoDiff,ms12MP\n"
+        var tiles: [[(String, CIImage)]] = Array(repeating: [], count: inputs.count)
+
+        for sim in FilmSimulation.allCases {
+            camera.cachedSim = sim
+            var r = ShotRecipe(); r.sim = sim
+            for (k, input) in inputs.enumerated() {
+                let out = camera.renderLook(input.1, recipe: r, flatten: true).cropped(to: input.1.extent)
+                tiles[k].append((sim.label, out))
+            }
+            let out = camera.renderLook(chartImg, recipe: r, flatten: true).cropped(to: chartImg.extent)
+            let live = camera.applyLiveLook(chartImg, grainTextures: false).cropped(to: chartImg.extent)
+            let pa = (0..<24).map { avg(out, patchRect($0)) }
+            // Neutral cast: worst channel spread across the six grey patches.
+            let cast = (18..<24).map { i in pa[i][0...2].max()! - pa[i][0...2].min()! }.max() ?? 0
+            let lum = { (c: [Float]) in 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2] }
+            let midContrast = (lum(pa[19]) - lum(pa[22])) / max(lum(baseline[19]) - lum(baseline[22]), 0.001)
+            let (h0, s0, _) = hsv(baseline[1]); let (h1, s1, _) = hsv(pa[1])
+            var dh = h1 - h0; if dh > 180 { dh -= 360 }; if dh < -180 { dh += 360 }
+            let satX = (0..<18).map { hsv(pa[$0]).1 }.reduce(0, +) / max((0..<18).map { hsv(baseline[$0]).1 }.reduce(0, +), 0.001)
+            let (mn, mx) = minMax(out)
+            let nan = mn.isNaN || mx.isNaN || mn.isInfinite || mx.isInfinite
+            let pl = (0..<24).map { avg(live, patchRect($0)) }
+            let diff = zip(pa, pl).map { a, b in (0..<3).map { abs(a[$0] - b[$0]) }.max()! }.max() ?? 0
+            // Time the second of two renders: the first includes compiling the
+            // look's GPU program, which happens once per app run.
+            var ms = 0.0
+            for _ in 0..<2 {
+                let t0 = CACurrentMediaTime()
+                let bigOut = camera.renderLook(big, recipe: r, flatten: true).cropped(to: big.extent)
+                _ = ctx.createCGImage(bigOut, from: bigOut.extent, format: .RGBA8, colorSpace: p3)
+                ms = (CACurrentMediaTime() - t0) * 1000
+            }
+            csv += String(format: "%@,%@,%.3f,%.3f,%.3f,%.3f,%.2f,%.1f,%.2f,%.2f,%.3f,%.3f,%@,%.3f,%.0f\n",
+                          sim.rawValue, sim.label.replacingOccurrences(of: ",", with: " "),
+                          cast, lum(pa[23]), lum(pa[18]), lum(pa[21]), midContrast, dh, s1 / max(s0, 0.001), satX,
+                          mn, mx, nan ? "NAN" : "ok", diff, ms)
+            print("AUDIT \(sim.rawValue) \(Int(ms))ms")
+        }
+        try? csv.write(to: outDir.appendingPathComponent("metrics.csv"), atomically: true, encoding: .utf8)
+
+        // Effects and lens looks, each on top of Portra.
+        var variants: [(String, ShotRecipe)] = []
+        func v(_ name: String, _ f: (inout ShotRecipe) -> Void) {
+            var r = ShotRecipe(); r.sim = .kodakPortra; f(&r); variants.append((name, r))
+        }
+        v("Portra") { _ in }
+        v("Grain 0.15") { $0.grainEnabled = true; $0.grain = 0.15 }
+        v("Grain 0.35") { $0.grainEnabled = true; $0.grain = 0.35 }
+        v("Grain ctx") { $0.grainEnabled = true; $0.grain = 0.2; $0.contextAwareGrain = true }
+        v("Halation") { $0.halationEnabled = true; $0.halation = 0.5 }
+        v("Crosstalk") { $0.crosstalkEnabled = true; $0.crosstalk = 0.3 }
+        v("Rolloff") { $0.rolloffEnabled = true; $0.rolloff = 0.7 }
+        v("Push +2") { $0.pushPullEnabled = true; $0.pushPull = 2 }
+        v("Pull -1") { $0.pushPullEnabled = true; $0.pushPull = -1 }
+        v("Anamorphic") { $0.anamorphicFlare = true }
+        v("Light leaks") { $0.lightArtifacts = true; $0.randomSeed = 7 }
+        v("Scratches") { $0.filmScratches = true; $0.randomSeed = 7 }
+        v("Randomize") { $0.randomization = true; $0.randomSeed = 7 }
+        v("Cross-dev") { $0.crossProcessed = true }
+        v("Develop 0.5") { $0.development = 0.5 }
+        v("Stand dev") { $0.development = 1 }
+        for kind in LensKind.allCases where kind != .none {
+            v("Lens \(kind.label)") { r in
+                var c = CustomSimulation(); c.name = "Audit"; c.baseSim = .kodakPortra; c.lens = kind.rawValue
+                r.custom = c
+            }
+        }
+        var ecsv = "variant,minVal,maxVal,nan,lumaShift,ms12MP\n"
+        let scene = inputs.count > 1 ? inputs[1].1 : chartImg
+        var etiles: [(String, CIImage)] = []
+        let portraBase = avg(camera.renderLook(scene, recipe: variants[0].1, flatten: true).cropped(to: scene.extent), scene.extent)
+        for (name, r) in variants {
+            let out = camera.renderLook(scene, recipe: r, flatten: true).cropped(to: scene.extent)
+            etiles.append((name, out))
+            let (mn, mx) = minMax(out)
+            let nan = mn.isNaN || mx.isNaN || mn.isInfinite || mx.isInfinite
+            let a = avg(out, scene.extent)
+            let lumaShift = (0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2]) - (0.2126 * portraBase[0] + 0.7152 * portraBase[1] + 0.0722 * portraBase[2])
+            var ms = 0.0
+            for _ in 0..<2 {
+                let t0 = CACurrentMediaTime()
+                let o = camera.renderLook(big, recipe: r, flatten: true).cropped(to: big.extent)
+                _ = ctx.createCGImage(o, from: o.extent, format: .RGBA8, colorSpace: p3)
+                ms = (CACurrentMediaTime() - t0) * 1000
+            }
+            ecsv += String(format: "%@,%.3f,%.3f,%@,%.3f,%.0f\n", name, mn, mx, nan ? "NAN" : "ok", lumaShift, ms)
+            print("AUDIT effect \(name) \(Int(ms))ms")
+        }
+        try? ecsv.write(to: outDir.appendingPathComponent("effects.csv"), atomically: true, encoding: .utf8)
+        tiles.append(etiles)
+        inputs.append(("effects", scene))
+
+        // Film engine pilot: each pilot stock's old look next to the engine.
+        let pilot: [FilmSimulation] = [.kodakPortra, .kodakEktar, .kodakGold, .fujiVelvia, .kodakVision3, .fujiSuperia, .kodakTriX]
+        let photoInputs = inputs.filter { $0.0 != "effects" }
+        for input in photoInputs {
+            var row: [(String, CIImage)] = [("Original", input.1)]
+            for sim in pilot {
+                var r = ShotRecipe(); r.sim = sim
+                FilmEngine.enabled = false
+                row.append(("Old \(sim.label)", camera.renderLook(input.1, recipe: r, flatten: true).cropped(to: input.1.extent)))
+                FilmEngine.enabled = true
+                row.append(("New \(sim.label)", camera.renderLook(input.1, recipe: r, flatten: true).cropped(to: input.1.extent)))
+            }
+            tiles.append(row)
+            inputs.append(("pilot-\((input.0 as NSString).deletingPathExtension)", input.1))
+        }
+
+        // Contact sheets: 8 per row, labelled.
+        for (k, input) in inputs.enumerated() {
+            let w = input.1.extent.width, h = input.1.extent.height
+            let perRow = inputs[k].0.hasPrefix("pilot-") ? 15 : 8, labelH: CGFloat = 22
+            let rows = Int(ceil(Double(tiles[k].count) / Double(perRow)))
+            let size = CGSize(width: CGFloat(perRow) * (w + 6) + 6, height: CGFloat(rows) * (h + labelH + 6) + 6)
+            let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1
+            let sheet = UIGraphicsImageRenderer(size: size, format: fmt).image { c in
+                UIColor(white: 0.12, alpha: 1).setFill(); c.fill(CGRect(origin: .zero, size: size))
+                for (i, t) in tiles[k].enumerated() {
+                    let x = 6 + CGFloat(i % perRow) * (w + 6), y = 6 + CGFloat(i / perRow) * (h + labelH + 6)
+                    if let cg = ctx.createCGImage(t.1, from: input.1.extent, format: .RGBA8, colorSpace: p3) {
+                        UIImage(cgImage: cg).draw(in: CGRect(x: x, y: y, width: w, height: h))
+                    }
+                    (t.0 as NSString).draw(at: CGPoint(x: x + 2, y: y + h + 3), withAttributes: [
+                        .font: UIFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: UIColor.white])
+                }
+            }
+            let name = (input.0 as NSString).deletingPathExtension
+            try? sheet.jpegData(compressionQuality: 0.9)?.write(to: outDir.appendingPathComponent("sheet-\(name).jpg"))
+        }
+        try? "done".write(to: outDir.appendingPathComponent("DONE"), atomically: true, encoding: .utf8)
+        print("AUDIT DONE \(outDir.path)")
+    }
+}
+#endif
