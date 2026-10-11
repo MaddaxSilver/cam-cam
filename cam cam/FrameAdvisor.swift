@@ -35,6 +35,17 @@ final class FrameAdvisor {
 
     enum Stage: Equatable { case suggesting, locked, aligned }
 
+    /// Where the subject should sit when the shot is right (not just centred):
+    /// `anchor` is a point inside the subject box (e.g. the eye line),
+    /// `target` where it goes in the frame (e.g. upper third), `fill` how much
+    /// of the frame the subject box should fill after the lock's auto zoom.
+    struct Composition: Equatable, Sendable {
+        var anchor = CGPoint(x: 0.5, y: 0.5)
+        var target = CGPoint(x: 0.5, y: 0.5)
+        var fill: CGFloat = 0.82
+    }
+    typealias Subject = (box: CGRect, isGroup: Bool, comp: Composition)
+
     var enabled = UserDefaults.standard.object(forKey: "cc_frameAdvisor") as? Bool ?? false {
         didSet {
             UserDefaults.standard.set(enabled, forKey: "cc_frameAdvisor")
@@ -53,6 +64,8 @@ final class FrameAdvisor {
     /// the screen re-projects the box with the gyro so it stays on the scene.
     private(set) var boxAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
     private(set) var fovLong: Double = 70
+    /// Composition of the box on screen (used for the lock's zoom).
+    private(set) var lastComp = Composition()
 
     // Read on the analysis queue.
     @ObservationIgnored nonisolated(unsafe) var cachedEnabled = UserDefaults.standard.object(forKey: "cc_frameAdvisor") as? Bool ?? false
@@ -74,6 +87,8 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) private var tracked: VNDetectedObjectObservation?
     @ObservationIgnored nonisolated(unsafe) private var trackStartAt: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var lockedIsGroup = false
+    @ObservationIgnored nonisolated(unsafe) private var lockedComp = Composition()
+    @ObservationIgnored nonisolated(unsafe) private var shownComp = Composition()
     // Attitude / FOV of the frame being analysed, and of the stored `shown` box
     @ObservationIgnored nonisolated(unsafe) private var frameAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
     @ObservationIgnored nonisolated(unsafe) private var frameFov: Double = 70
@@ -95,7 +110,7 @@ final class FrameAdvisor {
         camera.tapToFocus(at: CGPoint(x: b.midY, y: 1 - b.midX))   // focus on the subject
         // Auto zoom so the subject fills the frame (the zoom is centred, so
         // you then move the phone to centre it).
-        let z = min(max(Double(Self.targetFill / max(b.width, b.height)), 1), 4)
+        let z = min(max(Double(lastComp.fill / max(b.width, b.height)), 1), 4)
         if z > 1.08 {
             camera.setZoom(CGFloat(Double(max(camera.currentMM, 13)) / 26 * z))
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { camera.syncZoomState() }
@@ -145,6 +160,7 @@ final class FrameAdvisor {
                     guide(nil, tilt: tilt, time: time, aspect: aspect, camera: camera); return
                 }
                 lockedIsGroup = f.isGroup
+                lockedComp = f.comp
                 tracked = VNDetectedObjectObservation(boundingBox: Self.toVision(f.box))
                 tracker = VNSequenceRequestHandler()
                 guide(f, tilt: tilt, time: time, aspect: aspect, camera: camera)
@@ -155,7 +171,7 @@ final class FrameAdvisor {
             if (try? tracker?.perform([req], on: image)) != nil,
                let obs = req.results?.first as? VNDetectedObjectObservation, obs.confidence > 0.3 {
                 tracked = obs
-                guide((Self.fromVision(obs.boundingBox), lockedIsGroup), tilt: tilt, time: time, aspect: aspect, camera: camera)
+                guide((Self.fromVision(obs.boundingBox), lockedIsGroup, lockedComp), tilt: tilt, time: time, aspect: aspect, camera: camera)
             } else {
                 guide(nil, tilt: tilt, time: time, aspect: aspect, camera: camera)
             }
@@ -168,10 +184,11 @@ final class FrameAdvisor {
 
     // MARK: Stage 1 — suggest (calm)
 
-    nonisolated private func suggest(_ found: (box: CGRect, isGroup: Bool)?, tilt: Double?, time: Double, aspect: CGFloat) {
+    nonisolated private func suggest(_ found: Subject?, tilt: Double?, time: Double, aspect: CGFloat) {
         anchorShown(aspect: aspect)
         if let f = found, Self.worthFraming(f.box) {
             lastSeen = time
+            shownComp = f.comp
             if let cur = shown {
                 if Self.iou(cur, f.box) > 0.35 {
                     shown = Self.lerp(cur, f.box, 0.2)          // glide
@@ -196,7 +213,7 @@ final class FrameAdvisor {
 
     // MARK: Stage 2 — locked: guide until it's right, then shoot
 
-    nonisolated private func guide(_ found: (box: CGRect, isGroup: Bool)?, tilt: Double?, time: Double, aspect: CGFloat, camera: CameraManager) {
+    nonisolated private func guide(_ found: Subject?, tilt: Double?, time: Double, aspect: CGFloat, camera: CameraManager) {
         guard let f = found else {
             if lostSince == nil { lostSince = time }
             if time - (lostSince ?? time) > 2.5 {
@@ -214,7 +231,11 @@ final class FrameAdvisor {
         let b = shown!
 
         // Errors: centre offset, fill, horizon tilt.
-        let dx = b.midX - 0.5, dy = b.midY - 0.5
+        // Composition, not just centring: put the anchor (eye line / subject)
+        // on its target (thirds, headroom, lead room).
+        let c = f.comp
+        let ax = b.minX + c.anchor.x * b.width, ay = b.minY + c.anchor.y * b.height
+        let dx = ax - c.target.x, dy = ay - c.target.y
         let fill = max(b.width, b.height)
         let fillErr = fill - Self.targetFill
         let tiltErr = tilt ?? 0
@@ -263,34 +284,72 @@ final class FrameAdvisor {
     /// The thing to frame, smartest first: faces (group, padded for bodies),
     /// people's bodies, cats and dogs, then the single strongest stand-out
     /// object. Top-left normalized box out.
-    nonisolated static func detect(_ handler: VNImageRequestHandler, preferCentre: Bool) -> (box: CGRect, isGroup: Bool)? {
+    nonisolated static func detect(_ handler: VNImageRequestHandler, preferCentre: Bool) -> Subject? {
         let faceReq = VNDetectFaceRectanglesRequest()
         let humanReq = VNDetectHumanRectanglesRequest()
         humanReq.upperBodyOnly = false
         let animalReq = VNRecognizeAnimalsRequest()
         try? handler.perform([faceReq, humanReq, animalReq])
 
-        let faces = (faceReq.results ?? []).map(\.boundingBox).filter { $0.width > 0.03 }
-        if !faces.isEmpty {
+        let third: CGFloat = 1.0 / 3
+        func nearestThird(_ v: CGFloat) -> CGFloat { v < 0.5 ? third : 1 - third }
+
+        let faceObs = (faceReq.results ?? []).filter { $0.boundingBox.width > 0.03 }
+        if !faceObs.isEmpty {
+            let faces = faceObs.map(\.boundingBox)
             let u = faces.dropFirst().reduce(faces[0]) { $0.union($1) }
             let fh = faces.map(\.height).max() ?? 0.1
             let body = CGRect(x: u.minX - fh * 0.6, y: u.minY - fh * 2.2,
                               width: u.width + fh * 1.2, height: u.height + fh * 2.6)
-            if let b = box(around: body) { return (b, true) }
+            if let b = box(around: body) {
+                // Eye line ~62% up each face box (Vision is bottom-left).
+                let eyeY = 1 - (faces.map { $0.minY + $0.height * 0.62 }.reduce(0, +) / CGFloat(faces.count))
+                let eyeX = faces.map(\.midX).reduce(0, +) / CGFloat(faces.count)
+                var comp = Composition()
+                comp.anchor = CGPoint(x: (eyeX - b.minX) / b.width, y: (eyeY - b.minY) / b.height)
+                if faceObs.count == 1 {
+                    // Portrait: eyes on the upper third; looking aside → lead
+                    // room in front of the face (subject on the far third).
+                    let yaw = faceObs[0].yaw?.doubleValue ?? 0
+                    let x: CGFloat = abs(yaw) > 0.25 ? (yaw > 0 ? third : 1 - third) : 0.5
+                    comp.target = CGPoint(x: x, y: third)
+                    comp.fill = 0.7
+                } else {
+                    // Group: centred, eyes a little under the upper third (headroom).
+                    comp.target = CGPoint(x: 0.5, y: 0.36)
+                    comp.fill = 0.82
+                }
+                return (b, true, comp)
+            }
         }
         let people = (humanReq.results ?? []).filter { $0.confidence > 0.6 && $0.boundingBox.height > 0.15 }.map(\.boundingBox)
         if !people.isEmpty {
             let u = people.dropFirst().reduce(people[0]) { $0.union($1) }
-            if let b = box(around: u) { return (b, true) }
+            if let b = box(around: u) {
+                var comp = Composition()
+                comp.anchor = CGPoint(x: 0.5, y: 0.12)            // roughly the head
+                comp.target = CGPoint(x: b.width > 0.45 ? 0.5 : nearestThird(b.midX), y: 0.28)
+                comp.fill = 0.8
+                return (b, true, comp)
+            }
+        }
+        // Pets and objects: on the nearest thirds intersection unless big.
+        func objectComp(_ b: CGRect) -> Composition {
+            var comp = Composition()
+            comp.anchor = CGPoint(x: 0.5, y: 0.5)
+            comp.target = max(b.width, b.height) > 0.5 ? CGPoint(x: 0.5, y: 0.5)
+                : CGPoint(x: nearestThird(b.midX), y: nearestThird(b.midY))
+            comp.fill = 0.6
+            return comp
         }
         let animals = (animalReq.results ?? []).filter { $0.confidence > 0.6 }.map(\.boundingBox)
-        if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) { return (b, false) }
+        if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) { return (b, false, objectComp(b)) }
 
         let salReq = VNGenerateObjectnessBasedSaliencyImageRequest()
         try? handler.perform([salReq])
         let objs = ((salReq.results?.first as? VNSaliencyImageObservation)?.salientObjects ?? [])
             .filter { $0.confidence > 0.5 && $0.boundingBox.width * $0.boundingBox.height > 0.01 }
-        if let o = pick(objs.map(\.boundingBox), preferCentre: preferCentre), let b = box(around: o) { return (b, false) }
+        if let o = pick(objs.map(\.boundingBox), preferCentre: preferCentre), let b = box(around: o) { return (b, false, objectComp(b)) }
         return nil
     }
 
@@ -349,12 +408,14 @@ final class FrameAdvisor {
 
     nonisolated private func publish(box: CGRect?, stage: Stage, hint: String?, aspect: CGFloat) {
         let att = frameAttitude, fov = frameFov
+        let comp = cachedLocked ? lockedComp : shownComp
         Task { @MainActor in
             let a = FrameAdvisor.shared
             guard a.cachedEnabled else { return }
             a.imageAspect = aspect
             a.boxAttitude = att
             a.fovLong = fov
+            a.lastComp = comp
             a.box = box
             if a.cachedLocked || stage == .suggesting { a.stage = stage }
             if a.hint != hint { a.hint = hint }
