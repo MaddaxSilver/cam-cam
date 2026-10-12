@@ -2295,9 +2295,10 @@ extension CameraManager {
     nonisolated func physicalGrain(_ input: CIImage, amount a: CGFloat, fine: CIImage) -> CIImage? {
         guard let k = CameraManager.filmKernel("filmGrain") else { return nil }
         let extent = input.extent
+        let res = max(1, max(extent.width, extent.height) / 2000)     // same frame-relative scale as the fine grain
         let coarse = fine.clampedToExtent()
             .transformed(by: CGAffineTransform(scaleX: 3, y: 3))
-            .applyingGaussianBlur(sigma: 1.2)
+            .applyingGaussianBlur(sigma: 1.2 * res)
             .cropped(to: extent)
         return k.apply(extent: extent, arguments: [input, fine.cropped(to: extent), coarse, a * 1.2, 0.2])
     }
@@ -2742,12 +2743,19 @@ extension CameraManager {
         let ox = CGFloat.random(in: 0...4096)
         let oy = CGFloat.random(in: 0...4096)
         guard let rawNoise = CIFilter.randomGenerator().outputImage else { return input }
+        // Grain is sized to the FRAME, not to pixels: tuned on the ~2000 px
+        // preview, so a 48MP photo gets ~4 px grains that look the same as
+        // the preview. (Fixed 1–2 px grain at 48MP sat right on the finest
+        // detail and read as digital noise: measured on the phone, grain 0.2
+        // added noise ~1.1× the photo's own fine detail.)
+        let res = max(1, max(extent.width, extent.height) / 2000)
         let noise = rawNoise
             .transformed(by: CGAffineTransform(translationX: ox, y: oy))
+            .transformed(by: CGAffineTransform(scaleX: res, y: res))
             .cropped(to: extent)
 
-        // Physical grain: grains sized ~1–2 px (bigger as the amount rises).
-        let grainSize = 1.0 + a * 3.0
+        // Physical grain: grains sized ~1–2 preview pixels (bigger as the amount rises).
+        let grainSize = (1.0 + a * 3.0) * res
         if let g = physicalGrain(input, amount: a,
                                  fine: rawNoise.transformed(by: CGAffineTransform(translationX: ox, y: oy))
                                      .transformed(by: CGAffineTransform(scaleX: grainSize, y: grainSize))
@@ -2766,7 +2774,7 @@ extension CameraManager {
         // Minimal blur — just enough to round pixel edges, not enough to cause blotchiness
         let blur = CIFilter.gaussianBlur()
         blur.inputImage = monoNoise
-        blur.radius = Float(0.4 + a * 0.6)
+        blur.radius = Float((0.4 + a * 0.6) * res)
         guard let blurred = blur.outputImage?.cropped(to: extent) else { return input }
 
         // Soft light blend — more natural distribution than overlay, avoids clumping artifacts

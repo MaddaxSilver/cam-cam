@@ -2197,8 +2197,18 @@ private struct FrameGuideOverlay<Pinch: Gesture>: View {
                                                 fovLong: frameAdvisor.fovLong, aspect: Double(a))
                 let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
                 let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
-                let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
-                               width: box.width * dispW, height: box.height * dispH)
+                let full = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
+                                  width: box.width * dispW, height: box.height * dispH)
+                // While suggesting, the box is capped to a moderate size around
+                // its centre (a near-full-screen box covered the preview and
+                // caught every tap); once locked and zooming it shows the real
+                // framing.
+                let r: CGRect = {
+                    guard frameAdvisor.stage == .suggesting else { return full }
+                    let f = min(1, pw * 0.6 / max(full.width, 1), ph * 0.45 / max(full.height, 1))
+                    return CGRect(x: full.midX - full.width * f / 2, y: full.midY - full.height * f / 2,
+                                  width: full.width * f, height: full.height * f)
+                }()
                 FramingBox(color: frameAdvisor.stage == .aligned ? .green
                            : frameAdvisor.stage == .locked ? .white : .yellow)
                     .frame(width: r.width, height: r.height)

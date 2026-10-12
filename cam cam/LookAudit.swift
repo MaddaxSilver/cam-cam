@@ -85,6 +85,10 @@ nonisolated enum LookAudit {
         }
         var base = ShotRecipe(); base.sim = .kodakPortra
         row("Portra look only", base)
+        if ProcessInfo.processInfo.arguments.contains("-grainOnly") {
+            for g: Float in [0.1, 0.2, 0.3] { var r = base; r.grainEnabled = true; r.grain = g; row("Portra grain \(g)", r) }
+            return
+        }
         for g: Float in [0.1, 0.2, 0.3] { var r = base; r.grainEnabled = true; r.grain = g; row("Portra grain \(g)", r) }
         var r = base; r.halationEnabled = true; row("Portra halation", r)
         r = base; r.development = 0.6; row("Portra development 0.6", r)

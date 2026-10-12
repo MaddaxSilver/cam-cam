@@ -172,7 +172,9 @@ nonisolated enum SceneFraming {
         let full = CGRect(x: 0, y: 0, width: 1, height: 1)
         let (fullScore, _) = score(full)
         var best: (CGRect, Double, String)?
-        var sc: CGFloat = 0.9
+        // Up to 75% of the view (a 1.33× zoom): bigger "crops" were barely a
+        // change and drew a box over nearly the whole screen.
+        var sc: CGFloat = 0.75
         while sc >= minScale - 1e-6 {
             let step = max(0.04, sc * 0.1)
             var y: CGFloat = 0

@@ -30,7 +30,10 @@ struct cam_camApp: App {
         if let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-qualityAudit"),
            ProcessInfo.processInfo.arguments.count > i + 1 {
             let camera = CameraManager()
-            let path = ProcessInfo.processInfo.arguments[i + 1]
+            var path = ProcessInfo.processInfo.arguments[i + 1]
+            if !path.hasPrefix("/") {          // a file in the app's Documents (on the phone)
+                path = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(path).path
+            }
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
                 LookAudit.runQuality(camera: camera, path: path)
                 print("[quality] done")
