@@ -27,6 +27,17 @@ struct cam_camApp: App {
 
     init() {
         #if DEBUG
+        if let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-grainSamples"),
+           ProcessInfo.processInfo.arguments.count > i + 1 {
+            let camera = CameraManager()
+            let path = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent(ProcessInfo.processInfo.arguments[i + 1]).path
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+                LookAudit.runGrain(camera: camera, path: path)
+                print("[grain] done")
+                exit(0)
+            }
+        }
         if let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-qualityAudit"),
            ProcessInfo.processInfo.arguments.count > i + 1 {
             let camera = CameraManager()

@@ -22,6 +22,43 @@ import CoreImage
 
 nonisolated enum LookAudit {
 
+    // MARK: Grain samples (-grainSamples <image>)
+    // 100% crops of a few stocks' grain + a black→white ramp, as PNGs in
+    // Documents/grain, to judge the grain's structure by eye.
+    static func runGrain(camera: CameraManager, path: String) {
+        let fm = FileManager.default
+        let out = fm.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("grain")
+        try? fm.removeItem(at: out); try? fm.createDirectory(at: out, withIntermediateDirectories: true)
+        guard var input = CIImage(contentsOf: URL(fileURLWithPath: path)) else { print("[grain] no image"); return }
+        input = input.transformed(by: CGAffineTransform(translationX: -input.extent.minX, y: -input.extent.minY))
+        // Upscale to a 48MP-like width so grain is judged at photo scale.
+        let s = 8064 / input.extent.width
+        input = input.transformed(by: CGAffineTransform(scaleX: s, y: s)).cropped(to: CGRect(x: 0, y: 0, width: 8064, height: 6048))
+        let ramp = CIFilter(name: "CILinearGradient", parameters: [
+            "inputPoint0": CIVector(x: 0, y: 0), "inputPoint1": CIVector(x: 8064, y: 0),
+            "inputColor0": CIColor(red: 0, green: 0, blue: 0), "inputColor1": CIColor(red: 1, green: 1, blue: 1),
+        ])!.outputImage!.cropped(to: CGRect(x: 0, y: 0, width: 8064, height: 6048))
+        let ctx = camera.photoContext
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        let crop = CGRect(x: 3600, y: 2800, width: 600, height: 600)
+        let rampCrops = [CGRect(x: 400, y: 2800, width: 300, height: 200), CGRect(x: 2400, y: 2800, width: 300, height: 200),
+                         CGRect(x: 4000, y: 2800, width: 300, height: 200), CGRect(x: 6400, y: 2800, width: 300, height: 200)]
+        let sims: [FilmSimulation] = [.none, .fujiVelvia, .kodakPortra, .kodakPortra800Push2, .fujiClassicChrome, .kodakTriX]
+        for sim in sims {
+            var r = ShotRecipe(); r.sim = sim; r.grainEnabled = sim != .none; r.grain = 0.2
+            r.contextAwareGrain = true; r.sceneISO = 400
+            let img = camera.renderLook(input, recipe: r, flatten: true).cropped(to: input.extent)
+            try? ctx.writePNGRepresentation(of: img.cropped(to: crop), to: out.appendingPathComponent("\(sim.rawValue).png"),
+                                            format: .RGBA8, colorSpace: srgb)
+            let rr = camera.renderLook(ramp, recipe: r, flatten: true).cropped(to: ramp.extent)
+            for (i, c) in rampCrops.enumerated() {
+                try? ctx.writePNGRepresentation(of: rr.cropped(to: c), to: out.appendingPathComponent("ramp-\(sim.rawValue)-\(i).png"),
+                                                format: .RGBA8, colorSpace: srgb)
+            }
+            print("[grain] \(sim.rawValue)")
+        }
+    }
+
     // MARK: Detail audit (-qualityAudit)
     //
     // Does a look soften a full-resolution photo? On a 1024² centre crop of

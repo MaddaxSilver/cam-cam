@@ -114,6 +114,7 @@ final class SmartExposure {
               device.exposureMode == .continuousAutoExposure,
               !camera.cachedIsRecording, !camera.isCollectingFrames else { return }
 
+        camera.cachedLiveISO = device.iso         // context-aware grain in the preview
         // Every film, every custom sim and imported LUT: measure how the
         // active look moves mid-grey (re-measured ~every 1.5 s).
         if time - lookMeasuredAt > 1.5, !lookBusy {

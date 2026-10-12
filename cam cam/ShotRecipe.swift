@@ -40,6 +40,8 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
     var rolloffEnabled = false;    var rolloff: Float = 0.9
     var pushPullEnabled = false;   var pushPull: Float = 0
     var development: Float = 0          // 0 agitated … 1 stand development
+    /// ISO the shot was taken at (context-aware grain: less light, more grain).
+    var sceneISO: Float? = nil
     var anamorphicFlare = false
     var lightArtifacts = false
     var filmScratches = false
@@ -77,7 +79,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         case crosstalkEnabled, crosstalk, halationEnabled, halation, rolloffEnabled, rolloff
         case pushPullEnabled, pushPull, anamorphicFlare, lightArtifacts, filmScratches
         case randomization, randomSeed
-        case styleTone, styleColor, stylePalette, crossProcessed, development
+        case styleTone, styleColor, stylePalette, crossProcessed, development, sceneISO
     }
 
     init() {}
@@ -109,6 +111,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         stylePalette     = v(.stylePalette, Float(1))
         crossProcessed   = v(.crossProcessed, false)
         development      = v(.development, Float(0))
+        sceneISO         = (try? c.decodeIfPresent(Float.self, forKey: .sceneISO)) ?? nil
     }
 
     func encoded() -> Data? { try? JSONEncoder().encode(self) }

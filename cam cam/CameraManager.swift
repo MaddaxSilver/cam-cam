@@ -282,6 +282,18 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) var cachedContextAwareGrain: Bool = false
     @ObservationIgnored nonisolated(unsafe) var grainPreviewTextures: [CIImage] = []
     @ObservationIgnored nonisolated(unsafe) var grainPreviewFrameIdx: Int = 0
+    @ObservationIgnored nonisolated(unsafe) var grainPreviewSize: CGFloat = 1
+    /// Live sensor ISO (context-aware grain in the preview), updated by Smart AE's tick.
+    @ObservationIgnored nonisolated(unsafe) var cachedLiveISO: Float?
+    /// ISO of the shot being rendered (set per shot before its recipe is built).
+    @ObservationIgnored nonisolated(unsafe) var pendingSceneISO: Float?
+
+    /// ISO from a photo's EXIF.
+    nonisolated static func captureISO(_ metadata: [String: Any]) -> Float? {
+        guard let exif = metadata[kCGImagePropertyExifDictionary as String] as? [String: Any],
+              let v = (exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first else { return nil }
+        return v.floatValue
+    }
     @ObservationIgnored nonisolated(unsafe) var grainPreviewExtent: CGRect = .zero
     @ObservationIgnored nonisolated(unsafe) var grainPreviewBuilding: Bool = false
     @ObservationIgnored nonisolated(unsafe) var grainPreviewLuma: Float = 0.5
@@ -2595,6 +2607,7 @@ import CoreLocation
             let metadata = CIImage(data: dng)?.properties ?? [:]
             ciImage = applyPhotoZoomCrop(ciImage)
             let base = ciImage
+            pendingSceneISO = Self.captureISO(metadata)      // context-aware grain
             let recipe = pendingRecipe()
             publishQuickPreview(ciImage, recipe: recipe)
             let processed = applySimAndGrain(to: ciImage)
@@ -2633,6 +2646,7 @@ import CoreLocation
             }()
             let base = ciImage                                  // framed, un-graded original
             let isDoubleExposure = firstExposureCIImage != nil  // composites can't be re-graded
+            pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
             let recipe = pendingRecipe()
             if !isDoubleExposure { publishQuickPreview(ciImage, recipe: recipe) }
             if redEyeStr > 0 { ciImage = applyRedEyeCorrection(to: ciImage, strength: redEyeStr) }
@@ -2666,6 +2680,7 @@ import CoreLocation
                 ? depthData
                 : depthData.converting(toDepthDataType: kCVPixelFormatType_DisparityFloat32)
             let blurred = applyPortraitBlur(to: ciImage, disparityData: disparity, fStop: pendingPortraitFStop)
+            pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
             let recipe = pendingRecipe()
             let withSim = applySimAndGrain(to: blurred)
             renderAndSave(ciImage: withSim, metadata: originalMetadata, base: blurred, recipe: recipe)
@@ -2698,6 +2713,7 @@ import CoreLocation
             let s  = max(sx, sy)
             let scaledDepth = depthCI.transformed(by: CGAffineTransform(scaleX: s, y: s))
             let blurred = applyPortraitBlurFromCIImage(to: ciImage, disparityCI: scaledDepth, fStop: pendingPortraitFStop)
+            pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
             let recipe = pendingRecipe()
             publishQuickPreview(blurred, recipe: recipe)
             let withSim = applySimAndGrain(to: blurred)
@@ -3495,6 +3511,7 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
                 let metadata = ciImage.properties
                 ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
                 ciImage = applyPhotoZoomCrop(ciImage)
+                pendingSceneISO = Self.captureISO(metadata)      // context-aware grain
                 let recipe = pendingRecipe()
                 let processed = applySimAndGrain(to: ciImage)
                 renderAndSave(ciImage: processed, metadata: metadata, base: ciImage, recipe: recipe)

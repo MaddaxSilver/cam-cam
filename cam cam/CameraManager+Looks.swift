@@ -85,13 +85,20 @@ extension CameraManager {
         do {
             let previewExtent = extent
             // Trigger a (re)build if textures are missing or the frame size changed
-            if grainPreviewTextures.isEmpty || grainPreviewExtent != previewExtent {
+            let gc = cachedActiveCustomSim == nil ? cachedSim.grainCharacter : .standard
+            if grainPreviewTextures.isEmpty || grainPreviewExtent != previewExtent || grainPreviewSize != gc.size {
                 buildGrainPreviewTextures(for: previewExtent)
             }
             if !grainPreviewTextures.isEmpty {
                 let idx = grainPreviewFrameIdx % grainPreviewTextures.count
                 grainPreviewFrameIdx &+= 1
                 let grainTex = grainPreviewTextures[idx]
+                // Layout: [fine ×4, coarse ×2, chroma ×2] — fine changes every
+                // frame, the softer layers less often (like moving grain).
+                let tex = grainPreviewTextures
+                let fineTex = tex.count == 8 ? tex[grainPreviewFrameIdx % 4] : grainTex
+                let coarseTex = tex.count == 8 ? tex[4 + (grainPreviewFrameIdx / 2) % 2] : grainTex
+                let chromaTex = tex.count == 8 ? tex[6 + (grainPreviewFrameIdx / 3) % 2] : grainTex
 
                 // Context-aware: re-sample scene luma every 30 frames (~1 s at 30 fps).
                 // A 1×1 pixel render is near-zero GPU cost; throttling prevents any stall cadence.
@@ -113,12 +120,12 @@ extension CameraManager {
                                                Float(bmp[2]) * 0.114) / 255.0
                         }
                     }
-                    let scale = 1.7 - grainPreviewLuma * 1.3
-                    grainAmt = min(0.5, grainAmt * scale)
+                    grainAmt = min(0.5, grainAmt * Self.contextGrainScale(iso: cachedLiveISO, luma: grainPreviewLuma))
                 }
 
                 let a = Double(max(0, min(0.35, grainAmt)))
-                if let g = physicalGrain(filtered, amount: CGFloat(a), fine: grainTex) {
+                if let g = physicalGrain(filtered, amount: CGFloat(a), fine: fineTex, coarse: coarseTex, chroma: chromaTex,
+                                         character: gc) {
                     return g.cropped(to: previewExtent)
                 }
                 let blend = CIFilter.softLightBlendMode()
@@ -154,6 +161,7 @@ extension CameraManager {
         r.rolloffEnabled = pendingRolloffEnabled;     r.rolloff = pendingRolloff
         r.pushPullEnabled = pendingPushPullEnabled;   r.pushPull = pendingPushPullAmount
         r.development = pendingDevelopment
+        r.sceneISO = pendingSceneISO
         r.anamorphicFlare = pendingAnamorphicFlareEnabled
         r.lightArtifacts = pendingLightArtifactsEnabled
         r.filmScratches = pendingFilmScratchesEnabled
@@ -258,11 +266,10 @@ extension CameraManager {
             let pushExtra: Float = r.pushPullEnabled ? max(0, r.pushPull * 0.08) : 0
             var grainAmt = r.grain + pushExtra
 
-            // Context-aware grain: scale amount by inverse of scene luminance
-            // Dark scenes → more grain (like underexposed film), bright scenes → less
+            // Context-aware grain: more grain the less light there was (ISO).
             if r.contextAwareGrain {
-                // Measure a small copy of the scene: averaging the full-res
-                // graded image forced the whole look to render twice.
+                var luma: Float?
+                // Frame brightness from a small copy (full-res would render the look twice).
                 let s = 256 / max(input.extent.width, input.extent.height, 1)
                 let probe = input.transformed(by: CGAffineTransform(scaleX: s, y: s))
                 let avgFilter = CIFilter.areaAverage()
@@ -270,19 +277,15 @@ extension CameraManager {
                 avgFilter.extent = probe.extent
                 if let avgImg = avgFilter.outputImage {
                     var bitmap = [UInt8](repeating: 0, count: 4)
-                    ciContext.render(avgImg,
-                                    toBitmap: &bitmap,
-                                    rowBytes: 4,
+                    ciContext.render(avgImg, toBitmap: &bitmap, rowBytes: 4,
                                     bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                                    format: .RGBA8,
-                                    colorSpace: CGColorSpaceCreateDeviceRGB())
-                    let luma = (Float(bitmap[0]) * 0.299 + Float(bitmap[1]) * 0.587 + Float(bitmap[2]) * 0.114) / 255.0
-                    // Dark (luma≈0) → 1.7x, mid (luma≈0.5) → 1.0x, bright (luma≈1.0) → 0.4x
-                    let scale = 1.7 - luma * 1.3
-                    grainAmt = min(0.5, grainAmt * scale)
+                                    format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+                    luma = (Float(bitmap[0]) * 0.299 + Float(bitmap[1]) * 0.587 + Float(bitmap[2]) * 0.114) / 255.0
                 }
+                grainAmt = min(0.5, grainAmt * Self.contextGrainScale(iso: r.sceneISO, luma: luma))
             }
-            image = addGrain(input: image, amount: grainAmt)
+            image = addGrain(input: image, amount: grainAmt,
+                             character: r.custom == nil ? r.sim.grainCharacter : .standard)
         } else if r.pushPullEnabled && r.pushPull > 0 && !isDigiCam {
             // Even with grain off, push adds a small amount of grain
             image = addGrain(input: image, amount: r.pushPull * 0.06)
@@ -2290,17 +2293,79 @@ extension CameraManager {
         return k.apply(extent: extent, arguments: [input, near, far, CGFloat(min(max(strength, 0), 1))]) ?? input
     }
 
-    /// Physically-modelled grain (see FilmProcess.ci.metal). `fine` is the
-    /// per-grain noise; clumps are the same noise at 3× scale.
-    nonisolated func physicalGrain(_ input: CIImage, amount a: CGFloat, fine: CIImage) -> CIImage? {
+    /// Isotropic grain noise for the film-grain kernel: white noise blurred
+    /// into round clumps of `sigma` px, re-normalized to a fixed spread
+    /// (std ≈ 0.144, i.e. half of uniform noise — fits 8-bit), centred on
+    /// 0.5, independent per channel. (Enlarging a pixel-noise texture, as
+    /// before, kept its square grid: blocky, artificial grain.)
+    nonisolated static func noiseField(_ extent: CGRect, sigma: CGFloat) -> CIImage {
+        let ox = CGFloat(Int.random(in: 0...8192)), oy = CGFloat(Int.random(in: 0...8192))
+        guard var n = CIFilter.randomGenerator().outputImage else {
+            return CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5)).cropped(to: extent)
+        }
+        n = n.transformed(by: CGAffineTransform(translationX: ox, y: oy))
+        let q = (sigma * 4).rounded() / 4                     // cache key (¼ px steps)
+        if q > 0.3 { n = n.applyingGaussianBlur(sigma: Double(q)) }
+        // Measured, not derived: Core Image's blur doesn't follow the
+        // textbook variance formula, and CIColorMatrix's bias didn't apply.
+        let (mean, std) = noiseStats(q)
+        guard let k = CameraManager.filmKernel("normalizeNoise") else { return n.cropped(to: extent) }
+        let gain = 0.1443 / max(std, 1e-4)                    // half the raw spread (fits 8-bit)
+        return (k.apply(extent: extent, arguments: [n.cropped(to: extent), CGFloat(mean), CGFloat(gain)]) ?? n)
+            .cropped(to: extent)
+    }
+
+    private static let statsLock = NSLock()
+    nonisolated(unsafe) private static var statsCache: [CGFloat: (Float, Float)] = [:]
+    /// Mean and std of the blurred noise at this blur size (measured once on a patch).
+    nonisolated static func noiseStats(_ sigma: CGFloat) -> (Float, Float) {
+        statsLock.lock(); if let c = statsCache[sigma] { statsLock.unlock(); return c }; statsLock.unlock()
+        var n = CIFilter.randomGenerator().outputImage ?? CIImage(color: .gray)
+        if sigma > 0.3 { n = n.applyingGaussianBlur(sigma: Double(sigma)) }
+        let side = 256
+        var buf = [Float](repeating: 0, count: side * side * 4)
+        let ctx = CIContext(options: [.workingColorSpace: NSNull(), .cacheIntermediates: false])
+        ctx.render(n, toBitmap: &buf, rowBytes: side * 16, bounds: CGRect(x: 0, y: 0, width: side, height: side),
+                   format: .RGBAf, colorSpace: nil)
+        var sum: Float = 0, sq: Float = 0, cnt: Float = 0
+        for i in stride(from: 0, to: buf.count, by: 4) { for c in 0..<3 { sum += buf[i + c]; sq += buf[i + c] * buf[i + c]; cnt += 1 } }
+        let mean = sum / cnt, std = max(sq / cnt - mean * mean, 0).squareRoot()
+        statsLock.lock(); statsCache[sigma] = (mean, std); statsLock.unlock()
+        return (mean, std)
+    }
+
+    /// Grain sizes (px) for an image: tuned on the ~2000 px preview and
+    /// scaled with the frame, so a 48MP photo matches the preview.
+    nonisolated static func grainSigmas(_ extent: CGRect, amount a: CGFloat, size k: CGFloat = 1) -> (fine: CGFloat, coarse: CGFloat, chroma: CGFloat) {
+        let res = max(1, max(extent.width, extent.height) / 2000)
+        let size = (1.0 + a * 2.0) * res * k        // grows with the amount and the stock's speed
+        return (0.35 * size, 1.1 * size, 1.2 * size)       // fine grain; subtle clumps; soft dye clouds
+    }
+
+    /// Physically-modelled grain (see FilmProcess.ci.metal).
+    nonisolated func physicalGrain(_ input: CIImage, amount a: CGFloat,
+                                   fine: CIImage, coarse: CIImage, chroma: CIImage,
+                                   character g: GrainCharacter = .standard) -> CIImage? {
         guard let k = CameraManager.filmKernel("filmGrain") else { return nil }
         let extent = input.extent
-        let res = max(1, max(extent.width, extent.height) / 2000)     // same frame-relative scale as the fine grain
-        let coarse = fine.clampedToExtent()
-            .transformed(by: CGAffineTransform(scaleX: 3, y: 3))
-            .applyingGaussianBlur(sigma: 1.2 * res)
-            .cropped(to: extent)
-        return k.apply(extent: extent, arguments: [input, fine.cropped(to: extent), coarse, a * 1.2, 0.2])
+        return k.apply(extent: extent, arguments: [input, fine.cropped(to: extent), coarse.cropped(to: extent),
+                                                   chroma.cropped(to: extent), a * 1.2 * g.strength, g.chroma, g.clump])
+    }
+
+    /// Context-aware grain: grain follows how much light there was, like
+    /// film shot in dim light (underexposed / pushed, a thin negative). The
+    /// capture ISO says it directly; frame brightness alone doesn't (auto
+    /// exposure makes most frames similarly bright). ISO 50 ≈ 0.75×,
+    /// 100 ≈ 0.85×, 800 ≈ 1.5×, 3200+ ≈ 1.8×; a little more in dark frames.
+    nonisolated static func contextGrainScale(iso: Float?, luma: Float?) -> Float {
+        guard let iso, iso > 0 else {
+            // No ISO (older photos): fall back to frame brightness, gently.
+            guard let l = luma else { return 1 }
+            return max(0.7, min(1.6, 1.45 - l * 1.0))
+        }
+        var f = 0.85 + 0.22 * log2(max(iso, 25) / 100)
+        if let l = luma, l < 0.18 { f *= 1.15 }
+        return max(0.75, min(1.8, f))
     }
 
     /// Render `image` as a physical print process; nil if the kernel is missing.
@@ -2704,36 +2769,25 @@ extension CameraManager {
             let a = CGFloat(max(0, min(0.35, cachedGrainAmount)))
             var textures: [CIImage] = []
             textures.reserveCapacity(8)
-            for _ in 0..<8 {
-                let ox = CGFloat.random(in: 0...4096)
-                let oy = CGFloat.random(in: 0...4096)
-                guard let rawNoise = CIFilter.randomGenerator().outputImage else { continue }
-                let noise = rawNoise
-                    .transformed(by: CGAffineTransform(translationX: ox, y: oy))
-                    .cropped(to: extent)
-                let mono = CIFilter.colorControls()
-                mono.inputImage = noise
-                mono.saturation = 0.0
-                mono.brightness = -0.5
-                mono.contrast = Float(1.0 + a * 1.8)
-                guard let monoNoise = mono.outputImage?.cropped(to: extent) else { continue }
-                let blur = CIFilter.gaussianBlur()
-                blur.inputImage = monoNoise
-                blur.radius = Float(0.4 + a * 0.6)
-                guard let blurred = blur.outputImage?.cropped(to: extent) else { continue }
-                // Force eager rasterisation — pixel data baked into CGImage,
-                // so the blend at preview time is a plain Metal texture composite.
-                if let cg = ciContext.createCGImage(blurred, from: extent) {
-                    textures.append(CIImage(cgImage: cg))
+            // Same noise fields as the photo, baked once (no colour
+            // management: these are data, not colours).
+            let size = (cachedActiveCustomSim == nil ? cachedSim.grainCharacter : .standard).size
+            let sg = Self.grainSigmas(extent, amount: a, size: size)
+            let sigmas = [sg.fine, sg.fine, sg.fine, sg.fine, sg.coarse, sg.coarse, sg.chroma, sg.chroma]
+            for sigma in sigmas {
+                let field = Self.noiseField(extent, sigma: sigma)
+                if let cg = ciContext.createCGImage(field, from: extent, format: .RGBA8, colorSpace: nil) {
+                    textures.append(CIImage(cgImage: cg, options: [.colorSpace: NSNull()]))
                 }
             }
             grainPreviewTextures = textures
             grainPreviewExtent   = extent
+            grainPreviewSize     = size
             grainPreviewBuilding = false
         }
     }
 
-    nonisolated func addGrain(input: CIImage, amount: Float) -> CIImage {
+    nonisolated func addGrain(input: CIImage, amount: Float, character gc: GrainCharacter = .standard) -> CIImage {
         guard amount > 0 else { return input }
         let a = CGFloat(max(0, min(0.35, amount)))
         let extent = input.extent
@@ -2754,12 +2808,13 @@ extension CameraManager {
             .transformed(by: CGAffineTransform(scaleX: res, y: res))
             .cropped(to: extent)
 
-        // Physical grain: grains sized ~1–2 preview pixels (bigger as the amount rises).
-        let grainSize = (1.0 + a * 3.0) * res
+        // Physical grain: round clumps sized to the frame (see grainSigmas).
+        let sg = Self.grainSigmas(extent, amount: a, size: gc.size)
         if let g = physicalGrain(input, amount: a,
-                                 fine: rawNoise.transformed(by: CGAffineTransform(translationX: ox, y: oy))
-                                     .transformed(by: CGAffineTransform(scaleX: grainSize, y: grainSize))
-                                     .cropped(to: extent)) {
+                                 fine: Self.noiseField(extent, sigma: sg.fine),
+                                 coarse: Self.noiseField(extent, sigma: sg.coarse),
+                                 chroma: Self.noiseField(extent, sigma: sg.chroma),
+                                 character: gc) {
             return g.cropped(to: extent)
         }
 
@@ -3086,4 +3141,41 @@ extension CameraManager {
         return blend.outputImage?.cropped(to: targetExtent) ?? overlay
     }
 
+}
+
+// MARK: - Grain character per stock
+
+/// How a stock's grain looks: size (relative), colour grain, and clumping.
+/// Slow slide / fine colour stocks: small and tight; consumer 400: medium
+/// with a hint of colour; fast and pushed stocks: bigger and clumpier.
+/// Fujifilm's camera simulations get Fuji's in-camera Grain Effect:
+/// luminance only, fine and even. (B&W stocks get no colour grain anyway —
+/// the kernel only adds it where the image has colour.)
+nonisolated struct GrainCharacter: Sendable, Equatable {
+    var size: CGFloat
+    var strength: CGFloat
+    var chroma: CGFloat
+    var clump: CGFloat
+    static let fine      = GrainCharacter(size: 0.8, strength: 0.7, chroma: 0.12, clump: 0.22)
+    static let standard  = GrainCharacter(size: 1.0, strength: 1.0, chroma: 0.2, clump: 0.3)
+    static let fast      = GrainCharacter(size: 1.25, strength: 1.2, chroma: 0.25, clump: 0.42)
+    static let fujiCamera = GrainCharacter(size: 0.9, strength: 0.85, chroma: 0, clump: 0.2)
+}
+
+extension FilmSimulation {
+    nonisolated var grainCharacter: GrainCharacter {
+        switch self {
+        case .fujiVelvia, .fujiProvia, .ektachrome100, .kodachrome64, .kodakEktar, .kodakPortra160,
+             .fujiReala100, .kodakVision3_50D, .cinestill50D, .kodakProImage100, .ilfordDelta100,
+             .fuji160NS, .agfaRSX, .fujiProvia400X:
+            return .fine
+        case .kodakPortra800, .kodakPortra800Push1, .kodakPortra800Push2, .cinestill800T,
+             .ilfordDelta3200, .kodakP3200, .ilfordHP5, .kodakTriX, .kodakDoubleX, .kodakTmax400:
+            return .fast
+        case .fujiClassicChrome, .fujiAstia, .fujiEterna, .fujiEternaVivid, .fujiAcros, .fujiSensia:
+            return .fujiCamera
+        default:
+            return .standard
+        }
+    }
 }

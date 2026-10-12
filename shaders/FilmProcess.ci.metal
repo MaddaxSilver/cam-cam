@@ -74,15 +74,32 @@ float4 densityPrint(sample_t s, sample_t noise,
 // scales (single grains + clumps). Visibility follows a film-like envelope:
 // strongest in the mid-tones, gentler in deep shadow and bright highlight.
 // `color` > 0 lets each dye layer vary a little on its own (colour film).
-float4 filmGrain(sample_t s, sample_t fine, sample_t coarse, float amount, float color)
+// Film grain, applied as exposure (stops) in linear light.
+// fine / coarse / chroma: isotropic noise fields (blurred white noise,
+// normalized, centred on 0.5, independent per channel) — round clumps, not
+// an upscaled pixel grid. Mono grain = fine + coarse clumps. Colour grain is
+// soft dye-cloud colour variation with zero luminance, only where the image
+// has colour (black-and-white looks get none). Strength follows a print:
+// most in the shadows and lower mid-tones, clean highlights.
+float4 filmGrain(sample_t s, sample_t fine, sample_t coarse, sample_t chroma, float amount, float color, float clump)
 {
     float3 lin = srgbToLinear(s.rgb);
     float l = clamp(dot(s.rgb, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
-    float env = pow(clamp(4.0 * l * (1.0 - l), 0.0, 1.0), 0.6) * 0.85 + 0.15;
-    float n = (fine.r - 0.5) * 0.75 + (coarse.r - 0.5) * 0.55;
-    float3 nc = float3(fine.r, fine.g, fine.b) - 0.5;
-    float3 stops = (float3(n) * (1.0 - color) + nc * color) * amount * env * 2.0;
+    float env = smoothstep(0.0, 0.14, l) * (1.0 - 0.85 * smoothstep(0.45, 0.95, l)) * 0.88 + 0.12;
+    // Fields are stored at half spread (fits 8-bit preview textures): ×2.
+    float n = ((fine.r - 0.5) * 0.8 + (coarse.r - 0.5) * clump) * 2.0;
+    float3 nc = (chroma.rgb - 0.5) * 2.0;
+    nc -= dot(nc, float3(0.2126, 0.7152, 0.0722));          // colour only, no brightness
+    float sat = max(s.r, max(s.g, s.b)) - min(s.r, min(s.g, s.b));
+    float cg = color * smoothstep(0.03, 0.18, sat);
+    float3 stops = (float3(n) + nc * cg) * amount * env * 2.0;
     return float4(linearToSrgb(lin * exp2(stops)), s.a);
+}
+
+// Re-centre and re-scale a noise field: out = 0.5 + (in − mean) × gain.
+float4 normalizeNoise(sample_t s, float mean, float gain)
+{
+    return float4(0.5 + (s.rgb - mean) * gain, 1.0);
 }
 
 // MARK: - Halation
