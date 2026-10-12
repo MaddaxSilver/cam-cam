@@ -73,6 +73,7 @@ struct FilmArc: View {
     static let tracking: CGFloat = 0.7
     static let gap: CGFloat = 30
     static let minorStep: CGFloat = 11       // a small mark (and tick) every 11 pt
+    private static var lastTickAt: CFTimeInterval = 0
 
     private var centers: [CGFloat] {
         var out: [CGFloat] = []
@@ -192,8 +193,14 @@ struct FilmArc: View {
         let minor = Int((o / Self.minorStep).rounded(.down))
         if minor != lastMinor {
             lastMinor = minor
-            tick.impactOccurred(intensity: 0.35)
-            tick.prepare()
+            // A fast spin crosses 100+ marks a second; the Taptic Engine can't
+            // play that many and queuing them costs main-thread time. ~30/s max.
+            let now = CACurrentMediaTime()
+            if now - Self.lastTickAt > 0.033 {
+                Self.lastTickAt = now
+                tick.impactOccurred(intensity: 0.35)
+                tick.prepare()
+            }
         }
     }
 
@@ -202,7 +209,7 @@ struct FilmArc: View {
         let id = settleID
         let dist = to - from
         guard abs(dist) > 1 else { detent.impactOccurred(intensity: 0.9); return }
-        let steps = min(Int(abs(dist) / Self.minorStep), 60)
+        let steps = min(Int(abs(dist) / Self.minorStep), 60, max(Int(duration * 30), 1))
         // Ease-out: progress p happens at time ≈ duration * (1 - (1-p)^(1/2.2)).
         for k in 1...max(steps, 1) {
             let p = Double(k) / Double(max(steps, 1))
@@ -218,8 +225,11 @@ struct FilmArc: View {
     }
 }
 
-/// The dial's face: marks and film names. Animatable on `offset`, so SwiftUI
-/// redraws every frame of a turn instead of sliding labels between two states.
+/// The dial's face: marks and film names, drawn in one Canvas pass. (As
+/// separate views — a capsule per mark, a shadowed label per film — every
+/// frame of a fast spin created and removed views and ran a shadow pass per
+/// label, which is what made the dial stutter.) Animatable on `offset`, so a
+/// flick redraws every frame instead of sliding between two states.
 private struct FilmDialFace: View, Animatable {
     let items: [ArcItem]
     let centers: [CGFloat]
@@ -234,78 +244,80 @@ private struct FilmDialFace: View, Animatable {
     }
 
     var body: some View {
+        let focus = FilmArc.nearest(offset, in: centers)
+        let rl = ArcGeo.labelRadius
         GeometryReader { geo in
-            let w = geo.size.width
-            let focus = FilmArc.nearest(offset, in: centers)
-            let rl = ArcGeo.labelRadius
+        Canvas { ctx, size in
+            let w = size.width
+            func point(_ a: Double, _ r: Double) -> CGPoint {
+                CGPoint(x: w / 2 + CGFloat(r * sin(a)), y: ArcGeo.radius - CGFloat(r * cos(a)))
+            }
+            func mark(at pos: CGFloat, height: CGFloat, opacity: Double) {
+                let a = Double((pos - offset) / rl)
+                var c = ctx
+                c.translateBy(x: point(a, Double(ArcGeo.radius - 5 - height / 2)).x,
+                              y: point(a, Double(ArcGeo.radius - 5 - height / 2)).y)
+                c.rotate(by: .radians(a))
+                c.fill(Path(roundedRect: CGRect(x: -0.75, y: -height / 2, width: 1.5, height: height), cornerRadius: 0.75),
+                       with: .color(.white.opacity(opacity)))
+            }
+            // Minor marks every few points, film marks above each name.
             let first = (centers.first ?? 0) - 36, last = (centers.last ?? 0) + 36
-            // Minor marks every few points; film marks above each name.
             let lo = max(first, offset - 340), hi = min(last, offset + 340)
             let startK = Int((lo / FilmArc.minorStep).rounded(.up))
             let endK = Int((hi / FilmArc.minorStep).rounded(.down))
-            ZStack {
-                if endK >= startK {
-                    ForEach(startK...endK, id: \.self) { k in
-                        let pos = CGFloat(k) * FilmArc.minorStep
-                        mark(at: pos, w: w, height: 4, opacity: 0.35)
-                    }
-                }
-                ForEach(centers.indices, id: \.self) { i in
-                    let a = Double((centers[i] - offset) / rl) * 180 / .pi
-                    if abs(a) < 48 {
-                        mark(at: centers[i], w: w, height: 8, opacity: (i == focus || items[i].isSetSwitch) ? 0 : 0.85)
-                        let isSel = i == focus
-                        label(for: items[i])
-                            .opacity(isSel || items[i].isSetSwitch ? 1 : 0.8)
-                            .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
-                            .frame(minHeight: 44)
-                            .contentShape(Rectangle())
-                            .onTapGesture { onTapItem(i) }
-                            .rotationEffect(.degrees(a))
-                            .position(x: w / 2 + CGFloat(Double(rl) * sin(a * .pi / 180)),
-                                      y: ArcGeo.radius - CGFloat(Double(rl) * cos(a * .pi / 180)))
-                            .accessibilityLabel(items[i].label)
-                            .accessibilityAddTraits(i == selectedIndex ? .isSelected : [])
-                    }
-                }
-                Capsule().fill(Color.yellow)
-                    .frame(width: 2.5, height: 11)
-                    .position(x: w / 2, y: 10.5)
+            if endK >= startK {
+                for k in startK...endK { mark(at: CGFloat(k) * FilmArc.minorStep, height: 4, opacity: 0.35) }
             }
+            var labels = ctx
+            labels.addFilter(.shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1))
+            for i in centers.indices {
+                let a = Double((centers[i] - offset) / rl)
+                guard abs(a) < 48 * .pi / 180 else { continue }
+                let item = items[i]
+                let isSel = i == focus
+                if !(isSel || item.isSetSwitch) { mark(at: centers[i], height: 8, opacity: 0.85) }
+                var t = Text(item.label.uppercased()).font(Font(FilmArc.font)).tracking(FilmArc.tracking)
+                if item.isSetSwitch {
+                    t = Text(Image(systemName: "arrow.left.arrow.right.circle.fill")).font(.system(size: 13, weight: .semibold))
+                        + Text(" ") + t
+                }
+                let color: Color = item.isSetSwitch ? .white : tones.tone(item.key)
+                let resolved = labels.resolve(t.foregroundStyle(color))
+                var c = labels
+                let p = point(a, Double(rl))
+                c.translateBy(x: p.x, y: p.y)
+                c.rotate(by: .radians(a))
+                c.opacity = isSel || item.isSetSwitch ? 1 : 0.8
+                c.draw(resolved, at: .zero, anchor: .center)
+            }
+            ctx.fill(Path(roundedRect: CGRect(x: w / 2 - 1.25, y: 5, width: 2.5, height: 11), cornerRadius: 1.25),
+                     with: .color(.yellow))
+        }
+        // Taps: the film whose name is under the touch.
+        .gesture(SpatialTapGesture().onEnded { v in
+            guard let i = hitTest(v.location, width: geo.size.width) else { return }
+            onTapItem(i)
+        })
+        }
+        .accessibilityElement()
+        .accessibilityLabel(items.indices.contains(focus) ? items[focus].label : "Film dial")
+        .accessibilityAdjustableAction { dir in
+            let next = dir == .increment ? focus + 1 : focus - 1
+            if items.indices.contains(next) { onTapItem(next) }
         }
     }
 
-    @ViewBuilder private func label(for item: ArcItem) -> some View {
-        if item.isSetSwitch {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.left.arrow.right.circle.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                Text(item.label.uppercased())
-                    .font(Font(FilmArc.font)).tracking(FilmArc.tracking)
-            }
-            .foregroundStyle(.white)
-            .lineLimit(1)
-            .fixedSize()
-            .accessibilityLabel("Switch films: \(item.label)")
-        } else {
-            Text(item.label.uppercased())
-                .font(Font(FilmArc.font))
-                .tracking(FilmArc.tracking)
-                .lineLimit(1)
-                .fixedSize()
-                .foregroundStyle(tones.tone(item.key))
-        }
-    }
-
-    private func mark(at pos: CGFloat, w: CGFloat, height: CGFloat, opacity: Double) -> some View {
-        let a = Double((pos - offset) / ArcGeo.labelRadius) * 180 / .pi
-        let rad = a * .pi / 180
-        let r = Double(ArcGeo.radius - 5 - height / 2)
-        return Capsule()
-            .fill(.white.opacity(opacity))
-            .frame(width: 1.5, height: height)
-            .rotationEffect(.degrees(a))
-            .position(x: w / 2 + CGFloat(r * sin(rad)), y: ArcGeo.radius - CGFloat(r * cos(rad)))
+    /// Which label (if any) a touch landed on: compare the touch's angle on
+    /// the arc with each label's, within half its width.
+    private func hitTest(_ p: CGPoint, width w: CGFloat) -> Int? {
+        let dx = Double(p.x - w / 2), dy = Double(ArcGeo.radius - p.y)
+        guard abs(hypot(dx, dy) - Double(ArcGeo.labelRadius)) < 26 else { return nil }
+        let along = offset + CGFloat(atan2(dx, dy)) * ArcGeo.labelRadius   // touch position along the dial
+        let i = FilmArc.nearest(along, in: centers)
+        guard centers.indices.contains(i),
+              abs(centers[i] - along) < FilmArc.width(items[i].label) / 2 + 10 else { return nil }
+        return i
     }
 }
 
