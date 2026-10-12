@@ -514,6 +514,18 @@ struct CameraContentView: View {
         .onChange(of: router.request) { handleLaunchRequest() }
         .onAppear {
             handleLaunchRequest()
+            #if DEBUG
+            // Profiling harness: Frame guide on, a shot every 4 s for 40 s.
+            if ProcessInfo.processInfo.arguments.contains("-perfShots") {
+                frameAdvisor.enabled = !ProcessInfo.processInfo.arguments.contains("-noGuide")
+                for k in 1...10 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4 * Double(k)) {
+                        print(String(format: "[perf] %.2f SHOT %d", CACurrentMediaTime(), k))
+                        camera.capturePhoto()
+                    }
+                }
+            }
+            #endif
             // Fade out startup black so orientation is correct before anything is visible
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 withAnimation(.easeOut(duration: 0.3)) { startupBlackOpacity = 0 }

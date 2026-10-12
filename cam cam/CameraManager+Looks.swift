@@ -2563,7 +2563,7 @@ extension CameraManager {
         // flatten:false — at half-res the graph is fine, and a synchronous
         // GPU→CPU readback every frame would tank the viewfinder framerate.
         var img: CIImage
-        if flatten, let cg = ciContext.createCGImage(image, from: extent) {
+        if flatten, let cg = photoContext.createCGImage(image, from: extent) {
             img = CIImage(cgImage: cg)
         } else {
             img = image

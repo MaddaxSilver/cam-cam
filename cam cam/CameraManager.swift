@@ -435,6 +435,18 @@ import CoreLocation
         ])
     }()
 
+    /// Full-resolution photo renders get their own LOW-priority context. On
+    /// the shared one, a 48MP film render (~3 s of GPU) queued ahead of the
+    /// preview: the viewfinder froze for seconds after every shot.
+    @ObservationIgnored nonisolated(unsafe) lazy var photoContext: CIContext = {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        var opts: [CIContextOption: Any] = [.workingColorSpace: p3, .outputColorSpace: p3,
+                                            .cacheIntermediates: false, .priorityRequestLow: true]
+        if let device = MTLCreateSystemDefaultDevice() { return CIContext(mtlDevice: device, options: opts) }
+        opts[.useSoftwareRenderer] = false
+        return CIContext(options: opts)
+    }()
+
     // Reusable CIFilter instances — avoid per-frame allocation
     @ObservationIgnored nonisolated(unsafe) var reusableColorControls = CIFilter.colorControls()
     @ObservationIgnored nonisolated(unsafe) var reusableTempTint = CIFilter.temperatureAndTint()
@@ -2882,7 +2894,7 @@ import CoreLocation
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
                                   space: p3, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
               let pixels = ctx.data else { return nil }
-        ciContext.render(cropped, toBitmap: pixels, rowBytes: w * 4, bounds: bounds,
+        photoContext.render(cropped, toBitmap: pixels, rowBytes: w * 4, bounds: bounds,
                          format: .RGBA8, colorSpace: p3)
         guard let opaque = ctx.makeImage() else { return nil }
 
@@ -3122,6 +3134,14 @@ import CoreLocation
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+    #if DEBUG
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard output !== audioDataOutput else { return }
+        let reason = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) as? String ?? "?"
+        print(String(format: "[perf] %.2f DROP %@", CACurrentMediaTime(), reason))
+    }
+    #endif
+
     nonisolated func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
@@ -3137,6 +3157,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             audioIn.append(sampleBuffer)
             return
         }
+        #if DEBUG
+        PerfProbe.frame()
+        #endif
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
@@ -3354,7 +3377,7 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
                 let processed = applySimAndGrain(to: cropped)
                 firstExposureCIImage = processed
                 // Generate preview CGImage for overlay
-                let preview = ciContext.createCGImage(processed, from: processed.extent)
+                let preview = photoContext.createCGImage(processed, from: processed.extent)
                 DispatchQueue.main.async {
                     self.firstExposurePreview = preview
                     self.isCapturing = false
@@ -3401,3 +3424,15 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         }
     }
 }
+
+#if DEBUG
+/// Debug-only preview timing: logs late video frames (camera queue blocked).
+nonisolated enum PerfProbe {
+    nonisolated(unsafe) static var last: Double = 0
+    static func frame() {
+        let t = CACurrentMediaTime()
+        if last > 0, t - last > 0.05 { print(String(format: "[perf] %.2f GAP %.0f ms", t, (t - last) * 1000)) }
+        last = t
+    }
+}
+#endif

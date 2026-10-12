@@ -146,12 +146,27 @@ final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
     /// building and submitting the Core Image graph competed with touches,
     /// the film dial and pinch. CAMetalLayer hands out drawables on any thread.
     nonisolated func render(_ image: CIImage) {
+        // Never block the camera queue waiting for the GPU: if two frames are
+        // still in flight (the GPU is busy, e.g. rendering a photo), skip this
+        // one. nextDrawable() would otherwise wait up to a second per frame,
+        // stalling Frame guide, AE and every later frame with it.
+        inFlightLock.lock()
+        guard inFlight < 2 else { inFlightLock.unlock(); return }
+        inFlight += 1
+        inFlightLock.unlock()
         guard let layer = metalLayer,
               renderSize.width > 0,
               let context = sharedCIContext,
               let commandBuffer = renderQueue?.makeCommandBuffer(),
-              let drawable = layer.nextDrawable() else { return }
+              let drawable = layer.nextDrawable() else { finished(); return }
+        commandBuffer.addCompletedHandler { [weak self] _ in self?.finished() }
         encode(image, size: renderSize, context: context, drawable: drawable, commandBuffer: commandBuffer)
+    }
+
+    nonisolated(unsafe) private var inFlight = 0
+    private let inFlightLock = NSLock()
+    nonisolated private func finished() {
+        inFlightLock.lock(); inFlight = max(0, inFlight - 1); inFlightLock.unlock()
     }
 
     func draw(in view: MTKView) {
