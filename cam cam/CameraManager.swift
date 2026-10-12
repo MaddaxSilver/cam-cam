@@ -285,6 +285,8 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) var grainPreviewSize: CGFloat = 1
     /// Live sensor ISO (context-aware grain in the preview), updated by Smart AE's tick.
     @ObservationIgnored nonisolated(unsafe) var cachedLiveISO: Float?
+    /// Mean display brightness of the live frame (from Smart AE's metering).
+    @ObservationIgnored nonisolated(unsafe) var cachedFrameLuma: Float?
     /// ISO of the shot being rendered (set per shot before its recipe is built).
     @ObservationIgnored nonisolated(unsafe) var pendingSceneISO: Float?
 
@@ -1123,6 +1125,9 @@ import CoreLocation
     }
 
     nonisolated func swapInputDevice(to preset: FocalPreset, animateFromZoom: CGFloat? = nil, animate: Bool = true, targetZoom: CGFloat? = nil) {
+        #if DEBUG
+        print(String(format: "[perf] %.2f SWAP physical %dmm", CACurrentMediaTime(), preset.mm))
+        #endif
         // Stop any active recording before reconfiguring the session
         if cachedIsRecording {
             DispatchQueue.main.async { self.stopRecording() }
@@ -1246,6 +1251,9 @@ import CoreLocation
 
     /// Swap to the best virtual back camera (triple/dual) and set zoom — used when leaving physical ultrawide.
     nonisolated func swapToVirtualDevice(zoom: CGFloat, animate: Bool = true) {
+        #if DEBUG
+        print(String(format: "[perf] %.2f SWAP virtual z%.2f", CACurrentMediaTime(), zoom))
+        #endif
         if cachedIsRecording {
             DispatchQueue.main.async { self.stopRecording() }
         }
@@ -2422,6 +2430,18 @@ import CoreLocation
             device.ramp(toVideoZoomFactor: clamped, withRate: 60.0)
             device.unlockForConfiguration()
         } catch {}
+    }
+
+    /// Would `setZoom(factor)` have to switch lenses (reconfigure the session —
+    /// the preview freezes ~1 s)? Mirrors setZoom's swap rules.
+    func zoomNeedsLensSwap(_ factor: CGFloat) -> Bool {
+        guard !isRecording else { return false }
+        let t = currentDevice?.deviceType
+        if factor < 1.0 && t != .builtInUltraWideCamera { return true }
+        if factor >= 1.0 && t == .builtInUltraWideCamera { return true }
+        if t == .builtInTelephotoCamera { return true }
+        if t == .builtInWideAngleCamera && factor >= 5.0 { return true }
+        return false
     }
 
     func syncZoomState() {

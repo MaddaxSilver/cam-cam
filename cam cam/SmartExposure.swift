@@ -101,7 +101,24 @@ final class SmartExposure {
     }
 
     /// Called for every video frame; meters ~7 times a second.
+    nonisolated private static let aeQueue = DispatchQueue(label: "cam.smartae", qos: .userInitiated)
+    @ObservationIgnored nonisolated(unsafe) private var aeBusy = false
+
+    /// Called for every video frame. Metering reads its grid back from the
+    /// GPU, which waits whenever the GPU is busy (a photo rendering): done on
+    /// the camera queue it stalled every following preview frame, so it runs
+    /// on its own queue and stands aside while a photo renders.
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
+        guard !aeBusy, time - lastTick >= 0.15 || needsReset else { return }
+        if camera.hasShotsInFlight && !needsReset { return }
+        aeBusy = true
+        Self.aeQueue.async { [self] in
+            defer { aeBusy = false }
+            processNow(pixelBuffer, time: time, camera: camera)
+        }
+    }
+
+    nonisolated private func processNow(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         if needsReset {
             needsReset = false
             smart = 0; ticks = 0
@@ -117,7 +134,8 @@ final class SmartExposure {
         camera.cachedLiveISO = device.iso         // context-aware grain in the preview
         // Every film, every custom sim and imported LUT: measure how the
         // active look moves mid-grey (re-measured ~every 1.5 s).
-        if time - lookMeasuredAt > 1.5, !lookBusy {
+        let rendering = camera.hasShotsInFlight          // keep the GPU for the photo + preview
+        if time - lookMeasuredAt > 1.5, !lookBusy, !rendering {
             lookMeasuredAt = time; lookBusy = true
             Self.lookQueue.async { [self] in
                 defer { lookBusy = false }
@@ -135,7 +153,9 @@ final class SmartExposure {
 
         let frame = CIImage(cvPixelBuffer: pixelBuffer)
         guard let grid = Self.lumaGrid(frame) else { return }
-        if time - lastSaliency > 0.5 {
+        // Shared with context-aware grain (display brightness ≈ linear^(1/2.2)).
+        camera.cachedFrameLuma = pow(grid.reduce(0, +) / Float(max(grid.count, 1)), 1 / 2.2)
+        if time - lastSaliency > 0.5, !rendering {
             lastSaliency = time
             updateSaliency(frame)
         }

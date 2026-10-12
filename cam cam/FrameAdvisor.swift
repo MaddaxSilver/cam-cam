@@ -190,6 +190,24 @@ final class FrameAdvisor {
         return want / cur
     }
 
+    #if DEBUG
+    /// Profiling: lock on whatever is suggested (or a centre box), then run
+    /// the same path as an aligned auto shot.
+    func debugGuidedShot(camera: CameraManager) {
+        if box == nil { box = CGRect(x: 0.35, y: 0.35, width: 0.3, height: 0.3); lastComp.fill = 0.8 }
+        print(String(format: "[perf] %.2f LOCK box %.2f", CACurrentMediaTime(), max(box!.width, box!.height)))
+        lock(camera: camera)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            print(String(format: "[perf] %.2f FIRE", CACurrentMediaTime()))
+            self.fired = true
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            if !camera.isCapturing { camera.capturePhoto() }
+            self.stage = .aligned
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { FrameAdvisor.shared.unlock() }
+        }
+    }
+    #endif
+
     /// The phone turned (portrait ⇄ landscape): boxes are in the old upright
     /// frame, so start over.
     func orientationChanged(_ angle: Double) {
@@ -209,11 +227,20 @@ final class FrameAdvisor {
     }
 
     func unlock() {
+        #if DEBUG
+        print(String(format: "[perf] %.2f UNLOCK", CACurrentMediaTime()))
+        #endif
         stage = .suggesting; cachedLocked = false
         lockContext = nil; sceneLock = nil; sceneArmed = false
         // Put the zoom back where you had it — unless you changed it yourself.
+        // Never if it means switching lenses: that reconfigures the camera and
+        // froze the preview ~1.3 s right after the shot (measured on device).
         if let cam = lockCamera, let pre = preLockMM, let target = lastZoomTargetMM,
-           abs(Double(cam.currentMM) - target) <= max(3, target * 0.12), abs(Double(pre) - target) > 2 {
+           abs(Double(cam.currentMM) - target) <= max(3, target * 0.12), abs(Double(pre) - target) > 2,
+           !cam.zoomNeedsLensSwap(CGFloat(Double(pre) / 26)) {
+            #if DEBUG
+            print(String(format: "[perf] %.2f RESTORE zoom %d→%dmm", CACurrentMediaTime(), cam.currentMM, pre))
+            #endif
             cam.setZoom(CGFloat(Double(pre) / 26))
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { cam.syncZoomState() }
         }
@@ -226,9 +253,11 @@ final class FrameAdvisor {
 
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         let interval = cachedLocked ? 0.08 : 0.3
-        // Stand aside while a photo is being processed: Vision competing with
-        // the film render for the GPU / Neural Engine drops preview frames.
-        guard CACurrentMediaTime() >= pauseUntil else { return }
+        // Stand aside while a photo is captured and rendered (~1.5 s for iOS
+        // to deliver a 48MP photo, then the film render): Vision competing
+        // with it for the GPU / Neural Engine dropped preview frames right
+        // after auto shots. A fixed 1 s pause ended just as the render began.
+        guard CACurrentMediaTime() >= pauseUntil, !camera.hasShotsInFlight else { return }
         guard cachedEnabled, !busy, time - lastTick >= interval,
               camera.currentDevice?.position == .back else { return }
         lastTick = time

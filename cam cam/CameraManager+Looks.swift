@@ -104,22 +104,10 @@ extension CameraManager {
                 // A 1×1 pixel render is near-zero GPU cost; throttling prevents any stall cadence.
                 var grainAmt = cachedGrainAmount
                 if cachedContextAwareGrain {
-                    grainPreviewLumaCounter &+= 1
-                    if grainPreviewLumaCounter % 30 == 1 {
-                        let avg = CIFilter.areaAverage()
-                        avg.inputImage = filtered
-                        avg.extent = filtered.extent
-                        if let avgImg = avg.outputImage {
-                            var bmp = [UInt8](repeating: 0, count: 4)
-                            ciContext.render(avgImg, toBitmap: &bmp, rowBytes: 4,
-                                            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                                            format: .RGBA8,
-                                            colorSpace: CGColorSpaceCreateDeviceRGB())
-                            grainPreviewLuma = (Float(bmp[0]) * 0.299 +
-                                               Float(bmp[1]) * 0.587 +
-                                               Float(bmp[2]) * 0.114) / 255.0
-                        }
-                    }
+                    // Frame brightness from Smart AE's metering (measured on its own
+                    // queue). Reading a pixel back here every second waited for
+                    // the GPU and stalled the preview while a photo rendered.
+                    if let l = cachedFrameLuma { grainPreviewLuma = l }
                     grainAmt = min(0.5, grainAmt * Self.contextGrainScale(iso: cachedLiveISO, luma: grainPreviewLuma))
                 }
 

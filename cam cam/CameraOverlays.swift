@@ -580,12 +580,25 @@ class PeakingUIView: UIView {
         overlayLayer.frame = bounds
     }
 
+    nonisolated(unsafe) private var peakingBusy = false
+    nonisolated private static let peakingQueue = DispatchQueue(label: "cam.peaking", qos: .userInitiated)
+
     nonisolated func processFrame(pixelBuffer: CVPixelBuffer) {
         // Throttle to ~15fps
         let now = CACurrentMediaTime()
-        guard now - lastPeakingTime > 0.066 else { return }
+        guard now - lastPeakingTime > 0.066, !peakingBusy else { return }
         lastPeakingTime = now
+        // Rendered on its own queue: reading the result back waits for the
+        // GPU, and on the camera queue that stalled the preview whenever a
+        // photo was rendering.
+        peakingBusy = true
+        Self.peakingQueue.async { [self] in
+            defer { peakingBusy = false }
+            renderPeaking(pixelBuffer)
+        }
+    }
 
+    nonisolated private func renderPeaking(_ pixelBuffer: CVPixelBuffer) {
         guard let context = sharedContext else { return }
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         // Downscale for peaking — edges are visible at quarter res

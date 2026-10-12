@@ -451,6 +451,7 @@ final class PoseGuide {
 
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         guard cachedEnabled, !busy, time - lastTick >= 0.16, CACurrentMediaTime() >= pauseUntil,
+              !camera.hasShotsInFlight,      // not while a photo renders (GPU contention)
               camera.currentDevice?.position == .back, !camera.cachedIsRecording else { return }
         lastTick = time
         busy = true
