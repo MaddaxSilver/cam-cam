@@ -49,6 +49,11 @@ final class FrameAdvisor {
         /// distorted on the 13 mm), and whether the subject runs off the frame.
         var minMM: Int = 13
         var cutOff = false
+        /// A scene framing (coastline, landscape): the box IS the view to zoom
+        /// to, held in place with the gyro rather than visual tracking.
+        var isScene = false
+        /// From the generic object detector (not a person or pet).
+        var isObject = false
     }
     typealias Subject = (box: CGRect, isGroup: Bool, comp: Composition)
 
@@ -105,6 +110,13 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) var cachedAngle: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var pauseUntil: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var fovReadAt: Double = 0
+    // Scene framing
+    @ObservationIgnored nonisolated(unsafe) private var sceneWhy = ""
+    @ObservationIgnored nonisolated(unsafe) private var sceneLock: CGRect?          // expected box after the zoom
+    @ObservationIgnored nonisolated(unsafe) private var sceneArmed = false
+    @ObservationIgnored nonisolated(unsafe) private var lastSceneAt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var lastScene: Subject?
+    @ObservationIgnored nonisolated(unsafe) private var lastSceneAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
     @ObservationIgnored nonisolated(unsafe) private var frameAngle: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var bufferAspect: CGFloat = 3.0 / 4.0
     // Auto zoom while locked
@@ -142,23 +154,33 @@ final class FrameAdvisor {
         if let down = Self.downAngle(SceneMotion.attitude), down < 35 { comp.minMM = max(comp.minMM, 24) }
         var ratio = Double(comp.fill / max(b.width, b.height))
         if comp.cutOff { ratio = min(ratio, 0.7) }
-        let swapped = zoom(by: ratio, minMM: comp.minMM, camera: camera)
+        let applied = zoom(by: ratio, minMM: comp.minMM, camera: camera)
+        // Scenes: where the suggested view lands after the (centred) zoom —
+        // then held on the scene with the gyro while you aim at it.
+        sceneLock = nil; sceneArmed = false
+        if comp.isScene, let u = shown {
+            let z = CGFloat(applied ?? 1)
+            sceneLock = CGRect(x: (u.midX - 0.5) * z + 0.5 - u.width * z / 2,
+                               y: (u.midY - 0.5) * z + 0.5 - u.height * z / 2,
+                               width: u.width * z, height: u.height * z)
+            lockedComp = comp; lockedIsGroup = false
+        }
         // Start tracking once the zoom (or lens switch) has settled.
-        trackStartAt = CACurrentMediaTime() + (swapped ? 0.9 : 0.6)
+        trackStartAt = CACurrentMediaTime() + (applied != nil ? 0.9 : 0.6)
     }
 
     /// Zoom by `ratio` (>1 in, <1 out) within the subject's lens range.
-    /// Returns true if it changed the zoom.
+    /// Returns the zoom ratio actually applied, or nil if it didn't change.
     @discardableResult
-    func zoom(by ratio: Double, minMM: Int, camera: CameraManager) -> Bool {
+    func zoom(by ratio: Double, minMM: Int, camera: CameraManager) -> Double? {
         let cur = Double(max(camera.currentMM, 13))
         let lo = Double(max(minMM, 13)), hi = min(cur * 6, 200)   // far-off subjects need the long end
         let want = min(max(cur * ratio, lo), max(hi, lo))
-        guard abs(want / cur - 1) > 0.08 else { return false }
+        guard abs(want / cur - 1) > 0.08 else { return nil }
         camera.setZoom(CGFloat(want / 26))
         lastZoomAt = CACurrentMediaTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { camera.syncZoomState() }
-        return true
+        return want / cur
     }
 
     /// The phone turned (portrait ⇄ landscape): boxes are in the old upright
@@ -181,7 +203,7 @@ final class FrameAdvisor {
 
     func unlock() {
         stage = .suggesting; cachedLocked = false
-        lockContext = nil
+        lockContext = nil; sceneLock = nil; sceneArmed = false
         alignedSince = nil; lostSince = nil
         tracked = nil; tracker = nil
     }
@@ -237,6 +259,15 @@ final class FrameAdvisor {
         if cachedLocked {
             try? handler.perform([horizonReq])
             let tilt = Self.tilt(horizonReq)
+            // Scene: no tracking — the view is pinned to the scene with the
+            // gyro, and you aim the phone until it fills the frame.
+            if let sl = sceneLock {
+                guard CACurrentMediaTime() >= trackStartAt else { return }
+                if !sceneArmed { shown = sl; shownAttitude = frameAttitude; sceneArmed = true }
+                anchorShown(aspect: aspect)
+                guide((shown!, false, lockedComp), tilt: tilt, time: time, aspect: aspect, camera: camera)
+                return
+            }
             // Wait for the lock's zoom to settle, then pick the subject again
             // (nearest the centre) and track it from then on.
             if tracked == nil {
@@ -265,9 +296,41 @@ final class FrameAdvisor {
 
         try? handler.perform([horizonReq])
         var found = Self.detect(handler, preferCentre: false)
+        // Landscapes, coastlines, skylines: no person or pet in frame (and
+        // either nothing found or just a generic object in a scene with a
+        // horizon) — suggest the best framing of the whole scene instead.
+        // Re-scored every ~0.9 s; between scorings the last one rides the gyro.
+        if found == nil || (found!.comp.isObject && Self.tilt(horizonReq) != nil) {
+            if time - lastSceneAt > 0.9 {
+                lastSceneAt = time
+                lastScene = nil
+                if let r = SceneFraming.best(handler: handler, image: image, context: Self.ciContext) {
+                    var c = Composition()
+                    c.anchor = CGPoint(x: 0.5, y: 0.5); c.target = CGPoint(x: 0.5, y: 0.5)
+                    c.fill = 0.97; c.isScene = true
+                    lastScene = (r.view, false, c)
+                    lastSceneAttitude = frameAttitude
+                    sceneWhy = r.why
+                } else if found == nil, frameFov < 90, SceneFraming.wantsWider(handler: handler) {
+                    sceneWhy = "wider"
+                } else {
+                    sceneWhy = ""
+                }
+            }
+            if var sc = lastScene {
+                // Between scorings, carry it with the gyro (the phone moved).
+                let a = frameAngle, ba = Double(bufferAspect)
+                sc.box = Self.toUpright(SceneMotion.reproject(Self.toBuffer(sc.box, angle: a), from: lastSceneAttitude,
+                                                              to: frameAttitude, fovLong: frameFov, aspect: ba), angle: a)
+                lastScene = sc; lastSceneAttitude = frameAttitude
+                found = sc
+            }
+        } else {
+            lastScene = nil; sceneWhy = ""
+        }
         // Learned placement (trained on the Mac from your shots), refreshed
         // every ~1.5 s for the same subject.
-        if let f = found {
+        if let f = found, !f.comp.isScene {
             if let l = learned, Self.iou(l.box, f.box) > 0.4, time - l.at < 1.5 {
                 found!.comp = l.comp
             } else if let c = FrameLearning.refine(f.box, comp: f.comp, handler: handler) {
@@ -283,7 +346,7 @@ final class FrameAdvisor {
 
     nonisolated private func suggest(_ found: Subject?, tilt: Double?, time: Double, aspect: CGFloat, image: CIImage) {
         anchorShown(aspect: aspect)
-        if let f = found, Self.worthFraming(f.box) {
+        if let f = found, f.comp.isScene || Self.worthFraming(f.box) {
             lastSeen = time
             shownComp = f.comp
             if let cur = shown {
@@ -318,6 +381,11 @@ final class FrameAdvisor {
                 if h.y < want { tip = h.skyBusier ? "Tilt up — more sky" : "Tilt up a little" }
                 else { tip = h.skyBusier ? "Tilt down a little" : "Tilt down — more foreground" }
             }
+        } else if shown != nil, shownComp.isScene, let b = shown {
+            let z = shownComp.fill / max(b.width, b.height)
+            tip = String(format: "Tap the box · %@ (%.1f×)", sceneWhy.isEmpty ? "tighter framing" : sceneWhy, z)
+        } else if shown == nil, sceneWhy == "wider" {
+            tip = "Try 13mm — the scene runs off the edges"
         } else if shown != nil {
             tip = (found?.isGroup ?? false) ? "Tap the box to frame the group" : "Tap the box to frame this shot"
         }
@@ -354,7 +422,7 @@ final class FrameAdvisor {
         let tiltErr = tilt ?? 0
         // Keep the size right as the subject moves closer / further (or the
         // lock's first zoom wasn't enough): re-zoom after it's been off ~1 s.
-        if (fillErr > 0.18 || fill > 0.97 || fillErr < -0.3), zoomSteps < 3, time - lastZoomAt > 2 {
+        if !c.isScene, (fillErr > 0.18 || fill > 0.97 || fillErr < -0.3), zoomSteps < 3, time - lastZoomAt > 2 {
             if offFillSince == nil { offFillSince = time }
             if time - offFillSince! > 1 {
                 offFillSince = nil; zoomSteps += 1
@@ -362,7 +430,7 @@ final class FrameAdvisor {
                 let minMM = c.minMM
                 lastZoomAt = time
                 DispatchQueue.main.async {
-                    if FrameAdvisor.shared.zoom(by: ratio, minMM: minMM, camera: camera) {
+                    if FrameAdvisor.shared.zoom(by: ratio, minMM: minMM, camera: camera) != nil {
                         FrameAdvisor.shared.retrack(after: 0.8)
                     }
                 }
@@ -526,13 +594,14 @@ final class FrameAdvisor {
             comp.target = max(b.width, b.height) > 0.5 ? CGPoint(x: 0.5, y: 0.5)
                 : CGPoint(x: nearestThird(b.midX), y: nearestThird(b.midY))
             comp.fill = 0.6
+            comp.isObject = true
             return comp
         }
         let animalReq = VNRecognizeAnimalsRequest()
         try? handler.perform([animalReq])
         let animals = (animalReq.results ?? []).filter { $0.confidence > 0.5 }.map(\.boundingBox)
         if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) {
-            var c = objectComp(b); c.minMM = 24
+            var c = objectComp(b); c.minMM = 24; c.isObject = false
             return (b, false, c)
         }
 
@@ -542,20 +611,6 @@ final class FrameAdvisor {
             .filter { $0.confidence > 0.3 && $0.boundingBox.width * $0.boundingBox.height > 0.002 }
         if let o = pick(objs.map(\.boundingBox), preferCentre: preferCentre), let b = box(around: o), worthFraming(b) {
             return (b, false, objectComp(b))
-        }
-        // Scenes with no single object (skyline, mountain, building far off):
-        // frame where the eye goes — Apple's attention saliency — on a third.
-        let attReq = VNGenerateAttentionBasedSaliencyImageRequest()
-        try? handler.perform([attReq])
-        let hot = ((attReq.results?.first as? VNSaliencyImageObservation)?.salientObjects ?? [])
-            .filter { $0.confidence > 0.3 }.map(\.boundingBox)
-        if let h = pick(hot, preferCentre: preferCentre), let b = box(around: h), worthFraming(b) {
-            var c = objectComp(b)
-            if max(b.width, b.height) <= 0.5 {        // small: on the nearest thirds point
-                c.target = CGPoint(x: nearestThird(b.midX), y: nearestThird(b.midY))
-            }
-            c.fill = 0.7
-            return (b, false, c)
         }
         return nil
     }
@@ -580,31 +635,7 @@ final class FrameAdvisor {
     /// Where the horizon sits (top-left y) and whether the sky half has more
     /// detail than the ground half — from luminance down the frame.
     nonisolated static func horizonPlacement(_ image: CIImage) -> (y: CGFloat, skyBusier: Bool)? {
-        let n = 48
-        let e = image.extent
-        let strip = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
-            .transformed(by: CGAffineTransform(scaleX: 8 / e.width, y: CGFloat(n) / e.height))
-        var buf = [Float](repeating: 0, count: 8 * n * 4)
-        ciContext.render(strip, toBitmap: &buf, rowBytes: 8 * 16,
-            bounds: CGRect(x: 0, y: 0, width: 8, height: n), format: .RGBAf, colorSpace: nil)
-        // Row luminance (row 0 = bottom) and per-row detail (variation across the row).
-        var lum = [Float](repeating: 0, count: n), detail = [Float](repeating: 0, count: n)
-        for r in 0..<n {
-            // Bitmap memory row 0 is the top of the image; index rows from the bottom.
-            let mr = n - 1 - r
-            let row = (0..<8).map { c -> Float in let i = (mr * 8 + c) * 4; return 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2] }
-            lum[r] = row.reduce(0, +) / 8
-            let m = lum[r]; detail[r] = row.map { abs($0 - m) }.reduce(0, +) / 8
-        }
-        var best = 0, bestStep: Float = 0
-        for i in 2..<(n - 2) {
-            let step = (lum[i + 1] + lum[i + 2]) - (lum[i - 1] + lum[i - 2])     // brighter above
-            if step > bestStep { bestStep = step; best = i }
-        }
-        guard bestStep > 0.2 else { return nil }
-        let skyDetail = detail[(best + 1)...].reduce(0, +) / Float(n - best - 1)
-        let groundDetail = detail[..<best].reduce(0, +) / Float(max(best, 1))
-        return (1 - CGFloat(best) / CGFloat(n - 1), skyDetail > groundDetail * 1.15)
+        SceneFraming.horizonPlacement(image, context: ciContext)
     }
 
     nonisolated static func tilt(_ req: VNDetectHorizonRequest) -> Double? {
