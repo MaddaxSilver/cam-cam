@@ -104,6 +104,7 @@ final class FrameAdvisor {
     // landscape. Boxes are kept upright and converted for display.
     @ObservationIgnored nonisolated(unsafe) var cachedAngle: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var pauseUntil: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var fovReadAt: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var frameAngle: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var bufferAspect: CGFloat = 3.0 / 4.0
     // Auto zoom while locked
@@ -207,9 +208,12 @@ final class FrameAdvisor {
         let aspect = small.extent.width / max(small.extent.height, 1)     // upright
         SceneMotion.start()
         frameAttitude = SceneMotion.attitude          // attitude when this frame was seen
-        frameFov = SceneMotion.fovLong(camera.currentDevice)
+        let device = camera.currentDevice
         Self.queue.async { [self] in
             defer { busy = false }
+            // The lens FOV, read here, not on the camera queue: AVCaptureDevice
+            // property reads can wait on the session's configuration lock.
+            if time - fovReadAt > 0.5 || cachedLocked { frameFov = SceneMotion.fovLong(device); fovReadAt = time }
             if angle != frameAngle {           // turned since the last frame
                 frameAngle = angle; shown = nil; rival = nil; tracked = nil; learned = nil
             }
@@ -640,12 +644,13 @@ final class FrameAdvisor {
         Task { @MainActor in
             let a = FrameAdvisor.shared
             guard a.cachedEnabled, a.cachedAngle == angle else { return }
-            a.imageAspect = bufAspect
-            a.boxAttitude = att
-            a.fovLong = fov
-            a.lastComp = comp
-            a.box = box
-            if a.cachedLocked || stage == .suggesting { a.stage = stage }
+            // Only touch what changed: every observed write redraws the box.
+            if a.imageAspect != bufAspect { a.imageAspect = bufAspect }
+            if a.fovLong != fov { a.fovLong = fov }
+            if a.lastComp.target != comp.target || a.lastComp.fill != comp.fill
+                || a.lastComp.minMM != comp.minMM || a.lastComp.cutOff != comp.cutOff { a.lastComp = comp }
+            if a.box != box { a.boxAttitude = att; a.box = box }
+            if (a.cachedLocked || stage == .suggesting), a.stage != stage { a.stage = stage }
             if a.hint != hint { a.hint = hint }
         }
     }

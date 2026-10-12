@@ -3168,7 +3168,10 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         // real one replaces this when it lands.
         if wantsShutterThumb {
             wantsShutterThumb = false
-            publishShutterThumb(CIImage(cvPixelBuffer: pixelBuffer))
+            // Off the camera queue: its GPU readback lands right as the photo
+            // capture starts and used to stall the viewfinder ~0.3 s per shot.
+            let frame = CIImage(cvPixelBuffer: pixelBuffer)
+            DispatchQueue.global(qos: .userInitiated).async { [self] in publishShutterThumb(frame) }
         }
 
         // Styles: keep a live person mask fresh (~6 Hz, off this queue)
@@ -3426,6 +3429,23 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
 }
 
 #if DEBUG
+/// Debug-only main-thread hitch probe (UI: dial, box, chrome).
+final class MainHitchProbe: NSObject {
+    static let shared = MainHitchProbe()
+    private var link: CADisplayLink?
+    private var last: CFTimeInterval = 0
+    func start() {
+        link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        link?.add(to: .main, forMode: .common)
+    }
+    @objc private func tick(_ l: CADisplayLink) {
+        if last > 0, l.timestamp - last > 0.05 {
+            print(String(format: "[perf] %.2f MAIN %.0f ms", CACurrentMediaTime(), (l.timestamp - last) * 1000))
+        }
+        last = l.timestamp
+    }
+}
+
 /// Debug-only preview timing: logs late video frames (camera queue blocked).
 nonisolated enum PerfProbe {
     nonisolated(unsafe) static var last: Double = 0

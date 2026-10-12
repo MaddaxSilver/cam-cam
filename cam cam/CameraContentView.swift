@@ -192,31 +192,9 @@ struct CameraContentView: View {
 
                 // Frame guide box: yellow = suggestion (tap to lock on), white =
                 // guiding you (haptics + hint), green = lined up (fires the shutter).
-                if frameAdvisor.enabled, let measured = frameAdvisor.box {
-                    // Pinned to the scene: re-projected with the gyro every frame,
-                    // so the box stays on the subject as the phone moves.
-                    TimelineView(.animation) { _ in
-                        let a = frameAdvisor.imageAspect
-                        let box = SceneMotion.reproject(measured, from: frameAdvisor.boxAttitude,
-                                                        to: SceneMotion.attitude,
-                                                        fovLong: frameAdvisor.fovLong, aspect: Double(a))
-                        let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
-                        let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
-                        let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
-                                       width: box.width * dispW, height: box.height * dispH)
-                        FramingBox(color: frameAdvisor.stage == .aligned ? .green
-                                   : frameAdvisor.stage == .locked ? .white : .yellow)
-                            .frame(width: r.width, height: r.height)
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                if frameAdvisor.stage == .suggesting { frameAdvisor.lock(camera: camera) }
-                                else { frameAdvisor.unlock() }
-                            }
-                            .simultaneousGesture(pinchGesture)   // pinch still zooms over the box
-                            .position(x: r.midX, y: r.midY)
-                    }
-                    .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
-                }
+                // Its own view: Frame guide updates (3–12 a second) then only
+                // redraw the box, not this whole screen.
+                FrameGuideOverlay(camera: camera, pw: pw, ph: ph, pinch: pinchGesture)
 
                 // AE/AF LOCK badge at the top of the frame
                 if camera.focusLocked {
@@ -518,6 +496,7 @@ struct CameraContentView: View {
             // Profiling harness: Frame guide on, a shot every 4 s for 40 s.
             if ProcessInfo.processInfo.arguments.contains("-perfShots") {
                 frameAdvisor.enabled = !ProcessInfo.processInfo.arguments.contains("-noGuide")
+                MainHitchProbe.shared.start()
                 for k in 1...10 {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 4 * Double(k)) {
                         print(String(format: "[perf] %.2f SHOT %d", CACurrentMediaTime(), k))
@@ -2190,5 +2169,41 @@ private struct TopPill: View {
                 .overlay(Capsule().stroke(isActive ? Color.yellow : Color.white.opacity(0.25), lineWidth: 1))
         )
         .animation(.easeInOut(duration: 0.18), value: isActive)
+    }
+}
+
+/// Frame guide box: yellow = suggestion (tap to lock on), white = guiding
+/// you (haptics + hint), green = lined up (fires the shutter). Pinned to the
+/// scene: re-projected with the gyro each display frame (capped at 60 Hz).
+private struct FrameGuideOverlay<Pinch: Gesture>: View {
+    let camera: CameraManager
+    let pw: CGFloat, ph: CGFloat
+    let pinch: Pinch
+    @State private var frameAdvisor = FrameAdvisor.shared
+
+    var body: some View {
+        if frameAdvisor.enabled, let measured = frameAdvisor.box {
+            TimelineView(.animation(minimumInterval: 1.0 / 60)) { _ in
+                let a = frameAdvisor.imageAspect
+                let box = SceneMotion.reproject(measured, from: frameAdvisor.boxAttitude,
+                                                to: SceneMotion.attitude,
+                                                fovLong: frameAdvisor.fovLong, aspect: Double(a))
+                let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
+                let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
+                let r = CGRect(x: ox + box.minX * dispW, y: oy + box.minY * dispH,
+                               width: box.width * dispW, height: box.height * dispH)
+                FramingBox(color: frameAdvisor.stage == .aligned ? .green
+                           : frameAdvisor.stage == .locked ? .white : .yellow)
+                    .frame(width: r.width, height: r.height)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if frameAdvisor.stage == .suggesting { frameAdvisor.lock(camera: camera) }
+                        else { frameAdvisor.unlock() }
+                    }
+                    .simultaneousGesture(pinch)   // pinch still zooms over the box
+                    .position(x: r.midX, y: r.midY)
+            }
+            .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
+        }
     }
 }
