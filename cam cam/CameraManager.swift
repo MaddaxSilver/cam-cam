@@ -1937,6 +1937,7 @@ import CoreLocation
         }
         isCapturing = true   // didSet pushes Watch state — no need to call pushState again
         FrameAdvisor.shared.noteShot(camera: self)   // framing example for the Mac-side training
+        PoseGuide.shared.noteShot()
         wantsShutterThumb = true      // next live frame becomes the thumbnail, instantly
         // Each shot keeps its own copy of the settings: the shutter frees as soon
         // as the exposure is taken, so the next shot can start before this one
@@ -3183,6 +3184,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         FrameAdvisor.shared.process(pixelBuffer,
                                     time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
                                     camera: self)
+
+        // Pose guide: suggests a pose and coaches the subject into it (rear camera)
+        PoseGuide.shared.process(pixelBuffer,
+                                 time: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                                 camera: self)
 
         // Smart Take: fires the shutter when everyone in frame is posed
         SmartTake.shared.process(pixelBuffer,

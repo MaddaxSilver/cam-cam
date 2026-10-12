@@ -27,6 +27,21 @@ struct cam_camApp: App {
 
     init() {
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-poseCards") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("posecards")
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for (i, pose) in PoseLibrary.all.enumerated() {
+                    let card = PoseCard(pose: pose, index: i, count: PoseLibrary.all.count,
+                                        match: Double(i % 4) / 3, matched: i % 4 == 3) {}
+                        .padding(12).background(Color(white: 0.35))
+                    let r = ImageRenderer(content: card); r.scale = 3
+                    if let img = r.uiImage, let d = img.pngData() { try? d.write(to: dir.appendingPathComponent("\(i)-\(pose.id).png")) }
+                }
+                print("[poseCards] done", dir.path)
+                exit(0)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("-aeAudit") {
             let camera = CameraManager()
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {

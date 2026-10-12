@@ -195,6 +195,7 @@ struct CameraContentView: View {
                 // Its own view: Frame guide updates (3–12 a second) then only
                 // redraw the box, not this whole screen.
                 FrameGuideOverlay(camera: camera, pw: pw, ph: ph, pinch: pinchGesture)
+                PoseSkeletonOverlay(pw: pw, ph: ph)
 
                 // AE/AF LOCK badge at the top of the frame
                 if camera.focusLocked {
@@ -2204,6 +2205,44 @@ private struct FrameGuideOverlay<Pinch: Gesture>: View {
                     .position(x: r.midX, y: r.midY)
             }
             .animation(.easeOut(duration: 0.2), value: frameAdvisor.stage)
+        }
+    }
+}
+
+/// Pose guide: the subject's live skeleton, green where the pose matches and
+/// yellow where it's off (the main subject), faint for others in frame.
+private struct PoseSkeletonOverlay: View {
+    let pw: CGFloat, ph: CGFloat
+    @State private var guide = PoseGuide.shared
+
+    var body: some View {
+        if guide.enabled, !guide.people.isEmpty {
+            let a = guide.imageAspect
+            let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
+            let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
+            let off = guide.offJoints, matched = guide.matched
+            Canvas { ctx, _ in
+                func pt(_ p: CGPoint) -> CGPoint { CGPoint(x: ox + p.x * dispW, y: oy + p.y * dispH) }
+                for (i, person) in guide.people.enumerated() {
+                    let main = i == 0
+                    for (a, b) in PJ.bones {
+                        guard let p = person[a], let q = person[b] else { continue }
+                        var path = Path(); path.move(to: pt(p)); path.addLine(to: pt(q))
+                        let bad = main && !matched && (off.contains(a) || off.contains(b))
+                        let color: Color = !main ? .white.opacity(0.35) : bad ? .yellow : .green
+                        ctx.stroke(path, with: .color(color.opacity(main ? 0.9 : 1)),
+                                   style: StrokeStyle(lineWidth: main ? 2.5 : 1.5, lineCap: .round))
+                    }
+                    if let n = person[.nose] ?? person[.neck] {
+                        let c = pt(n), r: CGFloat = main ? 9 : 6
+                        ctx.stroke(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)),
+                                   with: .color(main ? (matched ? Color.green : Color.white).opacity(0.9) : Color.white.opacity(0.35)),
+                                   lineWidth: main ? 2.5 : 1.5)
+                    }
+                }
+            }
+            .allowsHitTesting(false)
+            .animation(.easeOut(duration: 0.15), value: matched)
         }
     }
 }

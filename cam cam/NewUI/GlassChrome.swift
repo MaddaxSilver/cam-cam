@@ -75,6 +75,7 @@ struct GlassChrome<Shutter: View>: View {
     @State private var smartAE = SmartExposure.shared
     @State private var smartTake = SmartTake.shared
     @State private var frameAdvisor = FrameAdvisor.shared
+    @State private var poseGuide = PoseGuide.shared
     @State private var styleSettings = StyleSettings.shared
     @State private var showSetPicker = false
     @AppStorage("cc_arcSet") private var arcSetRaw = ArcSet.all.rawValue
@@ -85,6 +86,17 @@ struct GlassChrome<Shutter: View>: View {
             topBar
                 .padding(.top, 58)
                 .padding(.horizontal, 16)
+            // Pose guide card, under the exposure meter, while someone's in frame.
+            if poseGuide.enabled, !poseGuide.people.isEmpty, let pose = poseGuide.pose, !showControls {
+                HStack {
+                    Spacer()
+                    PoseCard(pose: pose, index: poseGuide.index, count: poseGuide.poses.count,
+                             match: poseGuide.match, matched: poseGuide.matched) { poseGuide.next() }
+                }
+                .padding(.top, 8)
+                .padding(.horizontal, 16)
+                .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .topTrailing)))
+            }
             Spacer(minLength: 0)
             contextRulers
                 .padding(.horizontal, 16)
@@ -131,6 +143,14 @@ struct GlassChrome<Shutter: View>: View {
                     .padding(.bottom, 8)
                     .animation(.easeOut(duration: 0.2), value: smartTake.ready)
                     .transition(.opacity)
+                } else if poseGuide.enabled, !poseGuide.people.isEmpty, let cue = poseGuide.cue {
+                    Label(cue, systemImage: "figure.stand")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(poseGuide.matched ? .green : .white)
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .glassEffect(.regular, in: Capsule())
+                        .padding(.bottom, 8)
+                        .transition(.opacity)
                 } else if frameAdvisor.enabled, let hint = frameAdvisor.hint {
                     Label(hint, systemImage: "viewfinder")
                         .font(.system(size: 13, weight: .semibold))
@@ -289,6 +309,8 @@ struct GlassChrome<Shutter: View>: View {
         }
         if camera.rawEnabled { out.append(.init(id: "raw", symbol: "r.square")) }
         if smartTake.enabled { out.append(.init(id: "smarttake", symbol: "person.2.badge.gearshape")) }
+        if frameAdvisor.enabled { out.append(.init(id: "frameguide", symbol: "viewfinder.rectangular")) }
+        if poseGuide.enabled { out.append(.init(id: "poseguide", symbol: "figure.stand")) }
         if camera.thermalWarning != nil { out.append(.init(id: "heat", symbol: "thermometer.medium", tint: .orange)) }
         if camera.isFocusing { out.append(.init(id: "focus", symbol: "scope", pulse: true)) }
         else if camera.faceDetected && !camera.manualFocusEnabled { out.append(.init(id: "face", symbol: "face.dashed")) }
@@ -494,6 +516,8 @@ struct GlassChrome<Shutter: View>: View {
                          isOn: Binding(get: { smartTake.enabled }, set: { smartTake.enabled = $0 })),
                     Tile(title: "Frame guide", symbol: "viewfinder.rectangular",
                          isOn: Binding(get: { frameAdvisor.enabled }, set: { frameAdvisor.enabled = $0 })),
+                    Tile(title: "Pose guide", symbol: "figure.stand",
+                         isOn: Binding(get: { poseGuide.enabled }, set: { poseGuide.enabled = $0 })),
                 ])
                 GlassRuler(title: "Development",
                            valueText: camera.development == 0 ? "Off"
