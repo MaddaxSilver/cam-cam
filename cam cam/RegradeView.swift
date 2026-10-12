@@ -18,6 +18,7 @@ struct RegradeView: View {
     let customSimStore: CustomSimStore
     @Environment(\.dismiss) private var dismiss
     @State private var assetIDs: [String] = []
+    @State private var assets: [String: PHAsset] = [:]
     @State private var loaded = false
     @State private var open: String?
 
@@ -71,7 +72,7 @@ struct RegradeView: View {
                 ScrollView {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 2) {
                         ForEach(assetIDs, id: \.self) { id in
-                            Button { open = id } label: { AssetThumb(assetID: id) }
+                            Button { open = id } label: { AssetThumb(assetID: id, asset: assets[id]) }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -87,7 +88,10 @@ struct RegradeView: View {
         let opts = PHFetchOptions()
         opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let r = PHAsset.fetchAssets(in: album, options: opts)
-        assetIDs = (0..<r.count).map { r.object(at: $0).localIdentifier }
+        var list: [PHAsset] = []
+        r.enumerateObjects { a, _, _ in list.append(a) }
+        assets = Dictionary(uniqueKeysWithValues: list.map { ($0.localIdentifier, $0) })
+        assetIDs = list.map(\.localIdentifier)
     }
 }
 
@@ -95,8 +99,11 @@ struct RegradeView: View {
 
 private struct AssetThumb: View {
     let assetID: String
+    let asset: PHAsset?
     @State private var image: UIImage?
     @State private var film: String?
+    @State private var request: PHImageRequestID?
+    static let images = PHCachingImageManager()
 
     var body: some View {
         Color.white.opacity(0.06)
@@ -114,16 +121,25 @@ private struct AssetThumb: View {
             }
             .clipped()
             .task {
-                guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil).firstObject
+                guard let asset = asset ?? PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil).firstObject
                 else { return }
                 let opts = PHImageRequestOptions()
                 opts.deliveryMode = .opportunistic
+                opts.resizeMode = .fast
                 opts.isNetworkAccessAllowed = true
-                PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 300, height: 300),
-                                                      contentMode: .aspectFill, options: opts) { img, _ in
+                request = Self.images.requestImage(for: asset, targetSize: CGSize(width: 360, height: 360),
+                                                   contentMode: .aspectFill, options: opts) { img, _ in
                     if let img { image = img }
                 }
-                film = await PhotoSaver.recipe(for: asset)?.displayName
+                // The film label: cached, or looked up in the background.
+                if let n = PhotoSaver.cachedFilmName(assetID) { film = n.isEmpty ? nil : n }
+                else {
+                    let n = await PhotoSaver.FilmNameLoader.shared.name(for: asset)
+                    film = n.isEmpty ? nil : n
+                }
+            }
+            .onDisappear {
+                if let r = request { Self.images.cancelImageRequest(r); request = nil }
             }
     }
 }
@@ -137,6 +153,8 @@ private struct RegradeDetail: View {
     var onBack: () -> Void
 
     @State private var original: CIImage?          // downscaled, upright, for previews
+    @State private var rendering = false
+    @State private var renderAgain = false
     @State private var originalUI: UIImage?
     @State private var preview: UIImage?
     @State private var oldRecipe: ShotRecipe?
@@ -260,15 +278,23 @@ private struct RegradeDetail: View {
     private func loadOriginal() async {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil).firstObject,
               let input = await PhotoSaver.editingInput(for: asset),
-              let url = input.fullSizeImageURL,
-              let ci = CIImage(contentsOf: url)
+              let url = input.fullSizeImageURL
         else { message = "Couldn't open this photo"; return }
-        let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
-        let upright = ci.oriented(forExifOrientation: o)
-        let scale = min(1, 1600 / max(upright.extent.width, upright.extent.height))
-        let small = upright.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        // Decode and downscale off the main thread (a 48MP decode froze the UI).
+        nonisolated(unsafe) let cam = camera
+        let loaded: (CIImage, UIImage)? = await Task.detached(priority: .userInitiated) {
+            guard let ci = CIImage(contentsOf: url) else { return nil }
+            let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
+            let upright = ci.oriented(forExifOrientation: o)
+            let scale = min(1, 1600 / max(upright.extent.width, upright.extent.height))
+            var small = upright.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            guard let cg = cam.ciContext.createCGImage(small, from: small.extent) else { return nil }
+            small = CIImage(cgImage: cg)              // previews re-render from pixels, not the 48MP file
+            return (small, UIImage(cgImage: cg))
+        }.value
+        guard let (small, ui) = loaded else { message = "Couldn't open this photo"; return }
         original = small
-        if let cg = camera.ciContext.createCGImage(small, from: small.extent) { originalUI = UIImage(cgImage: cg) }
+        originalUI = ui
         if let adj = input.adjustmentData, adj.formatIdentifier == ShotRecipe.formatIdentifier {
             oldRecipe = ShotRecipe.decode(adj.data)
         } else {
@@ -278,15 +304,22 @@ private struct RegradeDetail: View {
         renderPreview()
     }
 
+    /// One render at a time; changes made meanwhile render once it's done
+    /// (flicking through films used to queue a full render per change).
     private func renderPreview() {
         guard let original else { return }
+        if rendering { renderAgain = true; return }
+        rendering = true
         let r = recipe
         nonisolated(unsafe) let cam = camera
         Task.detached(priority: .userInitiated) {
             let out = cam.renderLook(original, recipe: r, flatten: false).cropped(to: original.extent)
-            guard let cg = cam.ciContext.createCGImage(out, from: out.extent) else { return }
-            let img = UIImage(cgImage: cg)
-            await MainActor.run { if r == recipe { preview = img } }
+            let cg = cam.ciContext.createCGImage(out, from: out.extent)
+            await MainActor.run {
+                if let cg, r == recipe { preview = UIImage(cgImage: cg) }
+                rendering = false
+                if renderAgain || r != recipe { renderAgain = false; renderPreview() }
+            }
         }
     }
 
@@ -319,6 +352,7 @@ private struct RegradeDetail: View {
             }
             oldRecipe = nil
             recipe = ShotRecipe()
+            PhotoSaver.rememberFilmName(nil, for: assetID)
             message = "Back to the original"
         } catch {
             message = error.localizedDescription

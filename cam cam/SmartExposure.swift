@@ -108,18 +108,28 @@ final class SmartExposure {
             apply(bias: camera.cachedUserBias, camera: camera)
             publish(status: "", correction: 0)
         }
-        guard cachedEnabled, time - lastTick >= 0.15 else { return }
+        guard time - lastTick >= 0.15 else { return }
         lastTick = time
         guard let device = camera.currentDevice,
               device.exposureMode == .continuousAutoExposure,
               !camera.cachedIsRecording, !camera.isCollectingFrames else { return }
 
+        // Every film, every custom sim and imported LUT: measure how the
+        // active look moves mid-grey (re-measured ~every 1.5 s).
         if time - lookMeasuredAt > 1.5, !lookBusy {
             lookMeasuredAt = time; lookBusy = true
             Self.lookQueue.async { [self] in
                 defer { lookBusy = false }
                 if let o = Self.measureLook(camera) { lookOffset = o }
             }
+        }
+        // AUTO (Smart AE off): Apple's exposure, corrected only for the film.
+        guard cachedEnabled else {
+            if smart != 0 { smart = 0 }
+            apply(bias: camera.cachedUserBias - lookOffset, camera: camera)
+            let status = abs(lookOffset) >= 0.05 ? String(format: "Film %+.1f EV", -lookOffset) : ""
+            if status != lastStatus { lastStatus = status; publish(status: status, correction: -lookOffset) }
+            return
         }
 
         let frame = CIImage(cvPixelBuffer: pixelBuffer)
@@ -201,7 +211,7 @@ final class SmartExposure {
         smart += speed * error
 
         if reason.isEmpty {
-            if abs(look) > 0.2 { reason = String(format: "Film %+.1f EV", -look) }
+            if abs(look) >= 0.05 { reason = String(format: "Film %+.1f EV", -look) }
             else if faceHint { reason = "Face priority" }
             else if ev < 4 { reason = "Night" }
             else if smart > 0.15 { reason = "Brightening" }

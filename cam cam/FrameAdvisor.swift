@@ -110,6 +110,11 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) var cachedAngle: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var pauseUntil: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var fovReadAt: Double = 0
+    // Zoom to restore after the lock (Frame guide zooms in for the shot;
+    // staying at 120–200 mm afterwards left a slow, low-fps telephoto preview).
+    @ObservationIgnored private var preLockMM: Int?
+    @ObservationIgnored private var lastZoomTargetMM: Double?
+    @ObservationIgnored private weak var lockCamera: CameraManager?
     // Scene framing
     @ObservationIgnored nonisolated(unsafe) private var sceneWhy = ""
     @ObservationIgnored nonisolated(unsafe) private var sceneLock: CGRect?          // expected box after the zoom
@@ -145,6 +150,7 @@ final class FrameAdvisor {
         offFillSince = nil; zoomSteps = 0
         if let img = lastUpright, let u = shown { lockContext = (img, u) } else { lockContext = nil }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        preLockMM = camera.currentMM; lastZoomTargetMM = nil; lockCamera = camera
         camera.tapToFocus(at: CGPoint(x: b.midY, y: 1 - b.midX))   // focus on the subject
         // Auto zoom — in OR out — so the subject fills what suits it. A
         // subject running off the frame (a group cut at the edges) zooms out,
@@ -178,6 +184,7 @@ final class FrameAdvisor {
         let want = min(max(cur * ratio, lo), max(hi, lo))
         guard abs(want / cur - 1) > 0.08 else { return nil }
         camera.setZoom(CGFloat(want / 26))
+        lastZoomTargetMM = want
         lastZoomAt = CACurrentMediaTime()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { camera.syncZoomState() }
         return want / cur
@@ -204,6 +211,13 @@ final class FrameAdvisor {
     func unlock() {
         stage = .suggesting; cachedLocked = false
         lockContext = nil; sceneLock = nil; sceneArmed = false
+        // Put the zoom back where you had it — unless you changed it yourself.
+        if let cam = lockCamera, let pre = preLockMM, let target = lastZoomTargetMM,
+           abs(Double(cam.currentMM) - target) <= max(3, target * 0.12), abs(Double(pre) - target) > 2 {
+            cam.setZoom(CGFloat(Double(pre) / 26))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { cam.syncZoomState() }
+        }
+        preLockMM = nil; lastZoomTargetMM = nil
         alignedSince = nil; lostSince = nil
         tracked = nil; tracker = nil
     }
@@ -448,6 +462,11 @@ final class FrameAdvisor {
 
         if aligned {
             if alignedSince == nil { alignedSince = time }
+            // Holding on target: quick firm ticks until it fires.
+            if time - lastPulse >= 0.06 {
+                lastPulse = time
+                DispatchQueue.main.async { FrameAdvisor.pulse(1, rigid: true) }
+            }
             if time - alignedSince! > 0.4, !fired {
                 fired = true
                 logGuided(final: b, comp: c, camera: camera)
@@ -462,18 +481,27 @@ final class FrameAdvisor {
             publish(box: b, stage: .aligned, hint: tip, aspect: aspect)
         } else {
             alignedSince = nil
-            // Haptic guidance: pulse faster the further off it is.
+            // Haptic guidance, never silent while guiding: a steady pulse that
+            // quickens and firms up as you get closer (like a metal detector).
             let err = min(1, Double(abs(dx) + abs(dy)) * 2.2 + abs(tiltErr) / 8)
-            let interval = 0.12 + 0.55 * err
+            let interval = 0.07 + 0.28 * err
             if time - lastPulse >= interval {
                 lastPulse = time
-                let strength = CGFloat(0.35 + 0.5 * (1 - err))
-                DispatchQueue.main.async {
-                    UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: strength)
-                }
+                let strength = CGFloat(0.55 + 0.45 * (1 - err))
+                DispatchQueue.main.async { FrameAdvisor.pulse(strength) }
             }
             publish(box: b, stage: .locked, hint: tip, aspect: aspect)
         }
+    }
+
+    /// One prepared generator per feel (making one per pulse adds latency
+    /// and main-thread work).
+    private static let softPulse = UIImpactFeedbackGenerator(style: .medium)
+    private static let rigidPulse = UIImpactFeedbackGenerator(style: .rigid)
+    static func pulse(_ intensity: CGFloat, rigid: Bool = false) {
+        let g = rigid ? rigidPulse : softPulse
+        g.impactOccurred(intensity: intensity)
+        g.prepare()
     }
 
     /// After a zoom: detect the subject again and track it from there.

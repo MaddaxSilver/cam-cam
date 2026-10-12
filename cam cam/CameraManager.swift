@@ -239,7 +239,7 @@ import CoreLocation
     var currentMM: Int = 28
     var maxManualZoom: Double = 25.0
     var isFrontCamera: Bool = false
-    var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality
+    var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality (Max), 3 natural (ProRAW, no Apple processing)
         didSet { UserDefaults.standard.set(photoQuality, forKey: "cc_photoQuality") }
     }
     /// Observable so the UI follows it; the capture/render queues read the mirror.
@@ -661,6 +661,7 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) private var skipNextReconcile = false
     @ObservationIgnored nonisolated(unsafe) weak var editorPreviewRenderer: FilteredPreviewRenderer?
     @ObservationIgnored nonisolated(unsafe) weak var metalPreviewView: MetalFilteredPreviewView?
+    @ObservationIgnored nonisolated(unsafe) private var lastFaceDetected = false
     @ObservationIgnored nonisolated(unsafe) weak var peakingView: PeakingUIView?
     @ObservationIgnored nonisolated(unsafe) weak var previewLayer: AVCaptureVideoPreviewLayer?
     @ObservationIgnored nonisolated(unsafe) weak var previewUIView: PreviewUIView?
@@ -1813,7 +1814,12 @@ import CoreLocation
         let faces = metadataObjects.compactMap { $0 as? AVMetadataFaceObject }
         let detected = !faces.isEmpty
 
-        DispatchQueue.main.async { [weak self] in self?.faceDetected = detected }
+        // Only on change: this callback runs every frame, and each observed
+        // write re-renders the views that read it.
+        if detected != lastFaceDetected {
+            lastFaceDetected = detected
+            DispatchQueue.main.async { [weak self] in self?.faceDetected = detected }
+        }
 
         guard detected else { return }
 
@@ -1924,7 +1930,7 @@ import CoreLocation
         switch photoQuality {
         case 0: return .speed
         case 1: return .balanced
-        default: return .quality
+        default: return .quality          // Max, and Natural (48MP ProRAW)
         }
     }
 
@@ -2026,6 +2032,7 @@ import CoreLocation
         let useRAW = rawEnabled
         let quality = effectiveQualityPrioritization
         let portrait = portraitModeEnabled
+        let natural = photoQuality == 3 && activeCustomSim == nil
         sessionQueue.async { [self] in
             let settings: AVCapturePhotoSettings
             let codec: AVVideoCodecType = photoOutput.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
@@ -2037,7 +2044,13 @@ import CoreLocation
             let proRAW = rawTypes.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }
             let bayerRAW = rawTypes.first { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) }
             let rawChoice = quality == .quality ? (proRAW ?? bayerRAW) : (bayerRAW ?? proRAW)
-            if useRAW, let rawFormat = rawChoice {
+            if natural, !portrait, !capturingFirstExposure, let pro = proRAW {
+                // Natural: ProRAW only, developed here without Apple's
+                // photo processing (no local tone mapping, light noise
+                // reduction) — see developNatural.
+                settings = AVCapturePhotoSettings(rawPixelFormatType: pro)
+                markNatural(settings.uniqueID, keepRAW: useRAW)
+            } else if useRAW, let rawFormat = rawChoice {
                 // RAW + film: the DNG and a processed photo from one exposure.
                 // The processed one gets the film look; the DNG rides along as
                 // the same Photos asset's RAW (like Halide / Project Indigo).
@@ -2547,6 +2560,50 @@ import CoreLocation
 
     // MARK: Film Processing & Save
 
+    // MARK: Natural (ProRAW developed without Apple's processing)
+
+    @ObservationIgnored nonisolated(unsafe) private var naturalShots: [Int64: Bool] = [:]
+    nonisolated func markNatural(_ id: Int64, keepRAW: Bool) {
+        rawStashLock.lock(); naturalShots[id] = keepRAW; rawStashLock.unlock()
+    }
+    nonisolated func takeNatural(_ id: Int64) -> (keepRAW: Bool, Void)? {
+        rawStashLock.lock(); defer { rawStashLock.unlock() }
+        guard let k = naturalShots.removeValue(forKey: id) else { return nil }
+        return (k, ())
+    }
+
+    /// Develop a ProRAW ourselves: Apple's processed photo applies local tone
+    /// mapping (the "HDR look"), strong noise reduction and sharpening, which
+    /// smear fine texture under a film look. Here: no local tone mapping,
+    /// light noise reduction, default sharpening — then the film look.
+    nonisolated func developNatural(_ dng: Data, keepRAW: Bool, shot: (@Sendable () -> Void)?) {
+        DispatchQueue.main.async { self.isCapturing = false }
+        processQueue.async { [self] in
+            if let shot { shot() }
+            defer { if shot != nil { shotRendered() } }
+            guard let raw = CIRAWFilter(imageData: dng, identifierHint: "com.adobe.raw-image") else {
+                DispatchQueue.main.async { self.saveErrorMessage = "Couldn't develop the RAW" }
+                return
+            }
+            if raw.isLocalToneMapSupported { raw.localToneMapAmount = 0 }
+            if raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = 0.15 }
+            if raw.isColorNoiseReductionSupported { raw.colorNoiseReductionAmount = max(0.3, raw.colorNoiseReductionAmount) }
+            // The filter applies the file's orientation, so the result is upright
+            // like an EXIF-oriented processed photo.
+            guard var ciImage = raw.outputImage else { return }
+            ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -ciImage.extent.minX, y: -ciImage.extent.minY))
+            let metadata = CIImage(data: dng)?.properties ?? [:]
+            ciImage = applyPhotoZoomCrop(ciImage)
+            let base = ciImage
+            let recipe = pendingRecipe()
+            publishQuickPreview(ciImage, recipe: recipe)
+            let processed = applySimAndGrain(to: ciImage)
+            var meta = metadata
+            meta[kCGImagePropertyOrientation as String] = 1        // pixels are upright now
+            renderAndSave(ciImage: processed, metadata: meta, base: base, recipe: recipe, raw: keepRAW ? dng : nil)
+        }
+    }
+
     nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil, shot: (@Sendable () -> Void)? = nil) {
         // Unblock shutter immediately — process and save in background
         DispatchQueue.main.async { self.isCapturing = false }
@@ -2775,7 +2832,11 @@ import CoreLocation
         let scaleX = image.extent.width  / disparityImage.extent.width
         let scaleY = image.extent.height / disparityImage.extent.height
         let scale  = max(scaleX, scaleY)
-        let scaledDisparity = disparityImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        // Centred: the live preview is a centre crop of the frame, and the
+        // depth covers the whole frame.
+        let sd = disparityImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let scaledDisparity = sd.transformed(by: CGAffineTransform(translationX: image.extent.midX - sd.extent.midX,
+                                                                   y: image.extent.midY - sd.extent.midY))
 
         // Invert disparity so far = bright = more blur
         let mask: CIImage = {
@@ -3275,9 +3336,22 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             }
         }
 
-        // Downscale for preview — half resolution is plenty for screen display
-        let previewScale: CGFloat = 0.5
-        let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: previewScale, y: previewScale))
+        // Preview: only the part of the frame the screen shows (it's taller
+        // than 4:3, so aspect-fill hides the sides), at ~75% of screen
+        // resolution. Rendering the look on the whole frame at a fixed half
+        // size spent GPU on hidden pixels and, with smaller feeds, upscaled.
+        var scaled: CIImage
+        if let size = metal?.drawSize, size.width > 0, ciImage.extent.width > 0 {
+            let e = ciImage.extent
+            let fill = max(size.width / e.width, size.height / e.height)
+            let vw = size.width / fill, vh = size.height / fill            // visible part, buffer pixels
+            let visible = ciImage.cropped(to: CGRect(x: e.midX - vw / 2, y: e.midY - vh / 2, width: vw, height: vh).integral)
+            let k = min(1, fill * 0.75)
+            scaled = visible.transformed(by: CGAffineTransform(translationX: -visible.extent.minX, y: -visible.extent.minY))
+                .transformed(by: CGAffineTransform(scaleX: k, y: k))
+        } else {
+            scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 0.5, y: 0.5))
+        }
 
         // Same look as the saved photo (same order, same sims skip film grain),
         // shared with video recording so all three match.
@@ -3344,6 +3418,12 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // saved alongside the graded photo; RAW-only falls back to a bare DNG.
         let pairedRAWID: Int64? = photo.resolvedSettings.rawPhotoDimensions.width > 0
             && photo.resolvedSettings.photoDimensions.width > 0 ? photo.resolvedSettings.uniqueID : nil
+        if photo.isRawPhoto, let natural = takeNatural(photo.resolvedSettings.uniqueID),
+           let data = photo.fileDataRepresentation() {
+            let shot = takeShot(id: photo.resolvedSettings.uniqueID)
+            developNatural(data, keepRAW: natural.keepRAW, shot: shot?.apply)
+            return
+        }
         if photo.isRawPhoto, let data = photo.fileDataRepresentation() {
             if let id = pairedRAWID, !capturingFirstExposure {
                 stashRAW(data, id: id)

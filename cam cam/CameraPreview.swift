@@ -131,6 +131,8 @@ final class MetalFilteredPreviewView: MTKView, MTKViewDelegate {
 
     /// Drawable size, mirrored for the camera queue (UIKit owns the real one).
     nonisolated(unsafe) private var renderSize: CGSize = .zero
+    /// The drawable's size in pixels (read from the camera queue).
+    nonisolated var drawSize: CGSize { renderSize }
     nonisolated(unsafe) private var renderQueue: MTLCommandQueue?
     nonisolated(unsafe) private var metalLayer: CAMetalLayer?
 

@@ -225,7 +225,9 @@ struct CameraContentView: View {
 
                 // Level
                 if camera.showLevel {
-                    LevelOverlay(roll: motion.levelTilt)
+                    // Own view: the tilt updates 15×/s, and reading it here
+                    // re-evaluated this whole screen every time.
+                    LiveLevel(motion: motion)
                         .ignoresSafeArea()
                         .allowsHitTesting(false)
                 }
@@ -391,6 +393,10 @@ struct CameraContentView: View {
         }
         .fullScreenCover(isPresented: $showRegrade) {
             RegradeView(camera: camera, customSimStore: customSimStore)
+                // The live camera (film preview, Vision) competed with the
+                // gallery's renders for the GPU: pause it while browsing.
+                .onAppear { camera.pauseForExternalUse() }
+                .onDisappear { camera.resumeFromExternalUse() }
         }
         .confirmationDialog(roll.isLoaded ? "Roll · \(roll.shotCount) of \(roll.capacity) shot" : "Load a film roll",
                             isPresented: $showRollOptions, titleVisibility: .visible) {
@@ -1105,7 +1111,7 @@ struct CameraContentView: View {
             sectionHeader("PHOTO QUALITY", isExpanded: $sectionQualityExpanded, accent: .mint)
             if sectionQualityExpanded {
                 HStack(spacing: 6) {
-                    ForEach(Array(["Speed", "Balanced", "Max"].enumerated()), id: \.offset) { idx, label in
+                    ForEach(Array(["Speed", "Balanced", "Max", "Natural"].enumerated()), id: \.offset) { idx, label in
                         let sel = camera.photoQuality == idx
                         Button {
                             camera.photoQuality = idx
@@ -2245,4 +2251,10 @@ private struct PoseSkeletonOverlay: View {
             .animation(.easeOut(duration: 0.15), value: matched)
         }
     }
+}
+
+/// The level, observing the tilt by itself (see the call site).
+private struct LiveLevel: View {
+    let motion: MotionManager
+    var body: some View { LevelOverlay(roll: motion.levelTilt) }
 }

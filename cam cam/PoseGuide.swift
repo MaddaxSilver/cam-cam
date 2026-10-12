@@ -401,7 +401,7 @@ final class PoseGuide {
         didSet {
             UserDefaults.standard.set(enabled, forKey: "cc_poseGuide")
             cachedEnabled = enabled
-            if !enabled { people = []; match = 0; cue = nil }
+            if !enabled { people = []; present = false; match = 0; cue = nil }
         }
     }
     /// What's in frame right now, the poses that suit it and the one shown.
@@ -418,6 +418,9 @@ final class PoseGuide {
     private(set) var offJoints: Set<PJ> = []
     private(set) var imageAspect: CGFloat = 3.0 / 4.0
     private(set) var matched = false
+    /// Someone's in frame (changes rarely — what the chrome watches, so it
+    /// doesn't redraw on every skeleton update).
+    private(set) var present = false
 
     @ObservationIgnored nonisolated(unsafe) var cachedEnabled = UserDefaults.standard.object(forKey: "cc_poseGuide") as? Bool ?? false
     @ObservationIgnored nonisolated(unsafe) private var busy = false
@@ -569,6 +572,7 @@ final class PoseGuide {
                 g.context = c; g.poses = PoseLibrary.poses(for: c); g.index = 0
             }
             g.people = people
+            if g.present != !people.isEmpty { g.present = !people.isEmpty }
             if g.offJoints != off { g.offJoints = off }
             if abs(g.match - match) > 0.02 || (match == 0) != (g.match == 0) { g.match = match }
             if g.cue != cue { g.cue = cue }

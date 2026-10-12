@@ -22,6 +22,80 @@ import CoreImage
 
 nonisolated enum LookAudit {
 
+    // MARK: Detail audit (-qualityAudit)
+    //
+    // Does a look soften a full-resolution photo? On a 1024² centre crop of
+    // a big detailed image: how much of the original fine detail survives
+    // (slope of the output's high-pass against the input's, 1 = all of it)
+    // and how much new texture is added (residual noise, relative to the
+    // input's detail). Baselines: the same image resampled down to 16MP and
+    // 12MP and back up.
+    static func detail(_ img: CIImage, vs ref: [Float], crop: CGRect, ctx: CIContext) -> (slope: Float, noise: Float) {
+        let hp = highPass(img, crop: crop, ctx: ctx)
+        var cov: Float = 0, varR: Float = 0
+        for i in hp.indices { cov += hp[i] * ref[i]; varR += ref[i] * ref[i] }
+        let slope = cov / max(varR, 1e-9)
+        var res: Float = 0
+        for i in hp.indices { let r = hp[i] - slope * ref[i]; res += r * r }
+        return (slope, (res / max(varR, 1e-9)).squareRoot())
+    }
+
+    static func highPass(_ img: CIImage, crop: CGRect, ctx: CIContext) -> [Float] {
+        let n = Int(crop.width)
+        var buf = [Float](repeating: 0, count: n * n * 4)
+        ctx.render(img, toBitmap: &buf, rowBytes: n * 16, bounds: crop, format: .RGBAf,
+                   colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        var y = [Float](repeating: 0, count: n * n)
+        for i in 0..<(n * n) { y[i] = 0.2126 * buf[i * 4] + 0.7152 * buf[i * 4 + 1] + 0.0722 * buf[i * 4 + 2] }
+        // high-pass = luma − 3×3 mean
+        var out = [Float](repeating: 0, count: n * n)
+        for r in 1..<(n - 1) { for c in 1..<(n - 1) {
+            var m: Float = 0
+            for dy in -1...1 { for dx in -1...1 { m += y[(r + dy) * n + c + dx] } }
+            out[r * n + c] = y[r * n + c] - m / 9
+        } }
+        return out
+    }
+
+    static func runQuality(camera: CameraManager, path: String) {
+        guard var input = CIImage(contentsOf: URL(fileURLWithPath: path)) else { print("[quality] no image"); return }
+        input = input.transformed(by: CGAffineTransform(translationX: -input.extent.minX, y: -input.extent.minY))
+        // Crop to 4:3 like the camera.
+        let w = input.extent.width, h = min(input.extent.height, w * 3 / 4)
+        input = input.cropped(to: CGRect(x: 0, y: 0, width: w, height: h))
+        let ctx = camera.photoContext
+        let crop = CGRect(x: (w - 1024) / 2, y: (h - 1024) / 2, width: 1024, height: 1024).integral
+        let ref = highPass(input, crop: crop, ctx: ctx)
+        let mp = Double(w * h) / 1e6
+        print(String(format: "[quality] input %.0f×%.0f (%.1f MP)", w, h, mp))
+        func resampled(_ targetMP: Double) -> CIImage {
+            let s = CGFloat((targetMP / mp).squareRoot())
+            let down = input.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": s, "inputAspectRatio": 1])
+            return down.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": 1 / s, "inputAspectRatio": 1])
+                .cropped(to: input.extent)
+        }
+        for (name, img) in [("16MP baseline", resampled(16)), ("12MP baseline", resampled(12))] {
+            let d = detail(img, vs: ref, crop: crop, ctx: ctx)
+            print(String(format: "[quality] %@  detail %.2f  added %.2f", name, d.slope, d.noise))
+        }
+        func row(_ label: String, _ r: ShotRecipe) {
+            let out = camera.renderLook(input, recipe: r, flatten: true).cropped(to: input.extent)
+            let d = detail(out, vs: ref, crop: crop, ctx: ctx)
+            print(String(format: "[quality] %@  detail %.2f  added %.2f", label, d.slope, d.noise))
+        }
+        var base = ShotRecipe(); base.sim = .kodakPortra
+        row("Portra look only", base)
+        for g: Float in [0.1, 0.2, 0.3] { var r = base; r.grainEnabled = true; r.grain = g; row("Portra grain \(g)", r) }
+        var r = base; r.halationEnabled = true; row("Portra halation", r)
+        r = base; r.development = 0.6; row("Portra development 0.6", r)
+        r = base; r.crosstalkEnabled = true; row("Portra crosstalk", r)
+        r = base; r.rolloffEnabled = true; row("Portra rolloff", r)
+        for sim in FilmSimulation.allCases {
+            var x = ShotRecipe(); x.sim = sim
+            row("sim \(sim.rawValue)", x)
+        }
+    }
+
     // ColorChecker 24 (sRGB 8-bit), row-major from dark skin to black.
     static let patches: [(String, Int, Int, Int)] = [
         ("dark skin", 115, 82, 68), ("light skin", 194, 150, 130), ("blue sky", 98, 122, 157),

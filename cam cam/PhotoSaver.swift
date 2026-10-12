@@ -195,6 +195,39 @@ nonisolated enum PhotoSaver {
         try await commit(input: input, asset: asset, rendered: rendered, recipe: recipe)
     }
 
+    // MARK: Film names (gallery labels without opening every photo)
+
+    private static let namesLock = NSLock()
+    nonisolated(unsafe) private static var names: [String: String] =
+        UserDefaults.standard.dictionary(forKey: "cc_filmNames") as? [String: String] ?? [:]
+
+    /// The film a cam cam photo is graded with: nil = not known yet,
+    /// "" = none (original).
+    static func cachedFilmName(_ assetID: String) -> String? {
+        namesLock.lock(); defer { namesLock.unlock() }
+        return names[assetID]
+    }
+    static func rememberFilmName(_ name: String?, for assetID: String) {
+        namesLock.lock()
+        names[assetID] = name ?? ""
+        let copy = names
+        namesLock.unlock()
+        UserDefaults.standard.set(copy, forKey: "cc_filmNames")
+    }
+
+    /// Looks up film names for photos saved before the cache existed, one
+    /// at a time in the background (asking Photos for each photo's edit is
+    /// slow — it used to run for every thumbnail while scrolling).
+    actor FilmNameLoader {
+        static let shared = FilmNameLoader()
+        func name(for asset: PHAsset) async -> String {
+            if let n = PhotoSaver.cachedFilmName(asset.localIdentifier) { return n }
+            let n = await PhotoSaver.recipe(for: asset)?.displayName ?? ""
+            PhotoSaver.rememberFilmName(n, for: asset.localIdentifier)
+            return n
+        }
+    }
+
     private static func commit(input: PHContentEditingInput, asset: PHAsset,
                                rendered: Data, recipe: ShotRecipe) async throws {
         let output = PHContentEditingOutput(contentEditingInput: input)
@@ -207,6 +240,7 @@ nonisolated enum PhotoSaver {
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest(for: asset).contentEditingOutput = output
         }
+        rememberFilmName(recipe.displayName, for: asset.localIdentifier)
     }
 
     /// Editing input that hands us the UNEDITED original when the asset carries

@@ -27,6 +27,16 @@ struct cam_camApp: App {
 
     init() {
         #if DEBUG
+        if let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-qualityAudit"),
+           ProcessInfo.processInfo.arguments.count > i + 1 {
+            let camera = CameraManager()
+            let path = ProcessInfo.processInfo.arguments[i + 1]
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+                LookAudit.runQuality(camera: camera, path: path)
+                print("[quality] done")
+                exit(0)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("-poseCards") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("posecards")

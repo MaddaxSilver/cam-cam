@@ -87,7 +87,7 @@ struct GlassChrome<Shutter: View>: View {
                 .padding(.top, 58)
                 .padding(.horizontal, 16)
             // Pose guide card, under the exposure meter, while someone's in frame.
-            if poseGuide.enabled, !poseGuide.people.isEmpty, let pose = poseGuide.pose, !showControls {
+            if poseGuide.enabled, poseGuide.present, let pose = poseGuide.pose, !showControls {
                 HStack {
                     Spacer()
                     PoseCard(pose: pose, index: poseGuide.index, count: poseGuide.poses.count,
@@ -143,7 +143,7 @@ struct GlassChrome<Shutter: View>: View {
                     .padding(.bottom, 8)
                     .animation(.easeOut(duration: 0.2), value: smartTake.ready)
                     .transition(.opacity)
-                } else if poseGuide.enabled, !poseGuide.people.isEmpty, let cue = poseGuide.cue {
+                } else if poseGuide.enabled, poseGuide.present, let cue = poseGuide.cue {
                     Label(cue, systemImage: "figure.stand")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(poseGuide.matched ? .green : .white)

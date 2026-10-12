@@ -285,9 +285,13 @@ struct CamSettingsSheet: View {
             Form {
                 Section("Photos") {
                     Picker("Quality", selection: $camera.photoQuality) {
-                        Text("Speed").tag(0); Text("Balanced").tag(1); Text("Max").tag(2)
+                        Text("Speed").tag(0); Text("Balanced").tag(1); Text("Max").tag(2); Text("Natural").tag(3)
                     }
                     .pickerStyle(.segmented)
+                    if camera.photoQuality == 3 {
+                        Text("48MP ProRAW developed in cam cam, without Apple's processing (no HDR tone mapping, light noise reduction): more natural texture under the film, a little more noise.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     Toggle("RAW + film", isOn: $camera.rawEnabled)
                     if camera.rawEnabled {
                         Picker("RAW files", selection: $rawSeparate) {
