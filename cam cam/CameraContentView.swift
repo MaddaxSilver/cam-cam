@@ -501,6 +501,10 @@ struct CameraContentView: View {
             handleLaunchRequest()
             #if DEBUG
             // Profiling harness: Frame guide on, a shot every 4 s for 40 s.
+            if ProcessInfo.processInfo.arguments.contains("-perfProbe") {
+                frameAdvisor.enabled = true
+                MainHitchProbe.shared.start()
+            }
             if ProcessInfo.processInfo.arguments.contains("-perfGuided") {
                 frameAdvisor.enabled = true
                 MainHitchProbe.shared.start()

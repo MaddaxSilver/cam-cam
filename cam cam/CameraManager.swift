@@ -602,7 +602,9 @@ import CoreLocation
         if pendingDeviceAngle == -90 { look = look.oriented(.right) }
         else if pendingDeviceAngle == 90 { look = look.oriented(.left) }
         else if pendingDeviceAngle == 180 { look = look.oriented(.down) }
-        guard let cg = ciContext.createCGImage(look, from: look.extent) else { return }
+        // Photo context, not the preview's: this decodes the full 48MP photo,
+        // and on the preview's context the live view waited seconds behind it.
+        guard let cg = photoContext.createCGImage(look, from: look.extent) else { return }
         let ui = UIImage(cgImage: cg)
         DispatchQueue.main.async { self.lastShotPreview = ui }
     }
@@ -613,7 +615,7 @@ import CoreLocation
         let s = 240 / max(frame.extent.width, frame.extent.height)
         let small = frame.transformed(by: CGAffineTransform(scaleX: s, y: s))
         let look = applyLiveLook(small, grainTextures: false)
-        guard let cg = ciContext.createCGImage(look, from: small.extent) else { return }
+        guard let cg = photoContext.createCGImage(look, from: small.extent) else { return }
         let ui = UIImage(cgImage: cg)
         DispatchQueue.main.async { self.lastShotPreview = ui }
     }
@@ -1584,6 +1586,9 @@ import CoreLocation
             self.focusObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] dev, change in
                 guard let self else { return }
                 let adjusting = change.newValue ?? dev.isAdjustingFocus
+                #if DEBUG
+                print(String(format: "[perf] %.2f FOCUS %@", CACurrentMediaTime(), adjusting ? "start" : "end"))
+                #endif
                 DispatchQueue.main.async { self.isFocusing = adjusting }
                 if !adjusting {
                     // Lens has settled — schedule return to continuous after a brief hold
@@ -1783,6 +1788,9 @@ import CoreLocation
             // Only publish when not in the middle of a tap-focus settle sequence
             if !self.tapFocusActive {
                 let adjusting = change.newValue ?? false
+                #if DEBUG
+                print(String(format: "[perf] %.2f FOCUS %@", CACurrentMediaTime(), adjusting ? "start" : "end"))
+                #endif
                 DispatchQueue.main.async { self.isFocusing = adjusting }
             }
         }
@@ -2992,8 +3000,25 @@ import CoreLocation
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
                                   space: p3, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
               let pixels = ctx.data else { return nil }
-        photoContext.render(cropped, toBitmap: pixels, rowBytes: w * 4, bounds: bounds,
-                         format: .RGBA8, colorSpace: p3)
+        // In horizontal strips: one 48MP render is a single long GPU job that
+        // the live preview had to wait behind (a visible hitch ~2 s after
+        // each shot); separate strips let preview frames in between.
+        #if DEBUG
+        let t0 = CACurrentMediaTime()
+        #endif
+        let strips = h > 3000 ? 8 : 1
+        let rowsPer = (h + strips - 1) / strips
+        for i in 0..<strips {
+            let y0 = i * rowsPer, y1 = min(h, y0 + rowsPer)
+            guard y1 > y0 else { break }
+            // Bitmap row 0 is the top; Core Image's y runs up from the bottom.
+            let stripBounds = CGRect(x: bounds.minX, y: bounds.maxY - CGFloat(y1), width: bounds.width, height: CGFloat(y1 - y0))
+            photoContext.render(cropped, toBitmap: pixels.advanced(by: y0 * w * 4), rowBytes: w * 4, bounds: stripBounds,
+                                format: .RGBA8, colorSpace: p3)
+        }
+        #if DEBUG
+        print(String(format: "[perf] %.2f RENDER %dx%d in %.0f ms (%d strips)", CACurrentMediaTime(), w, h, (CACurrentMediaTime() - t0) * 1000, strips))
+        #endif
         guard let opaque = ctx.makeImage() else { return nil }
 
         // Original EXIF, orientation reset (already rotated), real pixel dims.

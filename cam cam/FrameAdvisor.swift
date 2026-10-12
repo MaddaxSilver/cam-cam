@@ -115,6 +115,8 @@ final class FrameAdvisor {
     @ObservationIgnored private var preLockMM: Int?
     @ObservationIgnored private var lastZoomTargetMM: Double?
     @ObservationIgnored private weak var lockCamera: CameraManager?
+    /// The lock wanted to go wider than this lens allows (suggest the 13 mm).
+    @ObservationIgnored nonisolated(unsafe) private var lensLimited = false
     // Scene framing
     @ObservationIgnored nonisolated(unsafe) private var sceneWhy = ""
     @ObservationIgnored nonisolated(unsafe) private var sceneLock: CGRect?          // expected box after the zoom
@@ -150,7 +152,7 @@ final class FrameAdvisor {
         offFillSince = nil; zoomSteps = 0
         if let img = lastUpright, let u = shown { lockContext = (img, u) } else { lockContext = nil }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        preLockMM = camera.currentMM; lastZoomTargetMM = nil; lockCamera = camera
+        preLockMM = camera.currentMM; lastZoomTargetMM = nil; lockCamera = camera; lensLimited = false
         camera.tapToFocus(at: CGPoint(x: b.midY, y: 1 - b.midX))   // focus on the subject
         // Auto zoom — in OR out — so the subject fills what suits it. A
         // subject running off the frame (a group cut at the edges) zooms out,
@@ -181,7 +183,18 @@ final class FrameAdvisor {
     func zoom(by ratio: Double, minMM: Int, camera: CameraManager) -> Double? {
         let cur = Double(max(camera.currentMM, 13))
         let lo = Double(max(minMM, 13)), hi = min(cur * 6, 200)   // far-off subjects need the long end
-        let want = min(max(cur * ratio, lo), max(hi, lo))
+        var want = min(max(cur * ratio, lo), max(hi, lo))
+        // Stay on the lens you're on: switching lenses reconfigures the
+        // camera (~1 s preview freeze, measured), and so does switching back.
+        // When the subject doesn't fit, the hint suggests the 13 mm instead.
+        if camera.zoomNeedsLensSwap(CGFloat(want / 26)) {
+            let onUW = camera.currentDevice?.deviceType == .builtInUltraWideCamera
+            if camera.currentDevice?.deviceType == .builtInTelephotoCamera { return nil }
+            if onUW { want = min(want, 25) }                      // ultra-wide tops out below 1×
+            else if want < 26 { want = 26; lensLimited = true }   // can't go wider without the 13 mm
+            else { want = min(want, 129) }                        // main lens: below the 5× switch
+            if camera.zoomNeedsLensSwap(CGFloat(want / 26)) { return nil }
+        }
         guard abs(want / cur - 1) > 0.08 else { return nil }
         camera.setZoom(CGFloat(want / 26))
         lastZoomTargetMM = want
@@ -232,6 +245,9 @@ final class FrameAdvisor {
         #endif
         stage = .suggesting; cachedLocked = false
         lockContext = nil; sceneLock = nil; sceneArmed = false
+        // Clear now: analysis pauses while the photo renders, and the box and
+        // "Got it" stayed on screen for seconds after the shot.
+        box = nil; hint = nil; shown = nil; rival = nil
         // Put the zoom back where you had it — unless you changed it yourself.
         // Never if it means switching lenses: that reconfigures the camera and
         // froze the preview ~1.3 s right after the shot (measured on device).
@@ -291,7 +307,14 @@ final class FrameAdvisor {
             guard let cg = Self.ciContext.createCGImage(small, from: small.extent) else { return }
             let frame = CIImage(cgImage: cg)
             lastUpright = frame
+            #if DEBUG
+            let t0 = CACurrentMediaTime()
+            #endif
             analyse(frame, time: time, aspect: aspect, camera: camera)
+            #if DEBUG
+            let dt = CACurrentMediaTime() - t0
+            if dt > 0.08 { print(String(format: "[perf] %.2f FG-ANALYSE %.0f ms %@", CACurrentMediaTime(), dt * 1000, cachedLocked ? "locked" : "suggest")) }
+            #endif
         }
     }
 
@@ -484,7 +507,8 @@ final class FrameAdvisor {
         let aligned = centred && level
 
         var tip: String
-        if !level { tip = String(format: "Tilt %.0f° %@", max(1, abs(tiltErr)), tiltErr > 0 ? "right" : "left") }
+        if lensLimited && fill > 0.9 { tip = "Step back, or switch to 13mm to fit everyone" }
+        else if !level { tip = String(format: "Tilt %.0f° %@", max(1, abs(tiltErr)), tiltErr > 0 ? "right" : "left") }
         else if !centred {
             tip = abs(dx) >= abs(dy) ? (dx < 0 ? "Move left" : "Move right") : (dy < 0 ? "Tilt up" : "Tilt down")
         } else { tip = "Hold it…" }
@@ -498,6 +522,9 @@ final class FrameAdvisor {
             }
             if time - alignedSince! > 0.4, !fired {
                 fired = true
+                #if DEBUG
+                print(String(format: "[perf] %.2f FIRE (auto)", CACurrentMediaTime()))
+                #endif
                 logGuided(final: b, comp: c, camera: camera)
                 DispatchQueue.main.async {
                     UINotificationFeedbackGenerator().notificationOccurred(.success)

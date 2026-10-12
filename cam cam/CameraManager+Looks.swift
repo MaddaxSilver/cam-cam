@@ -265,7 +265,7 @@ extension CameraManager {
                 avgFilter.extent = probe.extent
                 if let avgImg = avgFilter.outputImage {
                     var bitmap = [UInt8](repeating: 0, count: 4)
-                    ciContext.render(avgImg, toBitmap: &bitmap, rowBytes: 4,
+                    photoContext.render(avgImg, toBitmap: &bitmap, rowBytes: 4,
                                     bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
                                     format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
                     luma = (Float(bitmap[0]) * 0.299 + Float(bitmap[1]) * 0.587 + Float(bitmap[2]) * 0.114) / 255.0
@@ -2764,7 +2764,7 @@ extension CameraManager {
             let sigmas = [sg.fine, sg.fine, sg.fine, sg.fine, sg.coarse, sg.coarse, sg.chroma, sg.chroma]
             for sigma in sigmas {
                 let field = Self.noiseField(extent, sigma: sigma)
-                if let cg = ciContext.createCGImage(field, from: extent, format: .RGBA8, colorSpace: nil) {
+                if let cg = photoContext.createCGImage(field, from: extent, format: .RGBA8, colorSpace: nil) {
                     textures.append(CIImage(cgImage: cg, options: [.colorSpace: NSNull()]))
                 }
             }
