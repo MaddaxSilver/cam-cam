@@ -152,7 +152,7 @@ final class FrameAdvisor {
     @discardableResult
     func zoom(by ratio: Double, minMM: Int, camera: CameraManager) -> Bool {
         let cur = Double(max(camera.currentMM, 13))
-        let lo = Double(max(minMM, 13)), hi = min(cur * 4, 120)
+        let lo = Double(max(minMM, 13)), hi = min(cur * 6, 200)   // far-off subjects need the long end
         let want = min(max(cur * ratio, lo), max(hi, lo))
         guard abs(want / cur - 1) > 0.08 else { return false }
         camera.setZoom(CGFloat(want / 26))
@@ -197,7 +197,8 @@ final class FrameAdvisor {
               camera.currentDevice?.position == .back else { return }
         lastTick = time
         busy = true
-        let s = 512 / CGFloat(max(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer)))
+        // 640 px: far-off people and objects are only a few pixels at 512.
+        let s = 640 / CGFloat(max(CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer)))
         let angle = cachedAngle
         var small = CIImage(cvPixelBuffer: pixelBuffer).transformed(by: CGAffineTransform(scaleX: s, y: s))
         if let o = Self.orientation(angle) {
@@ -471,7 +472,7 @@ final class FrameAdvisor {
         let third: CGFloat = 1.0 / 3
         func nearestThird(_ v: CGFloat) -> CGFloat { v < 0.5 ? third : 1 - third }
 
-        let faceObs = (faceReq.results ?? []).filter { $0.boundingBox.width > 0.03 }
+        let faceObs = (faceReq.results ?? []).filter { $0.boundingBox.width > 0.012 }   // far-off faces too
         if !faceObs.isEmpty {
             let faces = faceObs.map(\.boundingBox)
             let u = faces.dropFirst().reduce(faces[0]) { $0.union($1) }
@@ -506,7 +507,7 @@ final class FrameAdvisor {
         let humanReq = VNDetectHumanRectanglesRequest()
         humanReq.upperBodyOnly = false
         try? handler.perform([humanReq])
-        let people = (humanReq.results ?? []).filter { $0.confidence > 0.6 && $0.boundingBox.height > 0.15 }.map(\.boundingBox)
+        let people = (humanReq.results ?? []).filter { $0.confidence > 0.5 && $0.boundingBox.height > 0.06 }.map(\.boundingBox)
         if !people.isEmpty {
             let u = people.dropFirst().reduce(people[0]) { $0.union($1) }
             if let b = box(around: u) {
@@ -529,7 +530,7 @@ final class FrameAdvisor {
         }
         let animalReq = VNRecognizeAnimalsRequest()
         try? handler.perform([animalReq])
-        let animals = (animalReq.results ?? []).filter { $0.confidence > 0.6 }.map(\.boundingBox)
+        let animals = (animalReq.results ?? []).filter { $0.confidence > 0.5 }.map(\.boundingBox)
         if let a = pick(animals, preferCentre: preferCentre), let b = box(around: a) {
             var c = objectComp(b); c.minMM = 24
             return (b, false, c)
@@ -538,8 +539,24 @@ final class FrameAdvisor {
         let salReq = VNGenerateObjectnessBasedSaliencyImageRequest()
         try? handler.perform([salReq])
         let objs = ((salReq.results?.first as? VNSaliencyImageObservation)?.salientObjects ?? [])
-            .filter { $0.confidence > 0.5 && $0.boundingBox.width * $0.boundingBox.height > 0.01 }
-        if let o = pick(objs.map(\.boundingBox), preferCentre: preferCentre), let b = box(around: o) { return (b, false, objectComp(b)) }
+            .filter { $0.confidence > 0.3 && $0.boundingBox.width * $0.boundingBox.height > 0.002 }
+        if let o = pick(objs.map(\.boundingBox), preferCentre: preferCentre), let b = box(around: o), worthFraming(b) {
+            return (b, false, objectComp(b))
+        }
+        // Scenes with no single object (skyline, mountain, building far off):
+        // frame where the eye goes — Apple's attention saliency — on a third.
+        let attReq = VNGenerateAttentionBasedSaliencyImageRequest()
+        try? handler.perform([attReq])
+        let hot = ((attReq.results?.first as? VNSaliencyImageObservation)?.salientObjects ?? [])
+            .filter { $0.confidence > 0.3 }.map(\.boundingBox)
+        if let h = pick(hot, preferCentre: preferCentre), let b = box(around: h), worthFraming(b) {
+            var c = objectComp(b)
+            if max(b.width, b.height) <= 0.5 {        // small: on the nearest thirds point
+                c.target = CGPoint(x: nearestThird(b.midX), y: nearestThird(b.midY))
+            }
+            c.fill = 0.7
+            return (b, false, c)
+        }
         return nil
     }
 
@@ -600,9 +617,11 @@ final class FrameAdvisor {
     nonisolated static func fromVision(_ r: CGRect) -> CGRect { CGRect(x: r.minX, y: 1 - r.maxY, width: r.width, height: r.height) }
 
     nonisolated static func box(around r: CGRect) -> CGRect? {
-        let m: CGFloat = 0.05
+        // Margin scales with the subject, so a small far-off subject gets a
+        // tight box (and the lock zooms in far enough) instead of a fixed 5%.
+        let m = max(0.012, 0.12 * max(r.width, r.height))
         let b = r.insetBy(dx: -m, dy: -m).intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-        guard !b.isNull, b.width > 0.08, b.height > 0.08 else { return nil }
+        guard !b.isNull, b.width > 0.03, b.height > 0.03 else { return nil }
         return CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height)
     }
 
