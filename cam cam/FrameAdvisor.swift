@@ -117,6 +117,7 @@ final class FrameAdvisor {
     @ObservationIgnored private weak var lockCamera: CameraManager?
     /// The lock wanted to go wider than this lens allows (suggest the 13 mm).
     @ObservationIgnored nonisolated(unsafe) private var lensLimited = false
+    @ObservationIgnored nonisolated(unsafe) private var resetShown = false
     // Scene framing
     @ObservationIgnored nonisolated(unsafe) private var sceneWhy = ""
     @ObservationIgnored nonisolated(unsafe) private var sceneLock: CGRect?          // expected box after the zoom
@@ -247,7 +248,8 @@ final class FrameAdvisor {
         lockContext = nil; sceneLock = nil; sceneArmed = false
         // Clear now: analysis pauses while the photo renders, and the box and
         // "Got it" stayed on screen for seconds after the shot.
-        box = nil; hint = nil; shown = nil; rival = nil
+        box = nil; hint = nil
+        resetShown = true          // the analysis queue clears its own state (no cross-thread writes)
         // Put the zoom back where you had it — unless you changed it yourself.
         // Never if it means switching lenses: that reconfigures the camera and
         // froze the preview ~1.3 s right after the shot (measured on device).
@@ -319,6 +321,7 @@ final class FrameAdvisor {
     }
 
     nonisolated private func analyse(_ image: CIImage, time: Double, aspect: CGFloat, camera: CameraManager) {
+        if resetShown { resetShown = false; shown = nil; rival = nil; tracked = nil; lastScene = nil }
         let horizonReq = VNDetectHorizonRequest()
         let handler = VNImageRequestHandler(ciImage: image)
 
@@ -331,7 +334,7 @@ final class FrameAdvisor {
                 guard CACurrentMediaTime() >= trackStartAt else { return }
                 if !sceneArmed { shown = sl; shownAttitude = frameAttitude; sceneArmed = true }
                 anchorShown(aspect: aspect)
-                guide((shown!, false, lockedComp), tilt: tilt, time: time, aspect: aspect, camera: camera)
+                guide((shown ?? sl, false, lockedComp), tilt: tilt, time: time, aspect: aspect, camera: camera)
                 return
             }
             // Wait for the lock's zoom to settle, then pick the subject again
@@ -474,8 +477,8 @@ final class FrameAdvisor {
         }
         lostSince = nil
         anchorShown(aspect: aspect)
-        shown = shown.map { Self.lerp($0, f.box, 0.6) } ?? f.box
-        let b = shown!
+        let b = shown.map { Self.lerp($0, f.box, 0.6) } ?? f.box
+        shown = b
 
         // Errors: centre offset, fill, horizon tilt.
         // Composition, not just centring: put the anchor (eye line / subject)
