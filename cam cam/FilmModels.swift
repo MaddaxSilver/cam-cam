@@ -104,6 +104,7 @@ nonisolated struct CustomSimulation: Codable, Identifiable, Equatable, Sendable 
 /// Lens character for saved cameras (applied after the film).
 nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
     case none, swirl, glow, toy, anamorphic, pinhole
+    case takumar, petzval, proMist, sonnar, dream, fisheye
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -113,6 +114,12 @@ nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
         case .toy: "Toy lens"
         case .anamorphic: "Anamorphic"
         case .pinhole: "Pinhole"
+        case .takumar: "Takumar"
+        case .petzval: "Petzval"
+        case .proMist: "Pro-Mist"
+        case .sonnar: "Sonnar pop"
+        case .dream: "Dream lens"
+        case .fisheye: "Fisheye"
         }
     }
     var detail: String {
@@ -123,6 +130,12 @@ nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
         case .toy: "Plastic lens: colour fringes, soft corners, dark edges"
         case .anamorphic: "Cinema lens: horizontal streaks, oval falloff"
         case .pinhole: "No lens at all: soft, deep vignette"
+        case .takumar: "Super-Takumar 50/1.4: yellowed thorium glass, warm and gentle"
+        case .petzval: "Petzval portrait lens: razor centre, wild swirl at the edges"
+        case .proMist: "Black Pro-Mist ¼ filter: highlights bloom, cinematic haze"
+        case .sonnar: "Zeiss Sonnar: micro-contrast 3D pop, smooth falloff"
+        case .dream: "Canon 50mm f/0.95: glowing, low contrast, soft swirling corners"
+        case .fisheye: "Zenitar 16mm fisheye: bulging barrel distortion, dark rim"
         }
     }
     var symbol: String {
@@ -133,6 +146,12 @@ nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
         case .toy: "camera.fill"
         case .anamorphic: "rectangle.ratio.16.to.9"
         case .pinhole: "circle.dotted"
+        case .takumar: "sun.max"
+        case .petzval: "hurricane"
+        case .proMist: "cloud.fog"
+        case .sonnar: "cube"
+        case .dream: "moon.stars"
+        case .fisheye: "globe"
         }
     }
 }

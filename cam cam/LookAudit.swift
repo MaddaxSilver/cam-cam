@@ -22,6 +22,24 @@ import CoreImage
 
 nonisolated enum LookAudit {
 
+    // MARK: Lens samples (-lensSamples <image>) — every lens profile on one photo.
+    static func runLenses(camera: CameraManager, path: String) {
+        let fm = FileManager.default
+        let out = fm.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("lenses")
+        try? fm.removeItem(at: out); try? fm.createDirectory(at: out, withIntermediateDirectories: true)
+        guard var input = CIImage(contentsOf: URL(fileURLWithPath: path)) else { print("[lens] no image"); return }
+        input = input.transformed(by: CGAffineTransform(translationX: -input.extent.minX, y: -input.extent.minY))
+        let s = 1200 / max(input.extent.width, input.extent.height)
+        input = input.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        input = input.transformed(by: CGAffineTransform(translationX: -input.extent.minX, y: -input.extent.minY))
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        for kind in LensKind.allCases {
+            let img = camera.applyLens(input, kind).cropped(to: input.extent)
+            try? camera.photoContext.writeJPEGRepresentation(of: img, to: out.appendingPathComponent("\(kind.rawValue).jpg"), colorSpace: srgb)
+            print("[lens] \(kind.rawValue)")
+        }
+    }
+
     // MARK: Grain samples (-grainSamples <image>)
     // 100% crops of a few stocks' grain + a black→white ramp, as PNGs in
     // Documents/grain, to judge the grain's structure by eye.

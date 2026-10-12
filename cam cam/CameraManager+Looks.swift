@@ -1861,6 +1861,16 @@ extension CameraManager {
                 kCIInputImageKey: a, kCIInputTargetImageKey: b, "inputTime": t,
             ])?.outputImage?.cropped(to: extent) ?? a
         }
+        /// Smooth rotational blur: the mean of `steps` rotations spread over
+        /// ±maxDeg (a handful of copies showed as ghosted double edges).
+        func spun(_ img: CIImage, _ maxDeg: CGFloat, steps: Int = 9) -> CIImage {
+            var acc = rotated(img, -maxDeg)
+            for i in 1..<steps {
+                let deg = -maxDeg + 2 * maxDeg * CGFloat(i) / CGFloat(steps - 1)
+                acc = mix(acc, rotated(img, deg), 1 / Double(i + 1))      // running mean
+            }
+            return acc
+        }
         func masked(_ fg: CIImage, over bg: CIImage, _ mask: CIImage) -> CIImage {
             let b = CIFilter.blendWithMask()
             b.inputImage = fg; b.backgroundImage = bg; b.maskImage = mask
@@ -1872,9 +1882,7 @@ extension CameraManager {
             return input
         case .swirl:
             // Rotational smear grows toward the edges (Helios-44 swirly bokeh).
-            let a = mix(rotated(input, 0.9), rotated(input, -0.9), 0.5)
-            let b = mix(rotated(input, 1.8), rotated(input, -1.8), 0.5)
-            let swirl = mix(a, b, 0.5)
+            let swirl = spun(input, 1.8)
             return vignette(masked(swirl, over: input, edgeMask(0.22, 0.62)), 0.6, 0.75)
         case .glow:
             let bloom = CIFilter.bloom()
@@ -1911,6 +1919,81 @@ extension CameraManager {
             let d = CIFilter.colorControls()
             d.inputImage = soft; d.saturation = 0.9
             return vignette(d.outputImage ?? soft, 2.2, 0.55)
+
+        case .takumar:
+            // Thoriated elements yellow with age: the blue channel loses
+            // most, single coating lowers saturation and lets a little glow in.
+            let warm = CIFilter.colorMatrix()
+            warm.inputImage = input
+            warm.rVector = CIVector(x: 1.0, y: 0, z: 0, w: 0)
+            warm.gVector = CIVector(x: 0, y: 0.97, z: 0, w: 0)
+            warm.bVector = CIVector(x: 0, y: 0, z: 0.84, w: 0)
+            warm.biasVector = CIVector(x: 0.01, y: 0.005, z: 0, w: 0)
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = warm.outputImage?.cropped(to: extent) ?? input
+            bloom.radius = Float(size * 0.008); bloom.intensity = 0.25
+            let soft = CIFilter.colorControls()
+            soft.inputImage = bloom.outputImage?.cropped(to: extent) ?? input
+            soft.saturation = 0.9; soft.contrast = 0.96
+            return vignette(soft.outputImage ?? input, 0.35, 0.85)
+
+        case .petzval:
+            // Sharp centre, strong field curvature: the swirl only starts
+            // a third of the way out and is far stronger than a Helios.
+            let swirl = spun(input, 3.2, steps: 11).clampedToExtent()
+                .applyingGaussianBlur(sigma: Double(size) * 0.0015).cropped(to: extent)
+            return vignette(masked(swirl, over: input, edgeMask(0.17, 0.5)), 1.1, 0.7)
+
+        case .proMist:
+            // Diffusion filter: bright areas spill a soft halo, blacks lift
+            // a touch, highlight contrast eases.
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = input
+            bloom.radius = Float(size * 0.02); bloom.intensity = 0.5
+            let lifted = CIFilter.toneCurve()
+            lifted.inputImage = bloom.outputImage?.cropped(to: extent) ?? input
+            lifted.point0 = CGPoint(x: 0, y: 0.025); lifted.point1 = CGPoint(x: 0.25, y: 0.26)
+            lifted.point2 = CGPoint(x: 0.5, y: 0.5); lifted.point3 = CGPoint(x: 0.75, y: 0.73)
+            lifted.point4 = CGPoint(x: 1, y: 0.97)
+            return lifted.outputImage?.cropped(to: extent) ?? input
+
+        case .sonnar:
+            // Micro-contrast (texture and edges crisp) with a smooth roll-off
+            // toward the corners: the subject "lifts" off the frame.
+            let pop = CIFilter.unsharpMask()
+            pop.inputImage = input
+            pop.radius = Float(size * 0.0035); pop.intensity = 0.55
+            let c2 = CIFilter.colorControls()
+            c2.inputImage = pop.outputImage?.cropped(to: extent) ?? input
+            c2.saturation = 1.03
+            let falloff = input.clampedToExtent().applyingGaussianBlur(sigma: Double(size) * 0.002).cropped(to: extent)
+            let popped = c2.outputImage ?? input
+            return vignette(masked(falloff, over: popped, edgeMask(0.35, 0.75)), 0.45, 0.8)
+
+        case .dream:
+            // f/0.95 wide open: heavy spherical-aberration glow, low
+            // contrast, soft corners with a gentle swirl.
+            let bloom = CIFilter.bloom()
+            bloom.inputImage = input
+            bloom.radius = Float(size * 0.018); bloom.intensity = 0.7
+            let low = CIFilter.colorControls()
+            low.inputImage = bloom.outputImage?.cropped(to: extent) ?? input
+            low.contrast = 0.88; low.saturation = 0.95
+            let glowing = low.outputImage?.cropped(to: extent) ?? input
+            let corners = spun(glowing, 0.8, steps: 5).clampedToExtent()
+                .applyingGaussianBlur(sigma: Double(size) * 0.003).cropped(to: extent)
+            return vignette(masked(corners, over: glowing, edgeMask(0.25, 0.6)), 0.8, 0.75)
+
+        case .fisheye:
+            // Barrel distortion: the centre bulges out, straight lines bow,
+            // and the rim darkens like a 16 mm fisheye on a crop frame.
+            let bump = CIFilter.bumpDistortion()
+            bump.inputImage = input.clampedToExtent()
+            bump.center = CGPoint(x: extent.midX, y: extent.midY)
+            bump.radius = Float(size * 0.75)
+            bump.scale = 0.55
+            let bulged = bump.outputImage?.cropped(to: extent) ?? input
+            return vignette(bulged, 1.3, 0.62)
         }
     }
 
