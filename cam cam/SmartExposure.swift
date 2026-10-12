@@ -63,6 +63,13 @@ final class SmartExposure {
     @ObservationIgnored nonisolated(unsafe) private var lastStatus = ""
     /// Saliency weights on the metering grid (gw×gh), nil until the first pass.
     @ObservationIgnored nonisolated(unsafe) private var saliency: [Float]?
+    /// EV the current film look shifts mid-grey by (+ = the look prints
+    /// brighter). Smart AE exposes against it so every film lands at a normal
+    /// exposure instead of some printing dark and some bright.
+    @ObservationIgnored nonisolated(unsafe) private(set) var lookOffset: Float = 0
+    @ObservationIgnored nonisolated(unsafe) private var lookMeasuredAt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var lookBusy = false
+    nonisolated private static let lookQueue = DispatchQueue(label: "cam.smartae.look", qos: .utility)
 
     nonisolated static let gw = 64, gh = 48
 
@@ -107,6 +114,14 @@ final class SmartExposure {
               device.exposureMode == .continuousAutoExposure,
               !camera.cachedIsRecording, !camera.isCollectingFrames else { return }
 
+        if time - lookMeasuredAt > 1.5, !lookBusy {
+            lookMeasuredAt = time; lookBusy = true
+            Self.lookQueue.async { [self] in
+                defer { lookBusy = false }
+                if let o = Self.measureLook(camera) { lookOffset = o }
+            }
+        }
+
         let frame = CIImage(cvPixelBuffer: pixelBuffer)
         guard let grid = Self.lumaGrid(frame) else { return }
         if time - lastSaliency > 0.5 {
@@ -132,7 +147,10 @@ final class SmartExposure {
 
         // 4. Target by light level (EV100 of the scene).
         let ev = Self.sceneEV(device)
-        let target = Self.target(ev: ev)
+        // Expose for the film: a look that prints mid-grey brighter needs
+        // less exposure, a darker-printing one more.
+        let look = lookOffset
+        let target = Self.target(ev: ev) * pow(2, -look)
 
         // 3. Solve the gain, accounting for clipping.
         var g: Float = 1
@@ -169,7 +187,7 @@ final class SmartExposure {
         let delta = log2(max(g, 1e-3))
         // A face is in frame: Apple's AE is already metering it (we point it
         // at the largest face). Ease our correction back out of its way.
-        let desired = faceHint ? 0 : max(-2.0, min(1.0, smart + delta))
+        let desired = faceHint ? -look : max(-2.0, min(1.5, smart + delta))
         let error = desired - smart
 
         // 6. Stable region, then the adaptive filter.
@@ -183,7 +201,8 @@ final class SmartExposure {
         smart += speed * error
 
         if reason.isEmpty {
-            if faceHint { reason = "Face priority" }
+            if abs(look) > 0.2 { reason = String(format: "Film %+.1f EV", -look) }
+            else if faceHint { reason = "Face priority" }
             else if ev < 4 { reason = "Night" }
             else if smart > 0.15 { reason = "Brightening" }
             else if smart < -0.15 { reason = "Darkening" }
@@ -237,6 +256,45 @@ final class SmartExposure {
             SmartExposure.shared.status = status
             SmartExposure.shared.correction = correction
         }
+    }
+
+    // MARK: Film look calibration
+
+    /// Run a grey ramp through the active look (exactly as the preview
+    /// renders it) and return how many EV it moves mid-grey. nil if unknown.
+    nonisolated static func measureLook(_ camera: CameraManager) -> Float? {
+        guard let srgb = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let levels: [Float] = (1...12).map { Float($0) / 13 }          // encoded greys 0.08…0.92
+        var outs: [Float] = []
+        for v in levels {
+            let patch = CIImage(color: CIColor(red: CGFloat(v), green: CGFloat(v), blue: CGFloat(v), colorSpace: srgb)!)
+                .cropped(to: CGRect(x: 0, y: 0, width: 48, height: 48))
+            let look = camera.applyLiveLook(patch, grainTextures: false)
+            var px = [Float](repeating: 0, count: 4)
+            context.render(look, toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 24, y: 24, width: 1, height: 1),
+                           format: .RGBAf, colorSpace: srgb)
+            let y = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]
+            guard y.isFinite else { return nil }
+            outs.append(y)
+        }
+        // Which input grey comes out as mid-grey (0.46 encoded ≈ 18%)?
+        let mid: Float = 0.46
+        guard outs.count == levels.count else { return nil }
+        var inNeeded: Float?
+        for i in 1..<outs.count {
+            let (a, b) = (outs[i - 1], outs[i])
+            if (a - mid) * (b - mid) <= 0, a != b {
+                inNeeded = levels[i - 1] + (levels[i] - levels[i - 1]) * (mid - a) / (b - a); break
+            }
+        }
+        guard let vIn = inNeeded, vIn > 0.02 else {
+            // Mid-grey never reached (very flat/extreme look): nudge by its middle output.
+            let m = outs[outs.count / 2]
+            return max(-1, min(1, 2.2 * log2(max(m, 0.02) / mid) * 0.5))
+        }
+        // + when the look brightens (it needs a darker input to print mid-grey).
+        let ev = 2.2 * log2(mid / vIn)
+        return max(-1, min(1, ev))   // creative looks (Aerochrome, circuit bent) remap grey wildly
     }
 
     // MARK: Metering grid + saliency

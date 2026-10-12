@@ -27,6 +27,18 @@ struct cam_camApp: App {
 
     init() {
         #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-aeAudit") {
+            let camera = CameraManager()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+                camera.cachedActiveCustomSim = nil
+                for sim in FilmSimulation.allCases {
+                    camera.cachedSim = sim
+                    let o = SmartExposure.measureLook(camera)
+                    print(String(format: "[ae] %@ %+.2f", sim.rawValue, o ?? .nan))
+                }
+                exit(0)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("-lookAudit") {
             let camera = CameraManager()
             // Let loadSettings' main-queue writes land first, then audit off-main.
