@@ -174,9 +174,6 @@ private struct RegradeDetail: View {
     @State private var message: String?
     @State private var comparing = false
     @State private var tones = FilmToneStore.shared
-    @State private var thumbBase: CIImage?
-    @State private var originalThumbUI: UIImage?
-    @State private var thumbs: [String: UIImage] = [:]
 
     private var items: [ArcItem] {
         FilmSimulation.allCases.map(ArcItem.builtIn) + customSimStore.simulations.map(ArcItem.custom)
@@ -234,31 +231,12 @@ private struct RegradeDetail: View {
                         .transition(.opacity)
                 }
 
-                // Looks: the photo itself in each film (like a camera roll editor).
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        LazyHStack(spacing: 10) {
-                            LookThumb(label: "Original", image: originalThumbUI,
-                                      selected: recipe.sim == .none && recipe.custom == nil)
-                                .onTapGesture { recipe.sim = .none; recipe.custom = nil }
-                                .id("original")
-                            ForEach(items, id: \.key) { item in
-                                LookThumb(label: item.label, image: thumbs[item.key], selected: item.key == selectedKey)
-                                    .id(item.key)
-                                    .onTapGesture {
-                                        UISelectionFeedbackGenerator().selectionChanged()
-                                        if let c = item.custom { recipe.custom = c; recipe.sim = .none }
-                                        else if let sim = item.sim { recipe.sim = sim; recipe.custom = nil }
-                                    }
-                                    .task(id: item.key) { await renderThumb(item) }
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                    }
-                    .frame(height: 104)
-                    .onAppear { proxy.scrollTo(selectedKey, anchor: .center) }
-                }
-                .padding(.bottom, 6)
+                FilmArc(items: items, selectedKey: selectedKey,
+                        onSelect: { item in
+                            if let c = item.custom { recipe.custom = c; recipe.sim = .none }
+                            else if let sim = item.sim { recipe.sim = sim; recipe.custom = nil }
+                        },
+                        onOpenLibrary: {})
 
                 HStack(spacing: 10) {
                     Button { Task { await revert() } } label: {
@@ -335,12 +313,6 @@ private struct RegradeDetail: View {
         guard let (small, ui) = loaded else { message = "Couldn't open this photo"; return }
         original = small
         originalUI = ui
-        // A tiny copy for the looks strip.
-        let ts = 200 / max(small.extent.width, small.extent.height)
-        let tb = small.transformed(by: CGAffineTransform(scaleX: ts, y: ts))
-        if let cg = camera.photoContext.createCGImage(tb, from: tb.extent) {
-            thumbBase = CIImage(cgImage: cg); originalThumbUI = UIImage(cgImage: cg)
-        }
         if let adj = input.adjustmentData, adj.formatIdentifier == ShotRecipe.formatIdentifier {
             oldRecipe = ShotRecipe.decode(adj.data)
         } else {
@@ -352,22 +324,6 @@ private struct RegradeDetail: View {
 
     /// One render at a time; changes made meanwhile render once it's done
     /// (flicking through films used to queue a full render per change).
-    /// One look's thumbnail (rendered off the main thread on the photo context).
-    private func renderThumb(_ item: ArcItem) async {
-        guard thumbs[item.key] == nil else { return }
-        while thumbBase == nil { try? await Task.sleep(nanoseconds: 50_000_000); if Task.isCancelled { return } }
-        guard let base = thumbBase else { return }
-        var r = oldRecipe ?? ShotRecipe()
-        if let c = item.custom { r.custom = c; r.sim = .none } else if let sim = item.sim { r.sim = sim; r.custom = nil }
-        r.grainEnabled = false                    // grain is noise at this size
-        nonisolated(unsafe) let cam = camera
-        let img: UIImage? = await Task.detached(priority: .utility) {
-            let out = cam.renderLook(base, recipe: r, flatten: false).cropped(to: base.extent)
-            return cam.photoContext.createCGImage(out, from: out.extent).map { UIImage(cgImage: $0) }
-        }.value
-        if let img { thumbs[item.key] = img }
-    }
-
     private func renderPreview() {
         guard let original else { return }
         if rendering { renderAgain = true; return }
@@ -419,35 +375,6 @@ private struct RegradeDetail: View {
         } catch {
             message = error.localizedDescription
         }
-    }
-}
-
-// MARK: - Look thumbnail (editor strip)
-
-private struct LookThumb: View {
-    let label: String
-    let image: UIImage?
-    let selected: Bool
-    var body: some View {
-        VStack(spacing: 5) {
-            ZStack {
-                Color.white.opacity(0.06)
-                if let image { Image(uiImage: image).resizable().scaledToFill() }
-                else { ProgressView().controlSize(.small).tint(.white.opacity(0.6)) }
-            }
-            .frame(width: 62, height: 78)
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(selected ? Color.yellow : .white.opacity(0.12), lineWidth: selected ? 2.5 : 1))
-            Text(label.uppercased())
-                .font(.system(size: 9, weight: .bold)).tracking(0.4)
-                .foregroundStyle(selected ? .yellow : .white.opacity(0.75))
-                .lineLimit(1).frame(width: 70)
-        }
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(label)
-        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
