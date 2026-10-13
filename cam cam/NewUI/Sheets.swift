@@ -282,6 +282,7 @@ struct CamSettingsSheet: View {
     @State private var geotag = LocationTagger.shared
 
     @AppStorage("cc_bokehStyle") private var bokehStyle = 0
+    @AppStorage("cc_filmSuggest") private var filmSuggest = true
 
     var body: some View {
         NavigationStack {
@@ -350,6 +351,12 @@ struct CamSettingsSheet: View {
                     .pickerStyle(.segmented)
                     .onChange(of: bokehStyle) { _, v in CameraManager.bokehStyle = v }
                     Text("Soap bubble: background highlights become rimmed discs, like a Meyer-Optik Trioplan.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("Frame guide") {
+                    Toggle("Film suggestions", isOn: $filmSuggest)
+                        .onChange(of: filmSuggest) { _, v in FrameAdvisor.filmSuggestionsOn = v }
+                    Text("Suggests a film that suits the scene (Portra for people, Ektar for landscapes, CineStill 800T at night).")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Display") {

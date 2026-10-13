@@ -659,7 +659,15 @@ final class FrameAdvisor {
     }
 
     /// Which film suits the scene. Needs the same answer ~3 ticks in a row.
+    /// Settings switch (on by default).
+    @ObservationIgnored nonisolated(unsafe) static var filmSuggestionsOn =
+        UserDefaults.standard.object(forKey: "cc_filmSuggest") as? Bool ?? true
+
     nonisolated private func updateFilmSuggestion(found: Subject?, horizon: Bool, camera: CameraManager) {
+        guard Self.filmSuggestionsOn else {
+            Task { @MainActor in if FrameAdvisor.shared.suggestedFilm != nil { FrameAdvisor.shared.suggestedFilm = nil } }
+            return
+        }
         let iso = camera.cachedLiveISO ?? 0
         let film: FilmSimulation?
         if iso >= 1600 { film = .cinestill800T }                                     // night / dim
