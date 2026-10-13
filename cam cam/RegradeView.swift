@@ -391,6 +391,9 @@ private struct PhotoViewer: View {
     var onDeleted: (String) -> Void
     @State private var images: [String: UIImage] = [:]
     @State private var chrome = true
+    @State private var comparing = false
+    @State private var originals: [String: UIImage] = [:]
+    @State private var split: CGFloat = 0.5
 
     private var currentID: String? { ids.indices.contains(index) ? ids[index] : nil }
     private var asset: PHAsset? { currentID.flatMap { assets[$0] } }
@@ -403,12 +406,36 @@ private struct PhotoViewer: View {
                     ZStack {
                         if let img = images[id] { Image(uiImage: img).resizable().scaledToFit() }
                         else { ProgressView().tint(.white) }
+                        // Before / after: the original on the left of the line.
+                        if comparing, i == index, let orig = originals[id] {
+                            GeometryReader { g in
+                                Image(uiImage: orig).resizable().scaledToFit()
+                                    .frame(width: g.size.width, height: g.size.height)
+                                    .mask(alignment: .leading) {
+                                        Rectangle().frame(width: g.size.width * split)
+                                    }
+                                Rectangle().fill(.white).frame(width: 2, height: g.size.height)
+                                    .position(x: g.size.width * split, y: g.size.height / 2)
+                                Circle().fill(.white).frame(width: 30, height: 30)
+                                    .overlay(Image(systemName: "chevron.left.chevron.right").font(.system(size: 11, weight: .bold)).foregroundStyle(.black))
+                                    .position(x: g.size.width * split, y: g.size.height / 2)
+                                Text("ORIGINAL").font(.system(size: 10, weight: .bold)).tracking(0.8)
+                                    .padding(.horizontal, 8).frame(height: 22)
+                                    .background(Capsule().fill(.black.opacity(0.5)))
+                                    .position(x: 52, y: g.size.height - 30)
+                            }
+                            .contentShape(Rectangle())
+                            .gesture(DragGesture(minimumDistance: 0).onChanged { v in
+                                split = min(max(v.location.x / max(UIScreen.main.bounds.width, 1), 0), 1)
+                            })
+                        }
                     }
                     .tag(i)
                     .task { await load(id) }
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
+            .scrollDisabled(comparing)
             .ignoresSafeArea()
             .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { chrome.toggle() } }
 
@@ -441,11 +468,25 @@ private struct PhotoViewer: View {
                     Spacer()
                     HStack(spacing: 14) {
                         if let id = currentID, let img = images[id] {
-                            ShareLink(item: Image(uiImage: img), preview: SharePreview("Photo", image: Image(uiImage: img))) {
+                            Menu {
+                                Button { InstagramShare.shareSheet(img) } label: { Label("Share photo", systemImage: "square.and.arrow.up") }
+                                Button { Task { await exportFramed(id) } } label: { Label("4:5 with border", systemImage: "rectangle.portrait") }
+                            } label: {
                                 Image(systemName: "square.and.arrow.up").font(.system(size: 17, weight: .semibold))
                                     .foregroundStyle(.white).frame(width: 52, height: 52)
                             }
                             .glassEffect(.regular.interactive(), in: Circle())
+                            Button {
+                                withAnimation(.easeOut(duration: 0.15)) { comparing.toggle() }
+                                if comparing { split = 0.5; Task { await loadOriginal(id) } }
+                            } label: {
+                                Image(systemName: comparing ? "square.split.2x1.fill" : "square.split.2x1")
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(comparing ? .yellow : .white).frame(width: 52, height: 52)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.interactive(), in: Circle())
+                            .accessibilityLabel("Compare with the original")
                         }
                         if let id = currentID, let img = images[id] {
                             // One tap: Instagram's own share page (Feed / Story / Messages).
@@ -500,6 +541,52 @@ private struct PhotoViewer: View {
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             if !degraded || images[id] == nil { images[id] = img }
         }
+    }
+
+    /// The unedited original (for before / after), at screen size.
+    private func loadOriginal(_ id: String) async {
+        guard originals[id] == nil, let a = assets[id] ?? PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject,
+              let input = await PhotoSaver.editingInput(for: a), let url = input.fullSizeImageURL else { return }
+        let side = UIScreen.main.nativeBounds.height
+        let img: UIImage? = await Task.detached(priority: .userInitiated) {
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: side] as CFDictionary) else { return nil }
+            return UIImage(cgImage: cg)
+        }.value
+        if let img { originals[id] = img }
+    }
+
+    /// Instagram-ready: the photo on a 4:5 white card with the film's name.
+    private func exportFramed(_ id: String) async {
+        guard let a = assets[id] ?? PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else { return }
+        let photo: UIImage? = await withCheckedContinuation { cont in
+            let o = PHImageRequestOptions()
+            o.deliveryMode = .highQualityFormat; o.resizeMode = .exact; o.isNetworkAccessAllowed = true
+            AssetThumbImages.manager.requestImage(for: a, targetSize: CGSize(width: 2160, height: 2160),
+                                                  contentMode: .aspectFit, options: o) { img, _ in cont.resume(returning: img) }
+        }
+        guard let photo else { return }
+        let caption = [PhotoSaver.cachedFilmName(id).flatMap { $0.isEmpty ? nil : $0.uppercased() }, "CAM CAM"]
+            .compactMap { $0 }.joined(separator: "  ·  ")
+        let W: CGFloat = 2160, H: CGFloat = 2700, margin: CGFloat = 120, capH: CGFloat = 150
+        let box = CGRect(x: margin, y: margin, width: W - 2 * margin, height: H - 2 * margin - capH)
+        let s = min(box.width / photo.size.width, box.height / photo.size.height)
+        let r = CGRect(x: box.midX - photo.size.width * s / 2, y: box.midY - photo.size.height * s / 2,
+                       width: photo.size.width * s, height: photo.size.height * s)
+        let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1; fmt.opaque = true
+        let card = UIGraphicsImageRenderer(size: CGSize(width: W, height: H), format: fmt).image { _ in
+            UIColor.white.setFill(); UIRectFill(CGRect(x: 0, y: 0, width: W, height: H))
+            photo.draw(in: r)
+            let para = NSMutableParagraphStyle(); para.alignment = .center
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 40, weight: .semibold), .kern: 6,
+                .foregroundColor: UIColor(white: 0.25, alpha: 1), .paragraphStyle: para]
+            (caption as NSString).draw(in: CGRect(x: 0, y: r.maxY + 50, width: W, height: 60), withAttributes: attrs)
+        }
+        InstagramShare.shareSheet(card)
     }
 
     private func delete() async {
