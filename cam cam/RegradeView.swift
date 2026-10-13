@@ -21,7 +21,19 @@ struct RegradeView: View {
     @State private var assets: [String: PHAsset] = [:]
     @State private var loaded = false
     @State private var open: String?            // editor
-    @State private var viewing: Int?             // full-screen viewer (index into assetIDs)
+    @State private var viewing: Int?             // full-screen viewer (index into shownIDs)
+    @State private var filmFilter: String?       // albums by film
+    @State private var names: [String: String] = [:]
+    private var shownIDs: [String] {
+        guard let f = filmFilter else { return assetIDs }
+        return assetIDs.filter { names[$0] == f }
+    }
+    /// Films present in the roll, most-shot first.
+    private var films: [(String, Int)] {
+        var c: [String: Int] = [:]
+        for id in assetIDs { if let n = names[id], !n.isEmpty { c[n, default: 0] += 1 } }
+        return c.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+    }
 
     var body: some View {
         ZStack {
@@ -31,12 +43,12 @@ struct RegradeView: View {
                               onBack: { open = nil })
                     .transition(.move(edge: .bottom))
             } else if let i = viewing {
-                PhotoViewer(ids: assetIDs, assets: assets, index: i,
+                PhotoViewer(ids: shownIDs, assets: assets, index: i,
                             onClose: { viewing = nil },
-                            onEdit: { id in viewing = assetIDs.firstIndex(of: id); open = id },
+                            onEdit: { id in viewing = shownIDs.firstIndex(of: id); open = id },
                             onDeleted: { id in
                                 assetIDs.removeAll { $0 == id }
-                                if assetIDs.isEmpty { viewing = nil } else { viewing = min(i, assetIDs.count - 1) }
+                                if shownIDs.isEmpty { viewing = nil } else { viewing = min(i, shownIDs.count - 1) }
                             })
                     .transition(.opacity)
             } else {
@@ -80,10 +92,23 @@ struct RegradeView: View {
                 }
                 Spacer()
             } else {
+                // Albums by film.
+                if !films.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            filmChip("All", count: assetIDs.count, on: filmFilter == nil) { filmFilter = nil }
+                            ForEach(films, id: \.0) { f in
+                                filmChip(f.0, count: f.1, on: filmFilter == f.0) { filmFilter = filmFilter == f.0 ? nil : f.0 }
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                    }
+                    .padding(.bottom, 8)
+                }
                 ScrollView {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 2) {
-                        ForEach(assetIDs, id: \.self) { id in
-                            Button { viewing = assetIDs.firstIndex(of: id) } label: { AssetThumb(assetID: id, asset: assets[id]) }
+                        ForEach(shownIDs, id: \.self) { id in
+                            Button { viewing = shownIDs.firstIndex(of: id) } label: { AssetThumb(assetID: id, asset: assets[id]) }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -103,6 +128,25 @@ struct RegradeView: View {
         r.enumerateObjects { a, _, _ in list.append(a) }
         assets = Dictionary(uniqueKeysWithValues: list.map { ($0.localIdentifier, $0) })
         assetIDs = list.map(\.localIdentifier)
+        // Film names: cached ones now, the rest looked up in the background.
+        for id in assetIDs { if let n = PhotoSaver.cachedFilmName(id) { names[id] = n } }
+        for a in list where names[a.localIdentifier] == nil {
+            let n = await PhotoSaver.FilmNameLoader.shared.name(for: a)
+            names[a.localIdentifier] = n
+        }
+    }
+
+    private func filmChip(_ title: String, count: Int, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Text(title.uppercased()).font(.system(size: 11, weight: .bold)).tracking(0.5)
+                Text("\(count)").font(.system(size: 11, weight: .semibold)).opacity(0.6)
+            }
+            .foregroundStyle(on ? .black : .white)
+            .padding(.horizontal, 12).frame(height: 30)
+            .background(Capsule().fill(on ? Color.yellow : Color.white.opacity(0.1)))
+        }
+        .buttonStyle(.plain)
     }
 }
 
