@@ -31,7 +31,7 @@ extension CameraManager {
     /// which own their noise) → DigiCam scanlines → Bent glitch.
     /// - grainTextures: true for the preview (cheap pre-baked grain textures);
     ///   false for video (procedural grain at recording resolution).
-    nonisolated func applyLiveLook(_ input: CIImage, grainTextures: Bool) -> CIImage {
+    nonisolated func applyLiveLook(_ input: CIImage, grainTextures: Bool, includeGrain: Bool = true) -> CIImage {
         let sim = cachedSim
         let custom = cachedActiveCustomSim
         let extent = input.extent
@@ -61,7 +61,8 @@ extension CameraManager {
         let isDigiCam = custom == nil && sim == .digiCam
         let isBent = custom == nil && (sim == .circuitBent || sim == .circuitBentHeavy)
         let grainOn = cachedGrainEnabled && cachedGrainAmount > 0
-        if grainOn && !isDigiCam && !isBent {
+        if grainOn && includeGrain && !isDigiCam && !isBent {
+            img = Self.cleanSensorNoise(img, iso: cachedLiveISO)       // film grain replaces digital noise
             img = grainTextures ? applyPreviewGrain(img, extent: extent)
                                 : addGrain(input: img, amount: cachedGrainAmount)
         }
@@ -272,6 +273,7 @@ extension CameraManager {
                 }
                 grainAmt = min(0.5, grainAmt * Self.contextGrainScale(iso: r.sceneISO, luma: luma))
             }
+            image = Self.cleanSensorNoise(image, iso: r.sceneISO)     // film grain replaces digital noise
             image = addGrain(input: image, amount: grainAmt,
                              character: r.custom == nil ? r.sim.grainCharacter : .standard)
         } else if r.pushPullEnabled && r.pushPull > 0 && !isDigiCam {
@@ -2458,9 +2460,22 @@ extension CameraManager {
             guard let l = luma else { return 1 }
             return max(0.7, min(1.6, 1.45 - l * 1.0))
         }
-        var f = 0.85 + 0.22 * log2(max(iso, 25) / 100)
-        if let l = luma, l < 0.18 { f *= 1.15 }
-        return max(0.75, min(1.8, f))
+        // Gentle: the sensor's own noise is cleaned up before grain at high
+        // ISO, so this only tilts the amount (it used to reach 1.8× on top of
+        // digital noise — double noise exactly when it looks worst).
+        var f = 0.92 + 0.08 * log2(max(iso, 25) / 100)
+        if let l = luma, l < 0.18 { f *= 1.08 }
+        return max(0.85, min(1.35, f))
+    }
+
+    /// At high ISO the frame already carries digital noise; smooth it a
+    /// little before adding film grain so the grain replaces it instead of
+    /// stacking on top (how a real film shot looks: grain, not speckle).
+    nonisolated static func cleanSensorNoise(_ image: CIImage, iso: Float?) -> CIImage {
+        guard let iso, iso >= 640 else { return image }
+        let level = min(0.035, 0.008 * log2(iso / 320))
+        return image.applyingFilter("CINoiseReduction", parameters: ["inputNoiseLevel": level, "inputSharpness": 0.45])
+            .cropped(to: image.extent)
     }
 
     /// Render `image` as a physical print process; nil if the kernel is missing.

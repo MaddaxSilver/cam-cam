@@ -300,7 +300,9 @@ final class SmartExposure {
         for v in levels {
             let patch = CIImage(color: CIColor(red: CGFloat(v), green: CGFloat(v), blue: CGFloat(v), colorSpace: srgb)!)
                 .cropped(to: CGRect(x: 0, y: 0, width: 48, height: 48))
-            let look = camera.applyLiveLook(patch, grainTextures: false)
+            // Without grain: random grain on a tiny patch made every reading
+            // different and the exposure correction wobble.
+            let look = camera.applyLiveLook(patch, grainTextures: false, includeGrain: false)
             var px = [Float](repeating: 0, count: 4)
             context.render(look, toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 24, y: 24, width: 1, height: 1),
                            format: .RGBAf, colorSpace: srgb)
