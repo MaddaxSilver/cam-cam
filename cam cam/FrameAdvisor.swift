@@ -302,7 +302,7 @@ final class FrameAdvisor {
         let bufAspect = CGFloat(CVPixelBufferGetWidth(pixelBuffer)) / CGFloat(max(CVPixelBufferGetHeight(pixelBuffer), 1))
         let aspect = small.extent.width / max(small.extent.height, 1)     // upright
         SceneMotion.start()
-        frameAttitude = SceneMotion.attitude          // attitude when this frame was seen
+        frameAttitude = SceneMotion.attitude(at: time)   // attitude when this frame was captured
         let device = camera.currentDevice
         Self.queue.async { [self] in
             defer { busy = false }
@@ -441,7 +441,11 @@ final class FrameAdvisor {
             shownComp = f.comp
             if let cur = shown {
                 if Self.iou(cur, f.box) > 0.35 {
-                    shown = Self.lerp(cur, f.box, 0.2)          // glide
+                    // Glide — but ignore small detection jitter (the box
+                    // twitched between analysis passes).
+                    let shift = hypot(f.box.midX - cur.midX, f.box.midY - cur.midY) / max(cur.width, cur.height)
+                    let grow = abs(f.box.width - cur.width) / max(cur.width, 0.01)
+                    if shift > 0.06 || grow > 0.08 { shown = Self.lerp(cur, f.box, 0.18) }
                     rival = nil
                 } else {
                     // A different suggestion: switch only once it's held ~1.2 s.
@@ -891,8 +895,17 @@ nonisolated enum SceneMotion {
         manager.deviceMotionUpdateInterval = 1.0 / 60.0
         let q = OperationQueue(); q.qualityOfService = .userInteractive
         manager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: q) { m, _ in
-            guard let a = m?.attitude.quaternion else { return }
-            lock.lock(); latest = simd_quatd(ix: a.x, iy: a.y, iz: a.z, r: a.w); lock.unlock()
+            guard let m else { return }
+            let a = m.attitude.quaternion
+            let qd = simd_quatd(ix: a.x, iy: a.y, iz: a.z, r: a.w)
+            #if DEBUG
+            if history.isEmpty { print(String(format: "[perf] clocks motion %.3f media %.3f", m.timestamp, CACurrentMediaTime())) }
+            #endif
+            lock.lock()
+            latest = qd
+            history.append((m.timestamp, qd))
+            if history.count > 90 { history.removeFirst(history.count - 90) }   // ~1.5 s
+            lock.unlock()
         }
     }
 
@@ -905,6 +918,29 @@ nonisolated enum SceneMotion {
 
     /// Device attitude (device → reference frame).
     static var attitude: simd_quatd { lock.lock(); defer { lock.unlock() }; return latest }
+
+    nonisolated(unsafe) private static var history: [(TimeInterval, simd_quatd)] = []
+    /// Capture time (host clock) of the frame now on screen.
+    nonisolated(unsafe) static var displayedFrameTime: TimeInterval = 0
+
+    /// Attitude at a moment in the last ~1.5 s (host clock, same as video
+    /// frame timestamps), interpolated between gyro samples.
+    static func attitude(at t: TimeInterval) -> simd_quatd {
+        lock.lock(); defer { lock.unlock() }
+        guard t > 0, let last = history.last, let first = history.first else { return latest }
+        // Clocks disagree or the moment is out of range: use the live reading.
+        if t > last.0 + 0.25 || t < first.0 - 0.05 { return latest }
+        if t >= last.0 { return last.1 }
+        guard let i = history.lastIndex(where: { $0.0 <= t }) else { return history.first?.1 ?? latest }
+        let a = history[i], b = history[min(i + 1, history.count - 1)]
+        let span = b.0 - a.0
+        return span > 0 ? simd_slerp(a.1, b.1, (t - a.0) / span) : a.1
+    }
+
+    /// The attitude that matches what's on screen: the displayed preview
+    /// frame was captured ~50–100 ms ago, and placing the box with "now"
+    /// made it run ahead of the picture whenever the phone moved.
+    static var displayedAttitude: simd_quatd { attitude(at: displayedFrameTime) }
 
     /// Move a top-left normalized image rect measured at attitude `from` to
     /// where that part of the scene appears at attitude `to`.

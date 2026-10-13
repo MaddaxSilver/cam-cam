@@ -3436,6 +3436,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         if let metal {
             metal.currentImage = filtered
             metal.render(filtered)        // drawn here, off the main thread
+            SceneMotion.displayedFrameTime = CMTimeGetSeconds(pts)   // box overlay matches this frame
         }
     }
 }

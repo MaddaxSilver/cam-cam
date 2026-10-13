@@ -2210,7 +2210,7 @@ private struct FrameGuideOverlay<Pinch: Gesture>: View {
                 let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
                 ZStack {
                     ForEach(Array(frameAdvisor.picks.enumerated()), id: \.offset) { i, pick in
-                        let b = SceneMotion.reproject(pick, from: frameAdvisor.picksAttitude, to: SceneMotion.attitude,
+                        let b = SceneMotion.reproject(pick, from: frameAdvisor.picksAttitude, to: SceneMotion.displayedAttitude,
                                                       fovLong: frameAdvisor.fovLong, aspect: Double(a))
                         let r = CGRect(x: ox + b.minX * dispW, y: oy + b.minY * dispH,
                                        width: b.width * dispW, height: b.height * dispH)
@@ -2234,7 +2234,7 @@ private struct FrameGuideOverlay<Pinch: Gesture>: View {
             TimelineView(.animation(minimumInterval: 1.0 / 60)) { _ in
                 let a = frameAdvisor.imageAspect
                 let box = SceneMotion.reproject(measured, from: frameAdvisor.boxAttitude,
-                                                to: SceneMotion.attitude,
+                                                to: SceneMotion.displayedAttitude,
                                                 fovLong: frameAdvisor.fovLong, aspect: Double(a))
                 let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
                 let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
