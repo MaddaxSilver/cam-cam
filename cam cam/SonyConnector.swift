@@ -28,6 +28,7 @@ import Darwin   // getifaddrs, inet_ntop
 import ImageIO
 import UniformTypeIdentifiers
 import Metal
+import Network
 
 // MARK: - Sony Device Discovery
 
@@ -218,6 +219,21 @@ enum SonyAPIError: Error, LocalizedError {
 
 struct SonyAPIClient {
 
+    /// The camera's own session: no response cache (the shared session
+    /// could cache every 42MP postview), Wi-Fi only (the camera network has
+    /// no internet; never try mobile data), and timeouts that fit a camera.
+    static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.urlCache = nil
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.allowsCellularAccess = false
+        c.waitsForConnectivity = false
+        c.httpMaximumConnectionsPerHost = 4
+        c.timeoutIntervalForRequest = 60
+        c.timeoutIntervalForResource = 180
+        return URLSession(configuration: c)
+    }()
+
     @discardableResult
     static func call(endpoint: String,
                      method: String,
@@ -238,7 +254,7 @@ struct SonyAPIClient {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await session.data(for: request)
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { throw SonyAPIError.badResponse }
 
@@ -254,9 +270,23 @@ struct SonyAPIClient {
         return json
     }
 
-    static func get(urlString: String) async throws -> Data {
+    /// Download with retries: a Wi-Fi hiccup mid-transfer used to lose the photo.
+    static func get(urlString: String, attempts: Int = 3) async throws -> Data {
+        var lastError: Error = SonyAPIError.badResponse
+        for i in 0..<max(attempts, 1) {
+            do { return try await getOnce(urlString: urlString) }
+            catch {
+                lastError = error
+                if case SonyAPIError.apiError(let code, _) = error, (400..<500).contains(code) { throw error }  // not transient
+                if i < attempts - 1 { try? await Task.sleep(nanoseconds: UInt64(i + 1) * 1_000_000_000) }
+            }
+        }
+        throw lastError
+    }
+
+    private static func getOnce(urlString: String) async throws -> Data {
         guard let url = URL(string: urlString) else { throw SonyAPIError.invalidURL }
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await session.data(from: url)
         // A 404/500 page isn't a photo — fail clearly instead of "render failed".
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw SonyAPIError.apiError(http.statusCode, "HTTP \(http.statusCode)")
@@ -381,6 +411,18 @@ final class SonyConnector {
         return CIContext(options: [.workingColorSpace: p3, .outputColorSpace: p3])
     }()
 
+    /// Full-res postview renders get their own LOW-priority context, so a
+    /// 42MP film render never holds up the live view (same fix as the
+    /// phone camera's preview).
+    private let photoContext: CIContext = {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        var o: [CIContextOption: Any] = [.workingColorSpace: p3, .outputColorSpace: p3,
+                                         .cacheIntermediates: false, .priorityRequestLow: true]
+        if let device = MTLCreateSystemDefaultDevice() { return CIContext(mtlDevice: device, options: o) }
+        o[.useSoftwareRenderer] = false
+        return CIContext(options: o)
+    }()
+
     /// Injected by SonyView from CameraManager: the pure, thread-safe look
     /// renderer and a live-recipe builder. Replaces the old closure that called
     /// `applySimAndGrainDirect`, which swapped shared capture state and raced
@@ -501,7 +543,43 @@ final class SonyConnector {
 
     // MARK: - Connect / Disconnect
 
+    /// Watches the phone's Wi-Fi: the camera's network has no internet, so
+    /// iOS likes to hop back to home Wi-Fi; react at once instead of waiting
+    /// for the live-view watchdog, and reconnect when Wi-Fi comes back.
+    private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
+    private var pathMonitorStarted = false
+    private var wifiUp = true
+
+    private func startPathMonitor() {
+        guard !pathMonitorStarted else { return }
+        pathMonitorStarted = true
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let up = path.status == .satisfied
+            Task { @MainActor [weak self] in self?.wifiChanged(up: up) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "cam.sony.path"))
+    }
+
+    private func wifiChanged(up: Bool) {
+        defer { wifiUp = up }
+        guard up != wifiUp else { return }
+        if !up {
+            log("📶 Wi-Fi dropped")
+            if case .connected = state { liveViewStatus = "Wi-Fi dropped — reconnecting when it's back…" }
+        } else {
+            log("📶 Wi-Fi back")
+            switch state {
+            case .connected:
+                Task { await self.hardResetSession() }      // new lease / camera restarted: rediscover now
+            case .error:
+                connect()                                    // gave up earlier: try again automatically
+            default: break
+            }
+        }
+    }
+
     func connect() {
+        startPathMonitor()
         guard state == .disconnected || {
             if case .error = state { return true }; return false
         }() else { return }
@@ -603,9 +681,53 @@ final class SonyConnector {
                 self.log("📷 setPostviewImageSize(Original) on connect")
             }
 
-            // 6. Begin polling + live view
+            // 6. Best image from the camera: largest size and finest JPEG,
+            //    so the postview cam cam grades is full quality.
+            await self.maximizeStillQuality(camURL: camURL)
+
+            // 7. Begin polling + live view
             self.startEventPolling()
             await self.startLiveView()
+        }
+    }
+
+    /// Ask the body for its largest still size and best JPEG quality (only
+    /// when it supports those calls; logs what it ends up on).
+    private func maximizeStillQuality(camURL: String) async {
+        if availableAPIs.contains("getAvailableStillSize"), availableAPIs.contains("setStillSize"),
+           let r = try? await SonyAPIClient.call(endpoint: camURL, method: "getAvailableStillSize", params: [], timeout: 3),
+           let res = r["result"] as? [Any], res.count > 1, let cands = res[1] as? [[String: Any]] {
+            let current = res.first as? [String: Any]
+            let aspect = (current?["aspect"] as? String) ?? "3:2"
+            if let best = cands.first(where: { ($0["aspect"] as? String) == aspect && ($0["size"] as? String) == "L" })
+                ?? cands.first(where: { ($0["size"] as? String) == "L" }),
+               let a = best["aspect"] as? String, let sz = best["size"] as? String {
+                _ = try? await SonyAPIClient.call(endpoint: camURL, method: "setStillSize", params: [a, sz], timeout: 3)
+                log("📷 setStillSize(\(a), \(sz))")
+            }
+        }
+        if availableAPIs.contains("getAvailableStillQuality"), availableAPIs.contains("setStillQuality"),
+           let r = try? await SonyAPIClient.call(endpoint: camURL, method: "getAvailableStillQuality", params: [], timeout: 3),
+           let res = r["result"] as? [Any] {
+            // [current, [candidates]] or [{stillQuality, candidate:[...]}] depending on the API version.
+            var cands: [String] = []
+            var current = ""
+            if let d = res.first as? [String: Any] {
+                current = d["stillQuality"] as? String ?? ""
+                cands = d["candidate"] as? [String] ?? []
+            } else {
+                current = res.first as? String ?? ""
+                cands = (res.count > 1 ? res[1] as? [String] : nil) ?? []
+            }
+            // Keep RAW+JPEG if the user shoots it; otherwise the finest JPEG.
+            let order = current.contains("RAW") ? ["RAW+JPEG(Extra Fine)", "RAW+JPEG"] : ["Extra Fine", "Fine"]
+            if let best = order.first(where: cands.contains), best != current {
+                _ = try? await SonyAPIClient.call(endpoint: camURL, method: "setStillQuality",
+                                                  params: [["stillQuality": best]], timeout: 3)
+                log("📷 setStillQuality(\(best)) (was \(current))")
+            } else {
+                log("📷 Still quality: \(current.isEmpty ? "unknown" : current)")
+            }
         }
     }
 
@@ -892,7 +1014,7 @@ final class SonyConnector {
         log("⬇️ Downloaded \(data.count / 1024) KB")
 
         nonisolated(unsafe) let renderer = self.renderer
-        let ctx = self.ciContext
+        let ctx = self.photoContext
         let hasLook = renderer != nil && !recipe.isIdentity
         let location = LocationTagger.shared.locationForPhoto()
 
