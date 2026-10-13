@@ -2834,7 +2834,51 @@ import CoreLocation
     }
 
     /// Applies CIDepthBlurEffect (or CIMaskedVariableBlur fallback) directly from a pre-scaled CIImage disparity map.
+    /// Portrait bokeh style: 0 smooth, 1 soap bubble (Trioplan).
+    @ObservationIgnored nonisolated(unsafe) static var bokehStyle = UserDefaults.standard.integer(forKey: "cc_bokehStyle")
+
+    /// Trioplan soap-bubble bokeh: background highlights become discs with a
+    /// bright rim and a dimmer (still filled) centre — over-corrected
+    /// spherical aberration. `far` is white where the scene is far away.
+    nonisolated func soapBubbles(_ blurred: CIImage, original: CIImage, far: CIImage, fStop: Float) -> CIImage {
+        let e = blurred.extent
+        let r = Double(max(e.width, e.height)) * 0.011 * Double(1.4 / max(fStop, 1))
+        guard r > 2 else { return blurred }
+        let luma = original.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0),
+            "inputGVector": CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0),
+            "inputBVector": CIVector(x: 0.2126, y: 0.7152, z: 0.0722, w: 0)])
+        guard let thr = CIFilter(name: "CIColorThreshold", parameters: [kCIInputImageKey: luma, "inputThreshold": 0.7])?.outputImage
+        else { return blurred }
+        // Bright points (in their own colour), only in the background.
+        let points = original.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: thr])
+            .applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: far])
+            .cropped(to: e)
+        func disc(_ rr: Double) -> CIImage {
+            points.clampedToExtent().applyingFilter("CIDiscBlur", parameters: [kCIInputRadiusKey: rr]).cropped(to: e)
+        }
+        // Rim = big disc − smaller disc (scaled so the centre stays a little lit).
+        let outer = disc(r).applyingFilter("CIColorMatrix", parameters: ["inputRVector": CIVector(x: 2.4, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 2.4, z: 0, w: 0), "inputBVector": CIVector(x: 0, y: 0, z: 2.4, w: 0)])
+        let inner = disc(r * 0.75).applyingFilter("CIColorMatrix", parameters: ["inputRVector": CIVector(x: 1.9, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 1.9, z: 0, w: 0), "inputBVector": CIVector(x: 0, y: 0, z: 1.9, w: 0)])
+        let rings = inner.applyingFilter("CISubtractBlendMode", parameters: [kCIInputBackgroundImageKey: outer])
+            .applyingFilter("CIColorClamp", parameters: ["inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 0),
+                                                         "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
+        return rings.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: blurred]).cropped(to: e)
+    }
+
     nonisolated func applyPortraitBlurFromCIImage(to image: CIImage, disparityCI: CIImage, fStop: Float) -> CIImage {
+        if Self.bokehStyle == 1 {
+            let far = disparityCI.applyingFilter("CIColorInvert")
+                .applyingFilter("CIColorControls", parameters: [kCIInputContrastKey: 2.0])
+            return soapBubbles(applySmoothPortraitBlur(image, disparityCI: disparityCI, fStop: fStop),
+                               original: image, far: far, fStop: fStop)
+        }
+        return applySmoothPortraitBlur(image, disparityCI: disparityCI, fStop: fStop)
+    }
+
+    nonisolated private func applySmoothPortraitBlur(_ image: CIImage, disparityCI: CIImage, fStop: Float) -> CIImage {
         if let filter = CIFilter(name: "CIDepthBlurEffect") {
             filter.setValue(image,        forKey: kCIInputImageKey)
             filter.setValue(disparityCI,  forKey: "inputDisparityImage")
@@ -2898,7 +2942,12 @@ import CoreLocation
             blurFilter.setValue(mask,   forKey: "inputMask")
             blurFilter.setValue(radius, forKey: kCIInputRadiusKey)
             if let out = blurFilter.outputImage {
-                return out.cropped(to: image.extent)
+                let blurred = out.cropped(to: image.extent)
+                if Self.bokehStyle == 1 {
+                    let far = mask.applyingFilter("CIColorControls", parameters: [kCIInputContrastKey: 2.0])
+                    return soapBubbles(blurred, original: image, far: far, fStop: fStop)
+                }
+                return blurred
             }
         }
         return image

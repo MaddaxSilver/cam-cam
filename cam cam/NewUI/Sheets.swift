@@ -280,6 +280,8 @@ struct CamSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var geotag = LocationTagger.shared
 
+    @AppStorage("cc_bokehStyle") private var bokehStyle = 0
+
     var body: some View {
         NavigationStack {
             Form {
@@ -339,6 +341,15 @@ struct CamSettingsSheet: View {
                         Text("Developer exhaustion: highlights compress, edges gain film's natural pop.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
+                }
+                Section("Portrait") {
+                    Picker("Bokeh", selection: $bokehStyle) {
+                        Text("Smooth").tag(0); Text("Soap bubble").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: bokehStyle) { _, v in CameraManager.bokehStyle = v }
+                    Text("Soap bubble: background highlights become rimmed discs, like a Meyer-Optik Trioplan.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Display") {
                     Toggle("Grid", isOn: $camera.showGrid)
