@@ -413,6 +413,7 @@ private struct RegradeDetail: View {
         let r = recipe
         nonisolated(unsafe) let cam = camera
         Task.detached(priority: .userInitiated) {
+            CameraManager.lookAngle = 0                       // upright already
             let out = cam.renderLook(original, recipe: r, flatten: false).cropped(to: original.extent)
             let cg = cam.ciContext.createCGImage(out, from: out.extent)
             await MainActor.run {
@@ -432,6 +433,7 @@ private struct RegradeDetail: View {
                 guard let ci = CIImage(data: data) else { return nil }
                 let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
                 let upright = ci.oriented(forExifOrientation: o)
+                CameraManager.lookAngle = 0
                 let out = cam.renderLook(upright, recipe: r, flatten: true).cropped(to: upright.extent)
                 guard let cg = cam.ciContext.createCGImage(out, from: out.extent) else { return nil }
                 return MetadataTools.jpeg(from: cg, metadataFrom: data, location: nil)

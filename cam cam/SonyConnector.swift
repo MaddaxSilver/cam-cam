@@ -1020,6 +1020,7 @@ final class SonyConnector {
 
         struct Rendered: @unchecked Sendable { let preview: UIImage; let jpeg: Data? }
         let rendered: Rendered? = await Task.detached(priority: .userInitiated) {
+            CameraManager.lookAngle = 0                       // Sony images are upright
             guard let ciImage = CIImage(data: data) else { return nil }
             let o = (ciImage.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
             let oriented = ciImage.oriented(forExifOrientation: o)

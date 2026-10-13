@@ -1984,6 +1984,30 @@ extension CameraManager {
                 .applyingGaussianBlur(sigma: Double(size) * 0.003).cropped(to: extent)
             return vignette(masked(corners, over: glowing, edgeMask(0.25, 0.6)), 0.8, 0.75)
 
+        case .tiltShift:
+            // Miniature: sharp band through the middle of the SCENE (across
+            // the way the phone is held), blur growing toward both edges,
+            // a little extra colour and contrast like a model railway.
+            let vertical = abs(abs(Self.lookAngle) - 90) < 1     // held sideways: scene's horizontal = image's vertical axis
+            let band = (vertical ? extent.width : extent.height) * 0.14
+            let ramp = (vertical ? extent.width : extent.height) * 0.22
+            let mid = vertical ? extent.midX : extent.midY
+            func grad(_ from: CGFloat, _ to: CGFloat) -> CIImage {
+                let p0 = vertical ? CIVector(x: from, y: 0) : CIVector(x: 0, y: from)
+                let p1 = vertical ? CIVector(x: to, y: 0) : CIVector(x: 0, y: to)
+                return CIFilter(name: "CISmoothLinearGradient", parameters: [
+                    "inputPoint0": p0, "inputPoint1": p1,
+                    "inputColor0": CIColor(red: 0, green: 0, blue: 0), "inputColor1": CIColor(red: 1, green: 1, blue: 1),
+                ])?.outputImage?.cropped(to: extent) ?? CIImage(color: .black).cropped(to: extent)
+            }
+            let mask = grad(mid + band / 2, mid + band / 2 + ramp)
+                .applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: grad(mid - band / 2, mid - band / 2 - ramp)])
+            let blurred = input.clampedToExtent().applyingFilter("CIMaskedVariableBlur", parameters: [
+                "inputMask": mask, kCIInputRadiusKey: Double(size) * 0.012]).cropped(to: extent)
+            let pop = CIFilter.colorControls()
+            pop.inputImage = blurred; pop.saturation = 1.25; pop.contrast = 1.08
+            return pop.outputImage?.cropped(to: extent) ?? blurred
+
         case .fisheye:
             // Barrel distortion: the centre bulges out, straight lines bow,
             // and the rim darkens like a 16 mm fisheye on a crop frame.

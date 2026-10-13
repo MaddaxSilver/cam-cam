@@ -2518,6 +2518,7 @@ import CoreLocation
 
         DispatchQueue.main.async { self.isCapturing = false }
         processQueue.async { [self] in
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             renderAndSave(ciImage: averaged.cropped(to: extent))
         }
     }
@@ -2619,6 +2620,7 @@ import CoreLocation
     nonisolated func developNatural(_ dng: Data, keepRAW: Bool, shot: (@Sendable () -> Void)?) {
         DispatchQueue.main.async { self.isCapturing = false }
         processQueue.async { [self] in
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             if let shot { shot() }
             defer { if shot != nil { shotRendered() } }
             guard let raw = CIRAWFilter(imageData: dng, identifierHint: "com.adobe.raw-image") else {
@@ -2650,6 +2652,7 @@ import CoreLocation
         DispatchQueue.main.async { self.isCapturing = false }
 
         processQueue.async { [self] in
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             if let shot { shot() }
             defer { if shot != nil { shotRendered() } }
             guard var ciImage = CIImage(data: imageData) else { return }
@@ -2695,6 +2698,7 @@ import CoreLocation
     nonisolated func processAndSavePortrait(imageData: Data, depthData: AVDepthData) {
         DispatchQueue.main.async { self.isCapturing = false }
         processQueue.async { [self] in
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             guard var ciImage = CIImage(data: imageData) else { return }
             let originalMetadata = ciImage.properties
             ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
@@ -2721,6 +2725,7 @@ import CoreLocation
         // CVPixelBuffer is not Sendable — rebind before the closure captures it
         nonisolated(unsafe) let sendableBuffer = depthBuffer
         processQueue.async { [self] in
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             if let shot { shot() }
             defer { if shot != nil { shotRendered() } }
             guard var ciImage = CIImage(data: imageData) else { return };
@@ -2834,6 +2839,14 @@ import CoreLocation
     }
 
     /// Applies CIDepthBlurEffect (or CIMaskedVariableBlur fallback) directly from a pre-scaled CIImage disparity map.
+    /// Which way is up in the image a look is rendering, per thread: the
+    /// live preview and photos are still in sensor (portrait) orientation
+    /// (landscape shots are rotated later), regrades are already upright (0).
+    nonisolated static var lookAngle: Double {
+        get { (Thread.current.threadDictionary["camcam.lookAngle"] as? Double) ?? 0 }
+        set { Thread.current.threadDictionary["camcam.lookAngle"] = newValue }
+    }
+
     /// Portrait bokeh style: 0 smooth, 1 soap bubble (Trioplan).
     @ObservationIgnored nonisolated(unsafe) static var bokehStyle = UserDefaults.standard.integer(forKey: "cc_bokehStyle")
 
@@ -2956,6 +2969,7 @@ import CoreLocation
     nonisolated func saveRAW(data: Data) {
         DispatchQueue.main.async { self.isCapturing = false }
         processQueue.async { [self] in
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             guard photoLibAuthorized else { return }
             let tempURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString)
@@ -3465,6 +3479,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         // Same look as the saved photo (same order, same sims skip film grain),
         // shared with video recording so all three match.
+        Self.lookAngle = FrameAdvisor.shared.cachedAngle     // live orientation
         var filtered = applyLiveLook(scaled, grainTextures: true)
 
         // Live portrait depth blur in preview (uses cached depth from AVCaptureDepthDataOutput)
@@ -3601,6 +3616,8 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             }
             adjustBurstBacklog(by: 1)
             processQueue.async { [self] in
+                Self.lookAngle = pendingDeviceAngle
+            Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
                 defer { self.adjustBurstBacklog(by: -1) }
                 guard var ciImage = CIImage(data: capturedData) else { return }
                 let metadata = ciImage.properties

@@ -104,7 +104,7 @@ nonisolated struct CustomSimulation: Codable, Identifiable, Equatable, Sendable 
 /// Lens character for saved cameras (applied after the film).
 nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
     case none, swirl, glow, toy, anamorphic, pinhole
-    case takumar, petzval, proMist, sonnar, dream, fisheye
+    case takumar, petzval, proMist, sonnar, dream, fisheye, tiltShift
     var id: String { rawValue }
     var label: String {
         switch self {
@@ -120,6 +120,7 @@ nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
         case .sonnar: "Sonnar pop"
         case .dream: "Dream lens"
         case .fisheye: "Fisheye"
+        case .tiltShift: "Tilt-shift"
         }
     }
     var detail: String {
@@ -136,6 +137,7 @@ nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
         case .sonnar: "Zeiss Sonnar: micro-contrast 3D pop, smooth falloff"
         case .dream: "Canon 50mm f/0.95: glowing, low contrast, soft swirling corners"
         case .fisheye: "Zenitar 16mm fisheye: bulging barrel distortion, dark rim"
+        case .tiltShift: "Miniature: a sharp band across the scene, blur above and below"
         }
     }
     var symbol: String {
@@ -152,6 +154,7 @@ nonisolated enum LensKind: String, CaseIterable, Identifiable, Sendable {
         case .sonnar: "cube"
         case .dream: "moon.stars"
         case .fisheye: "globe"
+        case .tiltShift: "square.split.1x2"
         }
     }
 }
