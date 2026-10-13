@@ -143,8 +143,11 @@ struct GlassChrome<Shutter: View>: View {
                     .padding(.bottom, 8)
                     .animation(.easeOut(duration: 0.2), value: smartTake.ready)
                     .transition(.opacity)
-                } else if poseGuide.enabled, poseGuide.present, let cue = poseGuide.cue {
-                    Label(cue, systemImage: "figure.stand")
+                } else if poseGuide.enabled, poseGuide.timerArmed || (poseGuide.present && poseGuide.cue != nil) {
+                    Label(poseGuide.timerArmed && !poseGuide.matched
+                            ? "Self-timer · get into pose" + (poseGuide.present ? " — \(poseGuide.cue ?? "")" : "")
+                            : (poseGuide.cue ?? ""),
+                          systemImage: poseGuide.timerArmed ? "timer" : "figure.stand")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(poseGuide.matched ? .green : .white)
                         .padding(.horizontal, 12).padding(.vertical, 7)

@@ -436,6 +436,40 @@ final class PoseGuide {
     nonisolated private static let queue = DispatchQueue(label: "cam.poseguide", qos: .userInitiated)
     nonisolated private static let ctx = CIContext(options: [.cacheIntermediates: false])
 
+    // MARK: Self-timer (hands-free)
+    /// Shutter tap with Pose guide on: 3 s to get into place, then it shoots
+    /// the moment the pose matches — or after 15 s anyway, like a timer.
+    private(set) var timerArmed = false
+    @ObservationIgnored nonisolated(unsafe) private var cachedTimerArmed = false
+    @ObservationIgnored nonisolated(unsafe) private var timerSettleUntil: Double = 0
+    @ObservationIgnored private var timerTask: Task<Void, Never>?
+
+    func toggleTimer(camera: CameraManager) {
+        if timerArmed { disarmTimer(); return }
+        timerArmed = true; cachedTimerArmed = true
+        timerSettleUntil = CACurrentMediaTime() + 3
+        firedForPose = false; matchedSince = nil
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        timerTask?.cancel()
+        timerTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 18_000_000_000)
+            guard let self, !Task.isCancelled, self.timerArmed else { return }
+            self.timerFire(camera: camera)                  // no match in time: shoot anyway
+        }
+    }
+
+    func disarmTimer() {
+        timerArmed = false; cachedTimerArmed = false
+        timerTask?.cancel(); timerTask = nil
+    }
+
+    fileprivate func timerFire(camera: CameraManager) {
+        disarmTimer()
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        if !camera.isCapturing { camera.capturePhoto() }
+        SmartTake.shared.blinkFlash(camera)                   // tells the people in front it fired
+    }
+
     /// Tap on the card: next pose for this kind of shot.
     func next() {
         guard !poses.isEmpty else { return }
@@ -536,11 +570,16 @@ final class PoseGuide {
         // Matched and held ~0.6 s: shoot, then on to the next pose.
         if isMatch {
             if matchedSince == nil { matchedSince = time }
-            if time - matchedSince! > 0.6, !firedForPose {
+            let settling = cachedTimerArmed && CACurrentMediaTime() < timerSettleUntil
+            if time - matchedSince! > 0.6, !firedForPose, !settling {
                 firedForPose = true
+                let armed = cachedTimerArmed
                 DispatchQueue.main.async {
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    if !camera.isCapturing { camera.capturePhoto() }
+                    if armed { PoseGuide.shared.timerFire(camera: camera) }
+                    else {
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        if !camera.isCapturing { camera.capturePhoto() }
+                    }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { PoseGuide.shared.next() }
                 }
             }

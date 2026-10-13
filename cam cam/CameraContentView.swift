@@ -2007,6 +2007,11 @@ struct CameraContentView: View {
                             smartTake.toggleSession()
                             return
                         }
+                        // Pose guide: the shutter arms the hands-free self-timer.
+                        if PoseGuide.shared.enabled {
+                            PoseGuide.shared.toggleTimer(camera: camera)
+                            return
+                        }
                         guard !camera.isCapturing else { return }
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         if camera.doubleExposureEnabled && camera.firstExposurePreview == nil {
