@@ -152,6 +152,31 @@ struct GlassChrome<Shutter: View>: View {
                         .padding(.bottom, 8)
                         .transition(.opacity)
                 } else if frameAdvisor.enabled {
+                    // Film that suits the scene (not shown for the film you're on).
+                    if let film = frameAdvisor.suggestedFilm, camera.selectedSim != film || camera.activeCustomSim != nil {
+                        HStack(spacing: 6) {
+                            Button {
+                                select(.builtIn(film))
+                                frameAdvisor.dismissFilmSuggestion()
+                            } label: {
+                                Label("Try \(film.label)", systemImage: "film")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.black)
+                                    .padding(.horizontal, 11).frame(height: 28)
+                                    .background(Capsule().fill(Color.yellow))
+                            }
+                            .buttonStyle(.plain)
+                            Button { frameAdvisor.dismissFilmSuggestion() } label: {
+                                Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(.white).frame(width: 28, height: 28)
+                            }
+                            .buttonStyle(.plain)
+                            .glassEffect(.regular.interactive(), in: Circle())
+                            .accessibilityLabel("Dismiss suggestion")
+                        }
+                        .padding(.bottom, 6)
+                        .transition(.opacity)
+                    }
                     HStack(spacing: 8) {
                         // Scan: find the best shots in this view.
                         Button { frameAdvisor.scan() } label: {

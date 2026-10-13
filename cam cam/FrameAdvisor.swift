@@ -124,6 +124,15 @@ final class FrameAdvisor {
     @ObservationIgnored nonisolated(unsafe) private var wasAligned = false
     // Scan ("find your shot"): numbered picks, pinned to the scene.
     private(set) var scanning = false
+    /// A film that suits what's in frame (portrait → Portra, night →
+    /// CineStill 800T…), offered as a one-tap chip; nil when none.
+    private(set) var suggestedFilm: FilmSimulation?
+    @ObservationIgnored nonisolated(unsafe) private var kindCandidate: (FilmSimulation, Int)?
+    @ObservationIgnored private var dismissedFilmUntil: [FilmSimulation: Date] = [:]
+    func dismissFilmSuggestion() {
+        if let f = suggestedFilm { dismissedFilmUntil[f] = Date().addingTimeInterval(180) }
+        suggestedFilm = nil
+    }
     private(set) var picks: [CGRect] = []                 // buffer coords, best first
     private(set) var picksAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
     @ObservationIgnored nonisolated(unsafe) private var scanRequested = false
@@ -434,6 +443,7 @@ final class FrameAdvisor {
             }
         }
         suggest(found, tilt: Self.tilt(horizonReq), time: time, aspect: aspect, image: image)
+        updateFilmSuggestion(found: found, horizon: Self.tilt(horizonReq) != nil, camera: camera)
     }
 
     // MARK: Stage 1 — suggest (calm)
@@ -645,6 +655,27 @@ final class FrameAdvisor {
                 try? await Task.sleep(nanoseconds: 20_000_000_000)
                 if a.picksAttitude == attitude, a.stage == .suggesting { a.picks = []; a.picksActive = false; a.hint = nil }
             }
+        }
+    }
+
+    /// Which film suits the scene. Needs the same answer ~3 ticks in a row.
+    nonisolated private func updateFilmSuggestion(found: Subject?, horizon: Bool, camera: CameraManager) {
+        let iso = camera.cachedLiveISO ?? 0
+        let film: FilmSimulation?
+        if iso >= 1600 { film = .cinestill800T }                                     // night / dim
+        else if let d = Self.downAngle(frameAttitude), d < 35 { film = .kodakGold }  // food, table
+        else if let f = found, f.isGroup { film = .kodakPortra }                     // people
+        else if let f = found, !f.comp.isScene, f.comp.minMM >= 24 { film = .kodakGold }   // pets
+        else if found?.comp.isScene == true || (found == nil && horizon) { film = .kodakEktar }  // landscapes
+        else { film = nil }
+        if let f = film, kindCandidate?.0 == f { kindCandidate = (f, kindCandidate!.1 + 1) }
+        else { kindCandidate = film.map { ($0, 1) } }
+        let stable = (kindCandidate?.1 ?? 0) >= 3 ? kindCandidate?.0 : nil
+        Task { @MainActor in
+            let a = FrameAdvisor.shared
+            var next = stable
+            if let f = next, let until = a.dismissedFilmUntil[f], until > Date() { next = nil }
+            if a.suggestedFilm != next { a.suggestedFilm = next }
         }
     }
 
