@@ -23,6 +23,7 @@ struct RegradeView: View {
     @State private var open: String?            // editor
     @State private var viewing: Int?             // full-screen viewer (index into shownIDs)
     @State private var filmFilter: String?       // albums by film
+    @State private var makingSheet = false
     @State private var names: [String: String] = [:]
     private var shownIDs: [String] {
         guard let f = filmFilter else { return assetIDs }
@@ -77,7 +78,18 @@ struct RegradeView: View {
                     Text("\(assetIDs.count) photos").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Color.clear.frame(width: 44, height: 44)
+                // Contact sheet of what's shown (the film filter = one roll).
+                Button { Task { await makeContactSheet() } } label: {
+                    Group {
+                        if makingSheet { ProgressView().tint(.white) }
+                        else { Image(systemName: "film.stack").font(.system(size: 15, weight: .semibold)) }
+                    }
+                    .foregroundStyle(.white).frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Circle())
+                .disabled(shownIDs.isEmpty || makingSheet)
+                .accessibilityLabel("Make a contact sheet")
             }
             .padding(.horizontal, 16).padding(.top, 8).padding(.bottom, 10)
 
@@ -134,6 +146,30 @@ struct RegradeView: View {
             let n = await PhotoSaver.FilmNameLoader.shared.name(for: a)
             names[a.localIdentifier] = n
         }
+    }
+
+    /// A contact print of up to 36 of the shown photos, newest roll order.
+    private func makeContactSheet() async {
+        makingSheet = true; defer { makingSheet = false }
+        let ids = Array(shownIDs.prefix(36)).reversed()           // oldest first, like a roll
+        var frames: [CGImage] = []
+        for id in ids {
+            guard let a = assets[id] else { continue }
+            let img: UIImage? = await withCheckedContinuation { cont in
+                let o = PHImageRequestOptions()
+                o.deliveryMode = .highQualityFormat; o.resizeMode = .exact; o.isNetworkAccessAllowed = true
+                PHImageManager.default().requestImage(for: a, targetSize: CGSize(width: 720, height: 720),
+                                                      contentMode: .aspectFit, options: o) { im, _ in cont.resume(returning: im) }
+            }
+            if let cg = img?.cgImage { frames.append(cg) }
+        }
+        guard !frames.isEmpty else { return }
+        let film = filmFilter ?? (films.count == 1 ? films[0].0 : "cam cam")
+        let date = ids.compactMap { assets[$0]?.creationDate }.max() ?? Date()
+        let data: Data? = await Task.detached(priority: .userInitiated) {
+            ContactSheet.render(frames: frames, film: film, date: date)
+        }.value
+        if let data, let sheet = UIImage(data: data) { InstagramShare.shareSheet(sheet) }
     }
 
     private func filmChip(_ title: String, count: Int, on: Bool, action: @escaping () -> Void) -> some View {
