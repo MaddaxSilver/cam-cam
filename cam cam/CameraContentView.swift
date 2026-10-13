@@ -2202,7 +2202,35 @@ private struct FrameGuideOverlay<Pinch: Gesture>: View {
     @State private var frameAdvisor = FrameAdvisor.shared
 
     var body: some View {
-        if frameAdvisor.enabled, let measured = frameAdvisor.box {
+        if frameAdvisor.enabled, !frameAdvisor.picks.isEmpty, frameAdvisor.stage == .suggesting {
+            // Scan picks: a number to aim at, pinned to the scene.
+            TimelineView(.animation(minimumInterval: 1.0 / 60)) { _ in
+                let a = frameAdvisor.imageAspect
+                let dispW = max(pw, ph * a), dispH = max(ph, pw / a)
+                let ox = (pw - dispW) / 2, oy = (ph - dispH) / 2
+                ZStack {
+                    ForEach(Array(frameAdvisor.picks.enumerated()), id: \.offset) { i, pick in
+                        let b = SceneMotion.reproject(pick, from: frameAdvisor.picksAttitude, to: SceneMotion.attitude,
+                                                      fovLong: frameAdvisor.fovLong, aspect: Double(a))
+                        let r = CGRect(x: ox + b.minX * dispW, y: oy + b.minY * dispH,
+                                       width: b.width * dispW, height: b.height * dispH)
+                        Rectangle().stroke(Color.yellow.opacity(i == 0 ? 0.55 : 0.3), lineWidth: 1)
+                            .frame(width: r.width, height: r.height)
+                            .position(x: r.midX, y: r.midY)
+                            .allowsHitTesting(false)
+                        Text("\(i + 1)")
+                            .font(.system(size: 17, weight: .bold, design: .rounded))
+                            .foregroundStyle(i == 0 ? .black : .white)
+                            .frame(width: 38, height: 38)
+                            .background(Circle().fill(i == 0 ? Color.yellow : Color.black.opacity(0.45)))
+                            .overlay(Circle().stroke(Color.yellow, lineWidth: 1.5))
+                            .contentShape(Circle().inset(by: -10))
+                            .onTapGesture { frameAdvisor.lockPick(i, camera: camera) }
+                            .position(x: r.midX, y: r.midY)
+                    }
+                }
+            }
+        } else if frameAdvisor.enabled, let measured = frameAdvisor.box {
             TimelineView(.animation(minimumInterval: 1.0 / 60)) { _ in
                 let a = frameAdvisor.imageAspect
                 let box = SceneMotion.reproject(measured, from: frameAdvisor.boxAttitude,

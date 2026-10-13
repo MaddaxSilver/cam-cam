@@ -118,6 +118,12 @@ final class FrameAdvisor {
     /// The lock wanted to go wider than this lens allows (suggest the 13 mm).
     @ObservationIgnored nonisolated(unsafe) private var lensLimited = false
     @ObservationIgnored nonisolated(unsafe) private var resetShown = false
+    // Scan ("find your shot"): numbered picks, pinned to the scene.
+    private(set) var scanning = false
+    private(set) var picks: [CGRect] = []                 // buffer coords, best first
+    private(set) var picksAttitude = simd_quatd(ix: 0, iy: 0, iz: 0, r: 1)
+    @ObservationIgnored nonisolated(unsafe) private var scanRequested = false
+    @ObservationIgnored nonisolated(unsafe) private var picksActive = false
     // Scene framing
     @ObservationIgnored nonisolated(unsafe) private var sceneWhy = ""
     @ObservationIgnored nonisolated(unsafe) private var sceneLock: CGRect?          // expected box after the zoom
@@ -364,6 +370,16 @@ final class FrameAdvisor {
         }
 
         try? handler.perform([horizonReq])
+        if scanRequested {
+            scanRequested = false
+            // Tighter crops than the passive suggestion (up to 5×), top three.
+            let r = SceneFraming.top(handler: handler, image: image, context: Self.ciContext,
+                                     minScale: 0.2, n: 3, margin: 0.1)
+            let a = frameAngle
+            publishPicks(r.map { Self.toBuffer($0.view, angle: a) }, attitude: frameAttitude)
+            return
+        }
+        if picksActive { publish(box: nil, stage: .suggesting, hint: nil, aspect: aspect); return }
         var found = Self.detect(handler, preferCentre: false)
         // Landscapes, coastlines, skylines: no person or pet in frame (and
         // either nothing found or just a generic object in a scene with a
@@ -561,6 +577,52 @@ final class FrameAdvisor {
         let g = rigid ? rigidPulse : softPulse
         g.impactOccurred(intensity: intensity)
         g.prepare()
+    }
+
+    /// Scan: look over the whole view and pin up to three numbered framings
+    /// to aim at (the iPhone 18 "finding your shot" idea).
+    func scan() {
+        guard enabled else { return }
+        if stage != .suggesting { unlock() }
+        picks = []; picksActive = false
+        scanning = true; hint = "Finding your shot…"
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        let started = CACurrentMediaTime()
+        scanStarted = started
+        scanRequested = true
+    }
+    @ObservationIgnored private var scanStarted: Double = 0
+
+    /// Tap on a numbered pick: zoom to it and guide you there.
+    func lockPick(_ i: Int, camera: CameraManager) {
+        guard picks.indices.contains(i) else { return }
+        let now = SceneMotion.attitude
+        let b = SceneMotion.reproject(picks[i], from: picksAttitude, to: now, fovLong: fovLong, aspect: Double(imageAspect))
+        shown = Self.toUpright(b, angle: cachedAngle); shownAttitude = now
+        var c = Composition(); c.fill = 0.97; c.isScene = true
+        lastComp = c; shownComp = c
+        box = b
+        picks = []; picksActive = false
+        lock(camera: camera)
+    }
+
+    nonisolated private func publishPicks(_ rects: [CGRect], attitude: simd_quatd) {
+        Task { @MainActor in
+            let a = FrameAdvisor.shared
+            // Let "Finding your shot…" read for a moment.
+            let wait = max(0, 0.9 - (CACurrentMediaTime() - a.scanStarted))
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1e9))
+            guard a.scanning else { return }
+            a.scanning = false
+            a.picks = rects; a.picksAttitude = attitude; a.picksActive = !rects.isEmpty
+            a.hint = rects.isEmpty ? "Nothing better in this view — try another" : "Aim at a number and tap it"
+            UINotificationFeedbackGenerator().notificationOccurred(rects.isEmpty ? .warning : .success)
+            if !rects.isEmpty {
+                // Picks fade after 20 s.
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                if a.picksAttitude == attitude, a.stage == .suggesting { a.picks = []; a.picksActive = false; a.hint = nil }
+            }
+        }
     }
 
     /// After a zoom: detect the subject again and track it from there.
@@ -788,7 +850,7 @@ final class FrameAdvisor {
                 || a.lastComp.minMM != comp.minMM || a.lastComp.cutOff != comp.cutOff { a.lastComp = comp }
             if a.box != box { a.boxAttitude = att; a.box = box }
             if (a.cachedLocked || stage == .suggesting), a.stage != stage { a.stage = stage }
-            if a.hint != hint { a.hint = hint }
+            if a.hint != hint, !(a.picksActive || a.scanning) || hint != nil { a.hint = hint }
         }
     }
 }

@@ -151,14 +151,29 @@ struct GlassChrome<Shutter: View>: View {
                         .glassEffect(.regular, in: Capsule())
                         .padding(.bottom, 8)
                         .transition(.opacity)
-                } else if frameAdvisor.enabled, let hint = frameAdvisor.hint {
-                    Label(hint, systemImage: "viewfinder")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .glassEffect(.regular, in: Capsule())
-                        .padding(.bottom, 8)
-                        .transition(.opacity)
+                } else if frameAdvisor.enabled {
+                    HStack(spacing: 8) {
+                        // Scan: find the best shots in this view.
+                        Button { frameAdvisor.scan() } label: {
+                            Image(systemName: frameAdvisor.scanning ? "sparkle.magnifyingglass" : "sparkles")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.yellow)
+                                .symbolEffect(.pulse, isActive: frameAdvisor.scanning)
+                                .frame(width: 34, height: 34)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: Circle())
+                        .accessibilityLabel("Scan for the best shot")
+                        if let hint = frameAdvisor.hint {
+                            Label(hint, systemImage: "viewfinder")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12).padding(.vertical, 7)
+                                .glassEffect(.regular, in: Capsule())
+                                .transition(.opacity)
+                        }
+                    }
+                    .padding(.bottom, 8)
                 }
                 // The lens pill sits in the dial, under the film names: the
                 // dial turns behind it, the pill stays put (and takes its own

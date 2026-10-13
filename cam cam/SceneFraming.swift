@@ -92,7 +92,13 @@ nonisolated enum SceneFraming {
     /// - minScale: smallest view (1 / max zoom allowed from here).
     static func best(handler: VNImageRequestHandler, image: CIImage, context: CIContext,
                      minScale: CGFloat = 0.3) -> Result? {
-        guard let sal = saliencyGrid(handler) else { return nil }
+        top(handler: handler, image: image, context: context, minScale: minScale, n: 1, margin: 0.18).first
+    }
+
+    /// Up to `n` distinct framings, best first (for "Scan": numbered picks).
+    static func top(handler: VNImageRequestHandler, image: CIImage, context: CIContext,
+                    minScale: CGFloat, n: Int, margin: Double) -> [Result] {
+        guard let sal = saliencyGrid(handler) else { return [] }
         let horizon = horizonPlacement(image, context: context)
         let objReq = VNGenerateObjectnessBasedSaliencyImageRequest()
         try? handler.perform([objReq])
@@ -100,12 +106,12 @@ nonisolated enum SceneFraming {
             .filter { $0.confidence > 0.4 }
             .map { CGRect(x: $0.boundingBox.minX, y: 1 - $0.boundingBox.maxY,
                           width: $0.boundingBox.width, height: $0.boundingBox.height) }
-        return choose(sal: sal, g: 32, horizon: horizon, objects: objects, minScale: minScale)
+        return choose(sal: sal, g: 32, horizon: horizon, objects: objects, minScale: minScale, n: n, margin: margin)
     }
 
     /// The scoring, separated from Vision so it can be unit-tested.
     static func choose(sal: [Double], g: Int, horizon: (y: CGFloat, skyBusier: Bool)?,
-                       objects: [CGRect], minScale: CGFloat) -> Result? {
+                       objects: [CGRect], minScale: CGFloat, n: Int = 1, margin: Double = 0.18) -> [Result] {
         func mass(_ r: CGRect) -> Double {
             let x0 = max(0, Int((r.minX * CGFloat(g)).rounded(.down))), x1 = min(g, Int((r.maxX * CGFloat(g)).rounded(.up)))
             let y0 = max(0, Int((r.minY * CGFloat(g)).rounded(.down))), y1 = min(g, Int((r.maxY * CGFloat(g)).rounded(.up)))
@@ -171,7 +177,7 @@ nonisolated enum SceneFraming {
 
         let full = CGRect(x: 0, y: 0, width: 1, height: 1)
         let (fullScore, _) = score(full)
-        var best: (CGRect, Double, String)?
+        var all: [(CGRect, Double, String)] = []
         // Up to 75% of the view (a 1.33× zoom): bigger "crops" were barely a
         // change and drew a box over nearly the whole screen.
         var sc: CGFloat = 0.75
@@ -183,16 +189,25 @@ nonisolated enum SceneFraming {
                 while x <= 1 - sc + 1e-6 {
                     let r = CGRect(x: x, y: y, width: sc, height: sc)
                     let (s, why) = score(r)
-                    if best == nil || s > best!.1 { best = (r, s, why) }
+                    all.append((r, s, why))
                     x += step
                 }
                 y += step
             }
             sc -= 0.1
         }
-        // Only suggest a crop that's clearly better than what you have.
-        guard let b = best, b.1 > fullScore + 0.18 else { return nil }
-        return Result(view: b.0, why: b.2.isEmpty ? "tighter framing" : b.2, score: b.1, fullScore: fullScore)
+        // Only crops clearly better than what you have; distinct from each other.
+        var picks: [Result] = []
+        for c in all.sorted(by: { $0.1 > $1.1 }) where c.1 > fullScore + margin {
+            let overlaps = picks.contains { p in
+                let i = p.view.intersection(c.0)
+                return !i.isNull && (i.width * i.height) / min(p.view.width * p.view.height, c.0.width * c.0.height) > 0.35
+            }
+            if overlaps { continue }
+            picks.append(Result(view: c.0, why: c.2.isEmpty ? "tighter framing" : c.2, score: c.1, fullScore: fullScore))
+            if picks.count >= n { break }
+        }
+        return picks
     }
 
     /// The interest runs off the edges of the full view: a wider lens would help.
