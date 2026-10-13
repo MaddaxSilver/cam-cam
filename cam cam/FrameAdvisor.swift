@@ -118,6 +118,10 @@ final class FrameAdvisor {
     /// The lock wanted to go wider than this lens allows (suggest the 13 mm).
     @ObservationIgnored nonisolated(unsafe) private var lensLimited = false
     @ObservationIgnored nonisolated(unsafe) private var resetShown = false
+    @ObservationIgnored nonisolated(unsafe) private var sdx: CGFloat = 0
+    @ObservationIgnored nonisolated(unsafe) private var sdy: CGFloat = 0
+    @ObservationIgnored nonisolated(unsafe) private var sTilt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var wasAligned = false
     // Scan ("find your shot"): numbered picks, pinned to the scene.
     private(set) var scanning = false
     private(set) var picks: [CGRect] = []                 // buffer coords, best first
@@ -157,6 +161,7 @@ final class FrameAdvisor {
         alignedSince = nil; lostSince = nil; fired = false
         tracked = nil; tracker = nil
         offFillSince = nil; zoomSteps = 0
+        sdx = 0; sdy = 0; sTilt = 0; wasAligned = false
         if let img = lastUpright, let u = shown { lockContext = (img, u) } else { lockContext = nil }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         preLockMM = camera.currentMM; lastZoomTargetMM = nil; lockCamera = camera; lensLimited = false
@@ -501,10 +506,14 @@ final class FrameAdvisor {
         // on its target (thirds, headroom, lead room).
         let c = f.comp
         let ax = b.minX + c.anchor.x * b.width, ay = b.minY + c.anchor.y * b.height
-        let dx = ax - c.target.x, dy = ay - c.target.y
+        // Smoothed (hand shake and tracker jitter made the guidance twitch).
+        let rdx = ax - c.target.x, rdy = ay - c.target.y
+        sdx = sdx * 0.6 + rdx * 0.4; sdy = sdy * 0.6 + rdy * 0.4
+        let dx = sdx, dy = sdy
         let fill = max(b.width, b.height)
         let fillErr = fill - Self.targetFill
-        let tiltErr = tilt ?? 0
+        sTilt = sTilt * 0.6 + (tilt ?? 0) * 0.4
+        let tiltErr = sTilt
         // Keep the size right as the subject moves closer / further (or the
         // lock's first zoom wasn't enough): re-zoom after it's been off ~1 s.
         if !c.isScene, (fillErr > 0.18 || fill > 0.97 || fillErr < -0.3), zoomSteps < 3, time - lastZoomAt > 2 {
@@ -521,8 +530,12 @@ final class FrameAdvisor {
                 }
             }
         } else { offFillSince = nil }
-        let centred = abs(dx) < 0.05 && abs(dy) < 0.065
-        let level = abs(tiltErr) < 1.0
+        // Looser, with hysteresis: once lined up it stays lined up until you
+        // drift clearly out (was 5% / 6.5% / 1°, flipping on every wobble).
+        let k: CGFloat = wasAligned ? 1.5 : 1
+        let centred = abs(dx) < 0.08 * k && abs(dy) < 0.1 * k
+        let level = abs(tiltErr) < 2.0 * Double(k)
+        wasAligned = centred && level
         let aligned = centred && level
 
         var tip: String
@@ -535,9 +548,9 @@ final class FrameAdvisor {
         if aligned {
             if alignedSince == nil { alignedSince = time }
             // Holding on target: quick firm ticks until it fires.
-            if time - lastPulse >= 0.06 {
+            if time - lastPulse >= 0.1 {
                 lastPulse = time
-                DispatchQueue.main.async { FrameAdvisor.pulse(1, rigid: true) }
+                DispatchQueue.main.async { FrameAdvisor.pulse(0.8, rigid: true) }
             }
             if time - alignedSince! > 0.4, !fired {
                 fired = true
@@ -558,11 +571,11 @@ final class FrameAdvisor {
             alignedSince = nil
             // Haptic guidance, never silent while guiding: a steady pulse that
             // quickens and firms up as you get closer (like a metal detector).
-            let err = min(1, Double(abs(dx) + abs(dy)) * 2.2 + abs(tiltErr) / 8)
-            let interval = 0.07 + 0.28 * err
+            let err = min(1, Double(abs(dx) + abs(dy)) * 1.6 + abs(tiltErr) / 12)
+            let interval = 0.1 + 0.35 * err
             if time - lastPulse >= interval {
                 lastPulse = time
-                let strength = CGFloat(0.55 + 0.45 * (1 - err))
+                let strength = CGFloat(0.45 + 0.35 * (1 - err))
                 DispatchQueue.main.async { FrameAdvisor.pulse(strength) }
             }
             publish(box: b, stage: .locked, hint: tip, aspect: aspect)
