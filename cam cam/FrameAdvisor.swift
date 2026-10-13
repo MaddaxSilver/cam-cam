@@ -348,10 +348,12 @@ final class FrameAdvisor {
         if resetShown { resetShown = false; shown = nil; rival = nil; tracked = nil; lastScene = nil }
         let horizonReq = VNDetectHorizonRequest()
         let handler = VNImageRequestHandler(ciImage: image)
+        // Pointing down at a table/food: no horizon to level to.
+        let flatNow = (Self.downAngle(frameAttitude) ?? 90) < 35
 
         if cachedLocked {
             try? handler.perform([horizonReq])
-            let tilt = Self.tilt(horizonReq)
+            let tilt = flatNow ? nil : Self.tilt(horizonReq)
             // Scene: no tracking — the view is pinned to the scene with the
             // gyro, and you aim the phone until it fills the frame.
             if let sl = sceneLock {
@@ -388,11 +390,12 @@ final class FrameAdvisor {
         }
 
         try? handler.perform([horizonReq])
+        let horizonTilt = flatNow ? nil : Self.tilt(horizonReq)
         if scanRequested {
             scanRequested = false
             // Tighter crops than the passive suggestion (up to 5×), top three.
             let r = SceneFraming.top(handler: handler, image: image, context: Self.ciContext,
-                                     minScale: 0.2, n: 3, margin: 0.1)
+                                     minScale: 0.2, n: 3, margin: 0.1, useHorizon: !flatNow)
             let a = frameAngle
             publishPicks(r.map { Self.toBuffer($0.view, angle: a) }, attitude: frameAttitude)
             return
@@ -403,11 +406,11 @@ final class FrameAdvisor {
         // either nothing found or just a generic object in a scene with a
         // horizon) — suggest the best framing of the whole scene instead.
         // Re-scored every ~0.9 s; between scorings the last one rides the gyro.
-        if found == nil || (found!.comp.isObject && Self.tilt(horizonReq) != nil) {
+        if found == nil || (found!.comp.isObject && horizonTilt != nil) {
             if time - lastSceneAt > 0.9 {
                 lastSceneAt = time
                 lastScene = nil
-                if let r = SceneFraming.best(handler: handler, image: image, context: Self.ciContext) {
+                if let r = SceneFraming.best(handler: handler, image: image, context: Self.ciContext, useHorizon: !flatNow) {
                     var c = Composition()
                     c.anchor = CGPoint(x: 0.5, y: 0.5); c.target = CGPoint(x: 0.5, y: 0.5)
                     c.fill = 0.97; c.isScene = true
@@ -442,8 +445,8 @@ final class FrameAdvisor {
                 learned = (f.box, f.comp, time)
             }
         }
-        suggest(found, tilt: Self.tilt(horizonReq), time: time, aspect: aspect, image: image)
-        updateFilmSuggestion(found: found, horizon: Self.tilt(horizonReq) != nil, camera: camera)
+        suggest(found, tilt: horizonTilt, time: time, aspect: aspect, image: image)
+        updateFilmSuggestion(found: found, horizon: horizonTilt != nil, camera: camera)
     }
 
     // MARK: Stage 1 — suggest (calm)
@@ -552,15 +555,21 @@ final class FrameAdvisor {
         // drift clearly out (was 5% / 6.5% / 1°, flipping on every wobble).
         let k: CGFloat = wasAligned ? 1.5 : 1
         let centred = abs(dx) < 0.08 * k && abs(dy) < 0.1 * k
-        let level = abs(tiltErr) < 2.0 * Double(k)
+        let flat = (Self.downAngle(frameAttitude) ?? 90) < 35
+        let down = Self.downAngle(frameAttitude) ?? 0
+        // Overhead: "level" means parallel to the table.
+        let level = flat ? down < 6 * Double(k) : abs(tiltErr) < 2.0 * Double(k)
         wasAligned = centred && level
         let aligned = centred && level
 
         var tip: String
         if lensLimited && fill > 0.9 { tip = "Step back, or switch to 13mm to fit everyone" }
+        else if !level, flat { tip = String(format: "Hold it flat — %.0f°", down) }
         else if !level { tip = String(format: "Tilt %.0f° %@", max(1, abs(tiltErr)), tiltErr > 0 ? "right" : "left") }
         else if !centred {
-            tip = abs(dx) >= abs(dy) ? (dx < 0 ? "Move left" : "Move right") : (dy < 0 ? "Tilt up" : "Tilt down")
+            tip = abs(dx) >= abs(dy) ? (dx < 0 ? "Move left" : "Move right")
+                : flat ? (dy < 0 ? "Move up" : "Move down")      // overhead: slide, don't tilt
+                : (dy < 0 ? "Tilt up" : "Tilt down")
         } else { tip = "Hold it…" }
 
         if aligned {

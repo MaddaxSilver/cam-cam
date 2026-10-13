@@ -91,15 +91,17 @@ nonisolated enum SceneFraming {
     /// Best framing of the scene, or nil when the full view is already best.
     /// - minScale: smallest view (1 / max zoom allowed from here).
     static func best(handler: VNImageRequestHandler, image: CIImage, context: CIContext,
-                     minScale: CGFloat = 0.3) -> Result? {
-        top(handler: handler, image: image, context: context, minScale: minScale, n: 1, margin: 0.18).first
+                     minScale: CGFloat = 0.3, useHorizon: Bool = true) -> Result? {
+        top(handler: handler, image: image, context: context, minScale: minScale, n: 1, margin: 0.18,
+            useHorizon: useHorizon).first
     }
 
     /// Up to `n` distinct framings, best first (for "Scan": numbered picks).
     static func top(handler: VNImageRequestHandler, image: CIImage, context: CIContext,
-                    minScale: CGFloat, n: Int, margin: Double) -> [Result] {
+                    minScale: CGFloat, n: Int, margin: Double, useHorizon: Bool = true) -> [Result] {
         guard let sal = saliencyGrid(handler) else { return [] }
-        let horizon = horizonPlacement(image, context: context)
+        // Looking down at a table there's no horizon (only a phantom edge).
+        let horizon = useHorizon ? horizonPlacement(image, context: context) : nil
         let objReq = VNGenerateObjectnessBasedSaliencyImageRequest()
         try? handler.perform([objReq])
         let objects = ((objReq.results?.first as? VNSaliencyImageObservation)?.salientObjects ?? [])
