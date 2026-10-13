@@ -20,7 +20,8 @@ struct RegradeView: View {
     @State private var assetIDs: [String] = []
     @State private var assets: [String: PHAsset] = [:]
     @State private var loaded = false
-    @State private var open: String?
+    @State private var open: String?            // editor
+    @State private var viewing: Int?             // full-screen viewer (index into assetIDs)
 
     var body: some View {
         ZStack {
@@ -28,12 +29,22 @@ struct RegradeView: View {
             if let id = open {
                 RegradeDetail(assetID: id, camera: camera, customSimStore: customSimStore,
                               onBack: { open = nil })
-                    .transition(.move(edge: .trailing))
+                    .transition(.move(edge: .bottom))
+            } else if let i = viewing {
+                PhotoViewer(ids: assetIDs, assets: assets, index: i,
+                            onClose: { viewing = nil },
+                            onEdit: { id in viewing = assetIDs.firstIndex(of: id); open = id },
+                            onDeleted: { id in
+                                assetIDs.removeAll { $0 == id }
+                                if assetIDs.isEmpty { viewing = nil } else { viewing = min(i, assetIDs.count - 1) }
+                            })
+                    .transition(.opacity)
             } else {
                 grid.transition(.move(edge: .leading))
             }
         }
         .animation(.snappy(duration: 0.3), value: open)
+        .animation(.easeOut(duration: 0.2), value: viewing)
         .preferredColorScheme(.dark)
         .task { await load() }
     }
@@ -72,7 +83,7 @@ struct RegradeView: View {
                 ScrollView {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 2) {
                         ForEach(assetIDs, id: \.self) { id in
-                            Button { open = id } label: { AssetThumb(assetID: id, asset: assets[id]) }
+                            Button { viewing = assetIDs.firstIndex(of: id) } label: { AssetThumb(assetID: id, asset: assets[id]) }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -163,6 +174,9 @@ private struct RegradeDetail: View {
     @State private var message: String?
     @State private var comparing = false
     @State private var tones = FilmToneStore.shared
+    @State private var thumbBase: CIImage?
+    @State private var originalThumbUI: UIImage?
+    @State private var thumbs: [String: UIImage] = [:]
 
     private var items: [ArcItem] {
         FilmSimulation.allCases.map(ArcItem.builtIn) + customSimStore.simulations.map(ArcItem.custom)
@@ -220,28 +234,54 @@ private struct RegradeDetail: View {
                         .transition(.opacity)
                 }
 
-                FilmArc(items: items, selectedKey: selectedKey,
-                        onSelect: { item in
-                            if let c = item.custom { recipe.custom = c; recipe.sim = .none }
-                            else if let s = item.sim { recipe.sim = s; recipe.custom = nil }
-                        },
-                        onOpenLibrary: {})
+                // Looks: the photo itself in each film (like a camera roll editor).
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(spacing: 10) {
+                            LookThumb(label: "Original", image: originalThumbUI,
+                                      selected: recipe.sim == .none && recipe.custom == nil)
+                                .onTapGesture { recipe.sim = .none; recipe.custom = nil }
+                                .id("original")
+                            ForEach(items, id: \.key) { item in
+                                LookThumb(label: item.label, image: thumbs[item.key], selected: item.key == selectedKey)
+                                    .id(item.key)
+                                    .onTapGesture {
+                                        UISelectionFeedbackGenerator().selectionChanged()
+                                        if let c = item.custom { recipe.custom = c; recipe.sim = .none }
+                                        else if let sim = item.sim { recipe.sim = sim; recipe.custom = nil }
+                                    }
+                                    .task(id: item.key) { await renderThumb(item) }
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                    }
+                    .frame(height: 104)
+                    .onAppear { proxy.scrollTo(selectedKey, anchor: .center) }
+                }
+                .padding(.bottom, 6)
 
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     Button { Task { await revert() } } label: {
-                        Text("Original").font(.system(size: 16, weight: .semibold))
+                        Image(systemName: "arrow.uturn.backward").font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.white).frame(width: 50, height: 50)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: Circle())
+                    .disabled(oldRecipe == nil)
+                    .opacity(oldRecipe == nil ? 0.4 : 1)
+                    .accessibilityLabel("Back to the original")
+
+                    Button(action: onBack) {
+                        Text("Cancel").font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(.white).padding(.horizontal, 22).frame(height: 50)
                     }
                     .buttonStyle(.plain)
                     .glassEffect(.regular.interactive(), in: Capsule())
-                    .disabled(oldRecipe == nil)
-                    .opacity(oldRecipe == nil ? 0.4 : 1)
 
-                    Button { Task { await apply() } } label: {
-                        Text(recipe == oldRecipe ? "Applied" : "Apply \(recipe.displayName)")
+                    Button { Task { await apply(); if message?.hasPrefix("Now") == true { onBack() } } } label: {
+                        Label(recipe == oldRecipe ? "Saved" : "Save", systemImage: "checkmark")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(.black)
-                            .lineLimit(1).minimumScaleFactor(0.8)
                             .frame(maxWidth: .infinity).frame(height: 50)
                             .background(Capsule().fill(Color.yellow))
                     }
@@ -295,6 +335,12 @@ private struct RegradeDetail: View {
         guard let (small, ui) = loaded else { message = "Couldn't open this photo"; return }
         original = small
         originalUI = ui
+        // A tiny copy for the looks strip.
+        let ts = 200 / max(small.extent.width, small.extent.height)
+        let tb = small.transformed(by: CGAffineTransform(scaleX: ts, y: ts))
+        if let cg = camera.photoContext.createCGImage(tb, from: tb.extent) {
+            thumbBase = CIImage(cgImage: cg); originalThumbUI = UIImage(cgImage: cg)
+        }
         if let adj = input.adjustmentData, adj.formatIdentifier == ShotRecipe.formatIdentifier {
             oldRecipe = ShotRecipe.decode(adj.data)
         } else {
@@ -306,6 +352,22 @@ private struct RegradeDetail: View {
 
     /// One render at a time; changes made meanwhile render once it's done
     /// (flicking through films used to queue a full render per change).
+    /// One look's thumbnail (rendered off the main thread on the photo context).
+    private func renderThumb(_ item: ArcItem) async {
+        guard thumbs[item.key] == nil else { return }
+        while thumbBase == nil { try? await Task.sleep(nanoseconds: 50_000_000); if Task.isCancelled { return } }
+        guard let base = thumbBase else { return }
+        var r = oldRecipe ?? ShotRecipe()
+        if let c = item.custom { r.custom = c; r.sim = .none } else if let sim = item.sim { r.sim = sim; r.custom = nil }
+        r.grainEnabled = false                    // grain is noise at this size
+        nonisolated(unsafe) let cam = camera
+        let img: UIImage? = await Task.detached(priority: .utility) {
+            let out = cam.renderLook(base, recipe: r, flatten: false).cropped(to: base.extent)
+            return cam.photoContext.createCGImage(out, from: out.extent).map { UIImage(cgImage: $0) }
+        }.value
+        if let img { thumbs[item.key] = img }
+    }
+
     private func renderPreview() {
         guard let original else { return }
         if rendering { renderAgain = true; return }
@@ -359,3 +421,152 @@ private struct RegradeDetail: View {
         }
     }
 }
+
+// MARK: - Look thumbnail (editor strip)
+
+private struct LookThumb: View {
+    let label: String
+    let image: UIImage?
+    let selected: Bool
+    var body: some View {
+        VStack(spacing: 5) {
+            ZStack {
+                Color.white.opacity(0.06)
+                if let image { Image(uiImage: image).resizable().scaledToFill() }
+                else { ProgressView().controlSize(.small).tint(.white.opacity(0.6)) }
+            }
+            .frame(width: 62, height: 78)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(selected ? Color.yellow : .white.opacity(0.12), lineWidth: selected ? 2.5 : 1))
+            Text(label.uppercased())
+                .font(.system(size: 9, weight: .bold)).tracking(0.4)
+                .foregroundStyle(selected ? .yellow : .white.opacity(0.75))
+                .lineLimit(1).frame(width: 70)
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+// MARK: - Full-screen viewer
+
+private struct PhotoViewer: View {
+    let ids: [String]
+    let assets: [String: PHAsset]
+    @State var index: Int
+    var onClose: () -> Void
+    var onEdit: (String) -> Void
+    var onDeleted: (String) -> Void
+    @State private var images: [String: UIImage] = [:]
+    @State private var chrome = true
+
+    private var currentID: String? { ids.indices.contains(index) ? ids[index] : nil }
+    private var asset: PHAsset? { currentID.flatMap { assets[$0] } }
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            TabView(selection: $index) {
+                ForEach(Array(ids.enumerated()), id: \.element) { i, id in
+                    ZStack {
+                        if let img = images[id] { Image(uiImage: img).resizable().scaledToFit() }
+                        else { ProgressView().tint(.white) }
+                    }
+                    .tag(i)
+                    .task { await load(id) }
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+            .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { chrome.toggle() } }
+
+            if chrome {
+                VStack {
+                    HStack {
+                        Button(action: onClose) {
+                            Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold))
+                                .foregroundStyle(.white).frame(width: 44, height: 44)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: Circle())
+                        .accessibilityLabel("Back to photos")
+                        Spacer()
+                        VStack(spacing: 1) {
+                            Text(dateText).font(.system(size: 15, weight: .semibold))
+                            if let film { Text(film.uppercased()).font(.system(size: 10, weight: .bold)).tracking(0.6)
+                                .foregroundStyle(.yellow) }
+                        }
+                        Spacer()
+                        Button(role: .destructive) { Task { await delete() } } label: {
+                            Image(systemName: "trash").font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.white).frame(width: 44, height: 44)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: Circle())
+                        .accessibilityLabel("Delete photo")
+                    }
+                    .padding(.horizontal, 16).padding(.top, 8)
+                    Spacer()
+                    HStack(spacing: 14) {
+                        if let id = currentID, let img = images[id] {
+                            ShareLink(item: Image(uiImage: img), preview: SharePreview("Photo", image: Image(uiImage: img))) {
+                                Image(systemName: "square.and.arrow.up").font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(.white).frame(width: 52, height: 52)
+                            }
+                            .glassEffect(.regular.interactive(), in: Circle())
+                        }
+                        Button { if let id = currentID { onEdit(id) } } label: {
+                            Label("Edit", systemImage: "slider.horizontal.3")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 28).frame(height: 52)
+                                .background(Capsule().fill(Color.white))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.bottom, 24)
+                }
+                .transition(.opacity)
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private var film: String? {
+        guard let id = currentID, let n = PhotoSaver.cachedFilmName(id), !n.isEmpty else { return nil }
+        return n
+    }
+    private var dateText: String {
+        guard let d = asset?.creationDate else { return "" }
+        let f = DateFormatter()
+        f.dateFormat = Calendar.current.isDate(d, equalTo: Date(), toGranularity: .year) ? "MMM d · h:mm a" : "MMM d, yyyy"
+        return f.string(from: d)
+    }
+
+    private func load(_ id: String) async {
+        guard images[id] == nil, let a = assets[id] ?? PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
+        else { return }
+        let opts = PHImageRequestOptions()
+        opts.deliveryMode = .opportunistic; opts.isNetworkAccessAllowed = true
+        let side = UIScreen.main.bounds.height * UIScreen.main.scale
+        AssetThumbImages.manager.requestImage(for: a, targetSize: CGSize(width: side, height: side),
+                                              contentMode: .aspectFit, options: opts) { img, _ in
+            if let img { images[id] = img }
+        }
+    }
+
+    private func delete() async {
+        guard let id = currentID, let a = asset else { return }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.deleteAssets([a] as NSArray)    // iOS asks to confirm
+            }
+            onDeleted(id)
+        } catch {}
+    }
+}
+
+private enum AssetThumbImages { static let manager = PHCachingImageManager() }
