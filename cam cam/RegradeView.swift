@@ -445,6 +445,21 @@ private struct PhotoViewer: View {
                             }
                             .glassEffect(.regular.interactive(), in: Circle())
                         }
+                        if let id = currentID, let img = images[id] {
+                            Menu {
+                                Button { if !InstagramShare.postToFeed(assetID: id) { InstagramShare.shareSheet(img) } } label: {
+                                    Label("Post to feed", systemImage: "square.grid.3x3")
+                                }
+                                Button { if !InstagramShare.shareToStory(img) { InstagramShare.shareSheet(img) } } label: {
+                                    Label("Add to story", systemImage: "circle.dashed")
+                                }
+                            } label: {
+                                Image(systemName: "camera.circle").font(.system(size: 19, weight: .semibold))
+                                    .foregroundStyle(.white).frame(width: 52, height: 52)
+                            }
+                            .glassEffect(.regular.interactive(), in: Circle())
+                            .accessibilityLabel("Share to Instagram")
+                        }
                         Button { if let id = currentID { onEdit(id) } } label: {
                             Label("Edit", systemImage: "slider.horizontal.3")
                                 .font(.system(size: 16, weight: .semibold))
