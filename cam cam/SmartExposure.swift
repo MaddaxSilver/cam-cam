@@ -103,6 +103,8 @@ final class SmartExposure {
     /// Called for every video frame; meters ~7 times a second.
     nonisolated private static let aeQueue = DispatchQueue(label: "cam.smartae", qos: .userInitiated)
     @ObservationIgnored nonisolated(unsafe) private var aeBusy = false
+    /// AUTO mode: how far exposure is pulled down for a bright subject on dark.
+    @ObservationIgnored nonisolated(unsafe) private var autoProtect: Float = 0
 
     /// Called for every video frame. Metering reads its grid back from the
     /// GPU, which waits whenever the GPU is busy (a photo rendering): done on
@@ -145,9 +147,30 @@ final class SmartExposure {
         // AUTO (Smart AE off): Apple's exposure, corrected only for the film.
         guard cachedEnabled else {
             if smart != 0 { smart = 0 }
-            apply(bias: camera.cachedUserBias - lookOffset, camera: camera)
-            let status = abs(lookOffset) >= 0.05 ? String(format: "Film %+.1f EV", -lookOffset) : ""
-            if status != lastStatus { lastStatus = status; publish(status: status, correction: -lookOffset) }
+            // Apple's auto averages the frame: a bright subject on a dark
+            // background gets blown out. Pull exposure down for that case only.
+            let frame = CIImage(cvPixelBuffer: pixelBuffer)
+            if abs(device.exposureTargetOffset) < 0.3, let grid = Self.lumaGrid(frame) {
+                if time - lastSaliency > 0.5 { lastSaliency = time; updateSaliency(frame) }
+                camera.cachedFrameLuma = pow(grid.reduce(0, +) / Float(max(grid.count, 1)), 1 / 2.2)
+                var target: Float = 0
+                if let sal = saliency {
+                    var sw: Float = 0, sl: Float = 0
+                    for i in grid.indices { let w2 = sal[i] * sal[i]; sw += w2; sl += w2 * grid[i] }
+                    let subject = sw > 1e-3 ? sl / sw : 0
+                    let overall = grid.reduce(0, +) / Float(max(grid.count, 1))
+                    if subject > 0.02, subject > overall * 2.2 {
+                        target = max(-2, min(0, autoProtect + log2(0.42 / subject)))
+                    }
+                }
+                autoProtect += (target - autoProtect) * 0.3
+                if abs(autoProtect) < 0.02 { autoProtect = 0 }
+            }
+            apply(bias: camera.cachedUserBias - lookOffset + autoProtect, camera: camera)
+            let parts = [abs(lookOffset) >= 0.05 ? String(format: "Film %+.1f EV", -lookOffset) : nil,
+                         autoProtect < -0.1 ? "Subject priority" : nil].compactMap { $0 }
+            let status = parts.joined(separator: " · ")
+            if status != lastStatus { lastStatus = status; publish(status: status, correction: autoProtect - lookOffset) }
             return
         }
 
@@ -213,6 +236,21 @@ final class SmartExposure {
             let protect = 0.9 / highlights
             g = max(protect, g * 0.76)
             reason = "Protecting highlights"
+        }
+
+        // Bright subject on a dark background (stage, lamp-lit face, window
+        // light): the dark surroundings drag the average down and the mean
+        // solution blows the subject out. Expose for the subject instead —
+        // put it at a proper brightness and let the background stay dark.
+        if !faceHint, let sal = saliency {
+            var sw: Float = 0, sl: Float = 0
+            for i in lum.indices { let w2 = sal[i] * sal[i]; sw += w2; sl += w2 * lum[i] }
+            let subject = sw > 1e-3 ? sl / sw : 0
+            let overall = lum.reduce(0, +) / Float(max(lum.count, 1))
+            if subject > 0.02, subject > overall * 2.2 {
+                let gSubject = 0.42 / subject            // ≈ a light, well-exposed subject
+                if gSubject < g { g = gSubject; reason = "Subject priority" }
+            }
         }
 
         let delta = log2(max(g, 1e-3))

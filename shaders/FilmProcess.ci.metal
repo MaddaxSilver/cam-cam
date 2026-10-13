@@ -85,7 +85,10 @@ float4 filmGrain(sample_t s, sample_t fine, sample_t coarse, sample_t chroma, fl
 {
     float3 lin = srgbToLinear(s.rgb);
     float l = clamp(dot(s.rgb, float3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
-    float env = smoothstep(0.0, 0.14, l) * (1.0 - 0.85 * smoothstep(0.45, 0.95, l)) * 0.88 + 0.12;
+    // Strongest in the mid-tones; deep shadows near-clean like a print's
+    // blacks (a big dark background got the heaviest grain and looked
+    // noisy), highlights clean.
+    float env = smoothstep(0.04, 0.32, l) * (1.0 - 0.85 * smoothstep(0.5, 0.95, l)) * 0.9 + 0.1;
     // Fields are stored at half spread (fits 8-bit preview textures): ×2.
     float n = ((fine.r - 0.5) * 0.8 + (coarse.r - 0.5) * clump) * 2.0;
     float3 nc = (chroma.rgb - 0.5) * 2.0;
