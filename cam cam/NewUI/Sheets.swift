@@ -272,6 +272,7 @@ struct CamSettingsSheet: View {
     var onRoll: () -> Void
     var onEditFilms: () -> Void
     var onImportLUT: () -> Void
+    var onLookFromPhoto: () -> Void = {}
     @Binding var cleanMode: Bool
     /// Separate: the DNG is its own picture. Combined: hidden inside the film
     /// photo as its RAW (Photos shows one picture; export "unmodified original").
@@ -380,6 +381,7 @@ struct CamSettingsSheet: View {
                     Button("Re-grade a photo") { dismiss(); onRegrade() }
                     Button("Edit films") { dismiss(); onEditFilms() }
                     Button("Import LUT") { dismiss(); onImportLUT() }
+                    Button("New look from a photo") { dismiss(); onLookFromPhoto() }
                 }
                 Section("Film data") {
                     // Required attribution (CC BY-SA 4.0) for the spectral stocks.

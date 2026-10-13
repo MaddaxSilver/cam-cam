@@ -10,6 +10,7 @@ import SwiftUI
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import Photos
+import PhotosUI
 import Observation
 import CoreMotion
 import MediaPlayer
@@ -34,6 +35,8 @@ struct CameraContentView: View {
     @State private var showCustomSimEditor = false
     @State private var showSonyView = false
     @State private var showRegrade = false
+    @State private var showLookPicker = false
+    @State private var lookPickerItem: PhotosPickerItem?
     @State private var showLibrary = false
     @State private var showRollSheet = false
     @State private var showSettings = false
@@ -391,6 +394,12 @@ struct CameraContentView: View {
             SonyView(camera: camera)
                 .preferredColorScheme(.dark)
         }
+        .photosPicker(isPresented: $showLookPicker, selection: $lookPickerItem, matching: .images)
+        .onChange(of: lookPickerItem) { _, item in
+            guard let item else { return }
+            lookPickerItem = nil
+            Task { await makeLookFromPhoto(item) }
+        }
         .fullScreenCover(isPresented: $showRegrade) {
             RegradeView(camera: camera, customSimStore: customSimStore)
                 // The live camera (film preview, Vision) competed with the
@@ -474,6 +483,7 @@ struct CameraContentView: View {
                              onRoll: { showRollSheet = true },
                              onEditFilms: { showCustomSimEditor = true },
                              onImportLUT: { showLUTImporter = true },
+                             onLookFromPhoto: { showLookPicker = true },
                              cleanMode: $cleanMode)
         }
         .onChange(of: motion.isLandscape) { _, newValue in
@@ -1247,6 +1257,34 @@ struct CameraContentView: View {
                 }
                 .buttonStyle(.plain)
             }
+        }
+    }
+
+    /// "New look from a photo": bake a LUT from the picked photo's palette and
+    /// add it as a custom film, selected.
+    private func makeLookFromPhoto(_ item: PhotosPickerItem) async {
+        guard let data = try? await item.loadTransferable(type: Data.self),
+              let ui = UIImage(data: data), let cg = ui.cgImage else {
+            camera.saveErrorMessage = "Couldn't read that photo"; return
+        }
+        let f = DateFormatter(); f.dateFormat = "MMM d HH.mm"
+        let name = "Match · " + f.string(from: Date())
+        let dir = LUTManager.shared.directory
+        do {
+            let file = try await Task.detached(priority: .userInitiated) {
+                try LookFromPhoto.makeLUT(from: cg, name: name, directory: dir)
+            }.value
+            var sim = CustomSimulation()
+            sim.name = name
+            sim.lutFilename = file
+            customSimStore.simulations.append(sim)
+            customSimStore.save()
+            customSimStore.activeCustomSimID = sim.id
+            camera.activeCustomSim = sim
+            camera.selectedSim = .none
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        } catch {
+            camera.saveErrorMessage = "Couldn't make a look from that photo"
         }
     }
 
