@@ -304,7 +304,9 @@ private struct RegradeDetail: View {
             guard let ci = CIImage(contentsOf: url) else { return nil }
             let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
             let upright = ci.oriented(forExifOrientation: o)
-            let scale = min(1, 1600 / max(upright.extent.width, upright.extent.height))
+            // Screen resolution (1600 px was upscaled ~1.75× on a 2796 px screen: soft).
+            let target = UIScreen.main.nativeBounds.height
+            let scale = min(1, target / max(upright.extent.width, upright.extent.height))
             var small = upright.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             guard let cg = cam.ciContext.createCGImage(small, from: small.extent) else { return nil }
             small = CIImage(cgImage: cg)              // previews re-render from pixels, not the 48MP file
@@ -491,12 +493,17 @@ private struct PhotoViewer: View {
     private func load(_ id: String) async {
         guard images[id] == nil, let a = assets[id] ?? PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
         else { return }
+        // Full detail at screen resolution: "exact" sizing (the default fast
+        // mode can return a smaller image), and a quick low-res placeholder
+        // never replaces the sharp one.
         let opts = PHImageRequestOptions()
-        opts.deliveryMode = .opportunistic; opts.isNetworkAccessAllowed = true
+        opts.deliveryMode = .opportunistic; opts.resizeMode = .exact; opts.isNetworkAccessAllowed = true
         let side = UIScreen.main.bounds.height * UIScreen.main.scale
         AssetThumbImages.manager.requestImage(for: a, targetSize: CGSize(width: side, height: side),
-                                              contentMode: .aspectFit, options: opts) { img, _ in
-            if let img { images[id] = img }
+                                              contentMode: .aspectFit, options: opts) { img, info in
+            guard let img else { return }
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            if !degraded || images[id] == nil { images[id] = img }
         }
     }
 
