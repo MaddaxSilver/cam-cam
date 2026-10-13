@@ -30,9 +30,10 @@ enum InstagramShare {
     /// Returns false if Instagram couldn't be opened.
     @discardableResult
     static func postToFeed(assetID: String) -> Bool {
+        // The identifier goes in as-is ("UUID/L0/001"): escaping its slashes
+        // made Instagram say "something went wrong".
         guard installed,
-              let id = assetID.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
-              let url = URL(string: "instagram://library?LocalIdentifier=\(id)") else { return false }
+              let url = URL(string: "instagram://library?LocalIdentifier=\(assetID)") else { return false }
         UIApplication.shared.open(url)
         return true
     }
@@ -58,7 +59,14 @@ enum InstagramShare {
             .compactMap({ ($0 as? UIWindowScene)?.keyWindow?.rootViewController }).first else { return }
         var top = root
         while let p = top.presentedViewController { top = p }
-        let vc = UIActivityViewController(activityItems: [image], applicationActivities: nil)
+        // A real JPEG file: apps like Instagram (Feed / Stories / Messages)
+        // only list themselves for files, not a bare image object.
+        var items: [Any] = [image]
+        if let data = image.jpegData(compressionQuality: 0.95) {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("cam cam.jpg")
+            if (try? data.write(to: url, options: .atomic)) != nil { items = [url] }
+        }
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
         vc.popoverPresentationController?.sourceView = top.view
         top.present(vc, animated: true)
     }
