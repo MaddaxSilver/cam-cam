@@ -174,7 +174,11 @@ final class FrameAdvisor {
         if let down = Self.downAngle(SceneMotion.attitude), down < 35 { comp.minMM = max(comp.minMM, 24) }
         var ratio = Double(comp.fill / max(b.width, b.height))
         if comp.cutOff { ratio = min(ratio, 0.7) }
-        let applied = zoom(by: ratio, minMM: comp.minMM, camera: camera)
+        // A scan pick you tapped may switch lenses to reach its framing
+        // (from the 13 mm a pick is often 2–5×, beyond the ultra-wide).
+        let switching = pickLock && camera.zoomNeedsLensSwap(CGFloat(Double(max(camera.currentMM, 13)) * ratio / 26))
+        let applied = zoom(by: ratio, minMM: comp.minMM, camera: camera, allowLensSwitch: pickLock)
+        pickLock = false
         // Scenes: where the suggested view lands after the (centred) zoom —
         // then held on the scene with the gyro while you aim at it.
         sceneLock = nil; sceneArmed = false
@@ -186,20 +190,20 @@ final class FrameAdvisor {
             lockedComp = comp; lockedIsGroup = false
         }
         // Start tracking once the zoom (or lens switch) has settled.
-        trackStartAt = CACurrentMediaTime() + (applied != nil ? 0.9 : 0.6)
+        trackStartAt = CACurrentMediaTime() + (switching ? 1.5 : applied != nil ? 0.9 : 0.6)
     }
 
     /// Zoom by `ratio` (>1 in, <1 out) within the subject's lens range.
     /// Returns the zoom ratio actually applied, or nil if it didn't change.
     @discardableResult
-    func zoom(by ratio: Double, minMM: Int, camera: CameraManager) -> Double? {
+    func zoom(by ratio: Double, minMM: Int, camera: CameraManager, allowLensSwitch: Bool = false) -> Double? {
         let cur = Double(max(camera.currentMM, 13))
         let lo = Double(max(minMM, 13)), hi = min(cur * 6, 200)   // far-off subjects need the long end
         var want = min(max(cur * ratio, lo), max(hi, lo))
         // Stay on the lens you're on: switching lenses reconfigures the
         // camera (~1 s preview freeze, measured), and so does switching back.
         // When the subject doesn't fit, the hint suggests the 13 mm instead.
-        if camera.zoomNeedsLensSwap(CGFloat(want / 26)) {
+        if !allowLensSwitch, camera.zoomNeedsLensSwap(CGFloat(want / 26)) {
             let onUW = camera.currentDevice?.deviceType == .builtInUltraWideCamera
             if camera.currentDevice?.deviceType == .builtInTelephotoCamera { return nil }
             if onUW { want = min(want, 25) }                      // ultra-wide tops out below 1×
@@ -609,6 +613,7 @@ final class FrameAdvisor {
         scanRequested = true
     }
     @ObservationIgnored private var scanStarted: Double = 0
+    @ObservationIgnored private var pickLock = false
 
     /// Tap on a numbered pick: zoom to it and guide you there.
     func lockPick(_ i: Int, camera: CameraManager) {
@@ -620,6 +625,7 @@ final class FrameAdvisor {
         lastComp = c; shownComp = c
         box = b
         picks = []; picksActive = false
+        pickLock = true
         lock(camera: camera)
     }
 
