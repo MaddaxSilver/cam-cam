@@ -183,10 +183,12 @@ final class FrameAdvisor {
         if let down = Self.downAngle(SceneMotion.attitude), down < 35 { comp.minMM = max(comp.minMM, 24) }
         var ratio = Double(comp.fill / max(b.width, b.height))
         if comp.cutOff { ratio = min(ratio, 0.7) }
-        // A scan pick you tapped may switch lenses to reach its framing
-        // (from the 13 mm a pick is often 2–5×, beyond the ultra-wide).
-        let switching = pickLock && camera.zoomNeedsLensSwap(CGFloat(Double(max(camera.currentMM, 13)) * ratio / 26))
-        let applied = zoom(by: ratio, minMM: comp.minMM, camera: camera, allowLensSwitch: pickLock)
+        // Tapping the box (or a scan pick) is deliberate: it may switch lenses
+        // to reach the framing — the brief switch happens now, while you aim.
+        // (From the 13 mm the ultra-wide tops out ~25 mm.) Nothing switches
+        // back after the shot.
+        let switching = camera.zoomNeedsLensSwap(CGFloat(Double(max(camera.currentMM, 13)) * ratio / 26))
+        let applied = zoom(by: ratio, minMM: comp.minMM, camera: camera, allowLensSwitch: true)
         pickLock = false
         // Scenes: where the suggested view lands after the (centred) zoom —
         // then held on the scene with the gyro while you aim at it.
@@ -207,7 +209,9 @@ final class FrameAdvisor {
     @discardableResult
     func zoom(by ratio: Double, minMM: Int, camera: CameraManager, allowLensSwitch: Bool = false) -> Double? {
         let cur = Double(max(camera.currentMM, 13))
-        let lo = Double(max(minMM, 13)), hi = min(cur * 6, 200)   // far-off subjects need the long end
+        // Straight to the framing, up to 200 mm (a 6× per-tap cap stopped
+        // 13 mm → 100 mm subjects at ~78 mm).
+        let lo = Double(max(minMM, 13)), hi = 200.0
         var want = min(max(cur * ratio, lo), max(hi, lo))
         // Stay on the lens you're on: switching lenses reconfigures the
         // camera (~1 s preview freeze, measured), and so does switching back.
