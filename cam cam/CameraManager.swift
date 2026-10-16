@@ -546,6 +546,11 @@ import CoreLocation
     @ObservationIgnored nonisolated(unsafe) var metadataOutput = AVCaptureMetadataOutput()
     @ObservationIgnored nonisolated(unsafe) var lastFaceFocusTime: Date = .distantPast
     @ObservationIgnored nonisolated(unsafe) var tapFocusActive: Bool = false
+    /// When the last tap-to-focus happened: the tapped point is kept while you
+    /// reframe, instead of snapping back to the centre on the first scene change.
+    @ObservationIgnored nonisolated(unsafe) var lastTapFocusTime: CFTimeInterval = 0
+    @ObservationIgnored nonisolated(unsafe) var lastFaceSeenTime: CFTimeInterval = 0
+    @ObservationIgnored nonisolated(unsafe) var lastFaceFocusPoint: CGPoint?
     @ObservationIgnored nonisolated(unsafe) var cachedManualFocusEnabled: Bool = false
 
     // Portrait / depth
@@ -938,7 +943,7 @@ import CoreLocation
                 device.focusMode = .continuousAutoFocus
             }
             if device.isSmoothAutoFocusSupported {
-                device.isSmoothAutoFocusEnabled = true
+                device.isSmoothAutoFocusEnabled = false   // stills: snap, don't breathe (on only while recording)
             }
             if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure
@@ -1190,7 +1195,7 @@ import CoreLocation
                     device.focusMode = .continuousAutoFocus
                 }
                 if device.isSmoothAutoFocusSupported {
-                    device.isSmoothAutoFocusEnabled = true
+                    device.isSmoothAutoFocusEnabled = false   // stills: snap, don't breathe (on only while recording)
                 }
                 if device.isExposureModeSupported(.continuousAutoExposure) {
                     device.exposureMode = .continuousAutoExposure
@@ -1298,7 +1303,7 @@ import CoreLocation
                 try device.lockForConfiguration()
                 selectBestFormat(for: device)
                 if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-                if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
+                if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = false }   // stills: snap; smooth only while recording
                 if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
                 device.isSubjectAreaChangeMonitoringEnabled = true
                 let clamped = max(device.minAvailableVideoZoomFactor, min(zoom, device.maxAvailableVideoZoomFactor))
@@ -1406,7 +1411,7 @@ import CoreLocation
                     device.focusMode = .continuousAutoFocus
                 }
                 if device.isSmoothAutoFocusSupported {
-                    device.isSmoothAutoFocusEnabled = true
+                    device.isSmoothAutoFocusEnabled = false   // stills: snap, don't breathe (on only while recording)
                 }
                 if device.isExposureModeSupported(.continuousAutoExposure) {
                     device.exposureMode = .continuousAutoExposure
@@ -1548,6 +1553,8 @@ import CoreLocation
         // A tap releases AE/AF lock and focuses normally.
         if focusLocked { focusLocked = false }
         tapFocusActive = true
+        lastTapFocusTime = CACurrentMediaTime()
+        lastFaceFocusPoint = nil
         // Cancel any pending settle timer
         tapFocusSettleTimer?.cancel()
         tapFocusSettleTimer = nil
@@ -1804,6 +1811,12 @@ import CoreLocation
             guard let self, let device else { return }
             // Ignore if user is doing manual focus or in the middle of a tap-focus
             guard !self.cachedManualFocusEnabled, !self.tapFocusActive, !self.cachedFocusLocked else { return }
+            // Keep a tapped point for 8 s of reframing, and leave a face-steered
+            // point alone while the face is still there (it used to snap to the
+            // centre here, then the face steering pulled it back a second later:
+            // focus ping-ponging between the face and the background).
+            let now = CACurrentMediaTime()
+            guard now - self.lastTapFocusTime > 8, now - self.lastFaceSeenTime > 1.5 else { return }
             self.sessionQueue.async {
                 // This fires constantly while the phone moves. Continuous AF/AE
                 // already follow the scene, so do NOTHING when they're running at
@@ -1850,6 +1863,9 @@ import CoreLocation
         }
 
         guard detected else { return }
+        lastFaceSeenTime = CACurrentMediaTime()
+        // A tap wins over face steering for a while.
+        guard CACurrentMediaTime() - lastTapFocusTime > 8 else { return }
 
         // Throttle face-steered focus updates to 1 Hz to avoid constant hunting
         let now = Date()
@@ -1864,6 +1880,9 @@ import CoreLocation
         let cx = largest.bounds.midX
         let cy = largest.bounds.midY
         let focusPt = CGPoint(x: cx, y: cy)
+        // Re-aiming a point that barely moved restarts the AF search for nothing.
+        if let last = lastFaceFocusPoint, abs(last.x - cx) < 0.04, abs(last.y - cy) < 0.04 { return }
+        lastFaceFocusPoint = focusPt
 
         sessionQueue.async {
             do {
@@ -2173,6 +2192,19 @@ import CoreLocation
 
     // MARK: Video Recording
 
+    /// Smooth AF (slow, no breathing) suits video; stills want the fast snap.
+    func setSmoothAutoFocus(_ on: Bool) {
+        sessionQueue.async { [weak self] in
+            guard let device = self?.currentDevice, device.isSmoothAutoFocusSupported,
+                  device.isSmoothAutoFocusEnabled != on else { return }
+            do {
+                try device.lockForConfiguration()
+                device.isSmoothAutoFocusEnabled = on
+                device.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
     func startRecording() {
         guard !isRecording, !isBursting, !capturingFirstExposure else { return }
         UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
@@ -2212,6 +2244,7 @@ import CoreLocation
     private func beginRecordingWriter() {
         guard !isRecording, !isBursting, !capturingFirstExposure else { return }
         isRecording = true
+        setSmoothAutoFocus(true)
         WatchConnector.shared.pushState()
         recordingDuration = 0
         recordingSessionStarted = false
@@ -2228,6 +2261,7 @@ import CoreLocation
     func stopRecording() {
         guard isRecording else { return }
         isRecording = false
+        setSmoothAutoFocus(false)
         WatchConnector.shared.pushState()
         recordingTimer?.invalidate()
         recordingTimer = nil
