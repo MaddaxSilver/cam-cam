@@ -198,13 +198,27 @@ nonisolated enum LookAudit {
             let out = camera.renderLook(input, recipe: r, flatten: true).cropped(to: input.extent)
             let d = detail(out, vs: ref, crop: crop, ctx: ctx)
             let st = PipelineAudit.stats(out, ctx: ctx)
-            print(String(format: "[quality] %@  detail %.2f  added %.2f | mean %.3f p1 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
-                         label, d.slope, d.noise, st.mean, st.p1, st.p99, st.crushLo * 100, st.clipHi * 100))
+            print(String(format: "[quality] %@  detail %.2f  added %.2f | mean %.3f p1 %.3f p50 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
+                         label, d.slope, d.noise, st.mean, st.p1, st.p50, st.p99, st.crushLo * 100, st.clipHi * 100))
         }
         let inSt = PipelineAudit.stats(input, ctx: ctx)
-        print(String(format: "[quality] INPUT | mean %.3f p1 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
-                     inSt.mean, inSt.p1, inSt.p99, inSt.crushLo * 100, inSt.clipHi * 100))
+        print(String(format: "[quality] INPUT | mean %.3f p1 %.3f p50 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
+                     inSt.mean, inSt.p1, inSt.p50, inSt.p99, inSt.crushLo * 100, inSt.clipHi * 100))
         if ProcessInfo.processInfo.arguments.contains("-noScan") { CameraManager.scanEnabled = false }
+        if ProcessInfo.processInfo.arguments.contains("-cpuTest") {
+            let cpu = CIContext(options: [.useSoftwareRenderer: true, .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!])
+            let sc = 4032 / max(w, h)
+            let img = input.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": sc, "inputAspectRatio": 1])
+            var x = ShotRecipe(); x.sim = .kodakPortra; x.grainEnabled = true; x.grain = 0.2
+            for (name, c) in [("gpu", ctx), ("cpu", cpu)] {
+                let t0 = CACurrentMediaTime()
+                let o = camera.renderLook(img, recipe: x, flatten: true).cropped(to: img.extent)
+                let cg = c.createCGImage(o, from: o.extent)
+                let st = cg.map { PipelineAudit.stats(CIImage(cgImage: $0), ctx: ctx) }
+                print(String(format: "[quality] %@ render %@ in %.1f s mean %.3f", name, cg == nil ? "FAILED" : "ok", CACurrentMediaTime() - t0, st?.mean ?? -1))
+            }
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-dumpSims") {
             let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("sims")
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

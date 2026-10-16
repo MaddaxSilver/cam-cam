@@ -292,6 +292,10 @@ struct CamSettingsSheet: View {
                         Text("Speed").tag(0); Text("Balanced").tag(1); Text("Max").tag(2); Text("Natural").tag(3)
                     }
                     .pickerStyle(.segmented)
+                    if camera.photoQuality == 2 {
+                        Text("48MP every shot. Zoomed, telephoto and ultra-wide photos are upscaled to 48MP so every photo is the same size. One lens is paused here: iOS limits it to 24MP.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     if camera.photoQuality == 3 {
                         Text("48MP ProRAW developed in cam cam, without Apple's processing (no HDR tone mapping, light noise reduction): more natural texture under the film, a little more noise.")
                             .font(.footnote).foregroundStyle(.secondary)
@@ -327,6 +331,10 @@ struct CamSettingsSheet: View {
                     Toggle("Manual focus", isOn: Binding(get: { camera.manualFocusEnabled },
                                                          set: { camera.setManualFocusEnabled($0) }))
                     Toggle("One lens (smooth zoom)", isOn: $camera.unifiedZoomMode)
+                    if camera.unifiedZoomMode && camera.photoQuality >= 2 {
+                        Text("Paused at Max / Natural (48MP). Works at Speed and Balanced.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     Toggle("Push / pull", isOn: $camera.pushPullEnabled)
                     if camera.pushPullEnabled {
                         Stepper("\(camera.pushPullAmount >= 0 ? "+" : "")\(Int(camera.pushPullAmount)) stop",

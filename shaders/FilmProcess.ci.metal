@@ -211,7 +211,7 @@ float4 scanGuard(sample_t look, sample_t orig, sample_t lookBlur, sample_t origB
     float3 chroma = yo > 1e-4 ? o / yo : (yi > 1e-5 ? i / yi : float3(1.0));
 
     // 1. Shadow floor.
-    float fade = 1.0 - smoothstep(0.03, 0.14, yi);
+    float fade = 1.0 - smoothstep(0.05, 0.22, yi);
     float floorY = floorK * yi * fade;
     if (yo < floorY) { o += (floorY - yo) * chroma; yo = floorY; }
 

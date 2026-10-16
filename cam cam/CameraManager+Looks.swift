@@ -335,17 +335,17 @@ extension CameraManager {
 
     /// Per-film scan settings: (shadow floor, white-point lift allowed, detail).
     nonisolated static func scanProfile(_ sim: FilmSimulation?) -> (floor: Float, white: Bool, detail: Float)? {
-        guard let sim else { return (0.35, true, 0.45) }          // custom sims / imported LUTs
+        guard let sim else { return (0.7, true, 0.45) }          // custom sims / imported LUTs
         switch sim {
         case .none, .circuitBent, .circuitBentHeavy: return nil
         case .polaroid600, .polaroidSpectra, .polaroidSX70, .fujiInstax, .goldenHaze, .expiredFilm,
              .saltPrint, .platinum, .vanDyke, .cyanotype, .digiCam:
-            return (0.35, true, 0)                                  // soft by design
+            return (0.7, true, 0)                                  // soft by design
         case .tintype, .daguerreotype:  return (0.25, false, 0)
         case .kodakAerochrome:          return (0.25, false, 0.4)
         case .neonNoir, .styleStarkBW, .styleDramatic, .bleachBypass, .nightShot:
             return (0.15, true, 0.5)                                 // contrast is the point
-        default: return (0.35, true, 0.45)
+        default: return (0.7, true, 0.45)
         }
     }
 
@@ -356,13 +356,15 @@ extension CameraManager {
     nonisolated private static let scanContext = CIContext(options: [
         .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!, .cacheIntermediates: false])
 
+    nonisolated private static let scanCPUContext = CIContext(options: [
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!, .cacheIntermediates: false, .useSoftwareRenderer: true])
     /// Linear luminance the look prints a near-white (0.96) at.
     nonisolated private static func measureWhite(_ look: (CIImage) -> CIImage) -> Float {
         let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
         let patch = CIImage(color: CIColor(red: 0.96, green: 0.96, blue: 0.96, colorSpace: p3)!)
             .cropped(to: CGRect(x: 0, y: 0, width: 32, height: 32))
         var px = [Float](repeating: 0, count: 4)
-        scanContext.render(look(patch), toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 16, y: 16, width: 1, height: 1),
+        (CameraManager.inBackground ? scanCPUContext : scanContext).render(look(patch), toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 16, y: 16, width: 1, height: 1),
                            format: .RGBAf, colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3))
         let y = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]
         return y.isFinite ? y : 1

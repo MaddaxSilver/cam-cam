@@ -532,7 +532,7 @@ struct CameraContentView: View {
                 // user's settings are put back afterwards.
                 let saved = (camera.photoQuality, camera.rawEnabled, UserDefaults.standard.object(forKey: "cc_rawSeparate"),
                              camera.unifiedZoomMode, camera.selectedSim)
-                let film = camera.selectedSim
+                let film = FilmSimulation.kodakPortra
                 typealias Setup = (String, Int, Bool, Bool, Bool, FilmSimulation)
                 let setups: [Setup] = [
                     ("max-nofilm", 2, false, true, false, .none),

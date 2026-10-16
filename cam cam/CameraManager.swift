@@ -205,8 +205,17 @@ import CoreLocation
     /// internally. When false (default), 28-70mm presets snap to the physical wide lens
     /// for explicit lens control.
     var unifiedZoomMode: Bool = false {
-        didSet { UserDefaults.standard.set(unifiedZoomMode, forKey: "cc_unifiedZoom") }
+        didSet {
+            UserDefaults.standard.set(unifiedZoomMode, forKey: "cc_unifiedZoom")
+            if oldValue != unifiedZoomMode, currentDevice != nil { routeForPortrait() }
+        }
     }
+    /// One lens in use right now. iOS caps the multi-lens camera at 24MP, so
+    /// Max and Natural (48MP) use each lens directly instead.
+    var oneLensActive: Bool { unifiedZoomMode && photoQuality < 2 }
+    /// Max / Natural: every photo is saved at 48MP (crops, telephoto and
+    /// ultra-wide shots are upscaled before the film, so grain matches).
+    var full48: Bool { photoQuality >= 2 }
     /// Macro mode — forces the physical ultrawide lens whose minimum focus distance is ~2cm.
     /// Disabling does not auto-swap back; the user navigates via focal presets / slider as normal.
     var macroModeEnabled: Bool = false {
@@ -240,7 +249,10 @@ import CoreLocation
     var maxManualZoom: Double = 25.0
     var isFrontCamera: Bool = false
     var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality (Max), 3 natural (ProRAW, no Apple processing)
-        didSet { UserDefaults.standard.set(photoQuality, forKey: "cc_photoQuality") }
+        didSet {
+            UserDefaults.standard.set(photoQuality, forKey: "cc_photoQuality")
+            if unifiedZoomMode, (oldValue >= 2) != (photoQuality >= 2), currentDevice != nil { routeForPortrait() }
+        }
     }
     /// Observable so the UI follows it; the capture/render queues read the mirror.
     var activeCustomSim: CustomSimulation? {
@@ -356,6 +368,13 @@ import CoreLocation
     /// only relaunching the app recovered.
     nonisolated func installSessionObservers() {
         let nc = NotificationCenter.default
+        sessionObserverTokens.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { _ in
+            CameraManager.backgroundEpoch += 1
+            CameraManager.inBackground = true
+        })
+        sessionObserverTokens.append(nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { _ in
+            CameraManager.inBackground = false
+        })
         sessionObserverTokens.append(nc.addObserver(
             forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main
         ) { [weak self] note in
@@ -452,7 +471,20 @@ import CoreLocation
     /// Full-resolution photo renders get their own LOW-priority context. On
     /// the shared one, a 48MP film render (~3 s of GPU) queued ahead of the
     /// preview: the viewfinder froze for seconds after every shot.
-    @ObservationIgnored nonisolated(unsafe) lazy var photoContext: CIContext = {
+    /// Photo renders: the GPU in the foreground; the CPU while the app is in
+    /// the background, where iOS doesn't allow GPU work (shots taken just
+    /// before leaving the app still develop — see DevelopActivity).
+    nonisolated var photoContext: CIContext { Self.inBackground ? cpuPhotoContext : gpuPhotoContext }
+    nonisolated(unsafe) static var inBackground = false
+    /// Bumped each time the app goes to the background (a render that spans
+    /// the switch is redone on the CPU).
+    nonisolated(unsafe) static var backgroundEpoch = 0
+    @ObservationIgnored nonisolated(unsafe) lazy var cpuPhotoContext: CIContext = {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+        return CIContext(options: [.workingColorSpace: p3, .outputColorSpace: p3,
+                                   .cacheIntermediates: false, .useSoftwareRenderer: true])
+    }()
+    @ObservationIgnored nonisolated(unsafe) lazy var gpuPhotoContext: CIContext = {
         let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         var opts: [CIContextOption: Any] = [.workingColorSpace: p3, .outputColorSpace: p3,
                                             .cacheIntermediates: false, .priorityRequestLow: true]
@@ -520,6 +552,7 @@ import CoreLocation
     /// where iOS sometimes delivers the constituent's full FOV without applying
     /// videoZoomFactor (when maxPhotoDimensions is at the sensor max).
     @ObservationIgnored nonisolated(unsafe) var pendingZoomCropFactor: CGFloat = 1.0
+    @ObservationIgnored nonisolated(unsafe) var pendingFull48 = true
     @ObservationIgnored nonisolated(unsafe) var cachedSim: FilmSimulation = .none
     @ObservationIgnored nonisolated(unsafe) var processQueue = DispatchQueue(label: "cam.process", qos: .userInitiated)
     /// In-flight burst processing count — bounded back-pressure to keep memory
@@ -582,6 +615,14 @@ import CoreLocation
 
     nonisolated func registerShot(id: Int64, apply: @escaping @Sendable () -> Void, portrait: Bool) {
         rawStashLock.lock(); shotSettings[id] = (apply, portrait); rawStashLock.unlock()
+        DispatchQueue.main.async { DevelopActivity.shared.shotStarted() }
+    }
+
+    /// The capture failed: forget its settings (it would otherwise count as
+    /// in flight forever, pausing Smart AE and the guides).
+    nonisolated func dropShot(id: Int64) {
+        rawStashLock.lock(); let had = shotSettings.removeValue(forKey: id) != nil; rawStashLock.unlock()
+        if had { DevelopActivity.shared.shotFinished() }
     }
 
     /// Take a delivered shot's settings and count it as rendering.
@@ -594,6 +635,7 @@ import CoreLocation
 
     nonisolated func shotRendered() {
         rawStashLock.lock(); shotsRendering = max(0, shotsRendering - 1); rawStashLock.unlock()
+        DevelopActivity.shared.shotFinished()
     }
 
     /// Render a small graded copy of a just-delivered shot for the thumbnail,
@@ -873,7 +915,7 @@ import CoreLocation
         guard preset.deviceType != .builtInUltraWideCamera else { return }   // no depth there
         let onVirtual = [.builtInTripleCamera, .builtInDualCamera, .builtInDualWideCamera]
             .contains(currentDevice?.deviceType)
-        let wantsVirtual = portraitModeEnabled || preset.useVirtualDevice || unifiedZoomMode
+        let wantsVirtual = portraitModeEnabled || preset.useVirtualDevice || oneLensActive
         let intentZoom = CGFloat(Double(currentMM) / 26.0)
         lastRequestedZoom = intentZoom
         if wantsVirtual && !onVirtual {
@@ -910,9 +952,10 @@ import CoreLocation
 
         // Launch device depends on unified-zoom mode (read directly from UserDefaults
         // since the published property may not be loaded yet at this point in init).
-        let unifiedZoom = UserDefaults.standard.object(forKey: "cc_unifiedZoom") != nil
+        let savedQuality = UserDefaults.standard.object(forKey: "cc_photoQuality") as? Int ?? 2
+        let unifiedZoom = (UserDefaults.standard.object(forKey: "cc_unifiedZoom") != nil
             ? UserDefaults.standard.bool(forKey: "cc_unifiedZoom")
-            : false
+            : false) && savedQuality < 2
         let device: AVCaptureDevice = {
             if unifiedZoom {
                 if let d = AVCaptureDevice.default(.builtInTripleCamera,   for: .video, position: .back) { return d }
@@ -1966,8 +2009,9 @@ import CoreLocation
     }
 
     var effectiveQualityPrioritization: AVCapturePhotoOutput.QualityPrioritization {
-        // If a custom sim is active and has its own quality, use that
-        if let customSim = activeCustomSim {
+        // Max / Natural are the user's 48MP choice: a saved camera's lower
+        // quality (Speed = 12MP) must not override it.
+        if let customSim = activeCustomSim, photoQuality < 2 {
             switch customSim.quality {
             case 0: return .speed
             case 1: return .balanced
@@ -2027,6 +2071,7 @@ import CoreLocation
         let shotPortraitEnabled = portraitModeEnabled
         let shotPortraitFStop = portraitFStop
         let shotZoomCropFactor = computePhotoZoomCropFactor()
+        let shotFull48 = full48
         let applySettings: @Sendable () -> Void = { [self] in
             pendingSim = shotSim
             pendingGrain = shotGrain
@@ -2058,6 +2103,7 @@ import CoreLocation
             pendingPortraitEnabled = shotPortraitEnabled
             pendingPortraitFStop = shotPortraitFStop
             pendingZoomCropFactor = shotZoomCropFactor
+            pendingFull48 = shotFull48
         }
 
         if isLongExposure {
@@ -2807,6 +2853,7 @@ import CoreLocation
             guard var ciImage = CIImage(data: imageData) else { return };
             let originalMetadata = ciImage.properties
             ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
+            ciImage = applyPhotoZoomCrop(ciImage)              // 48MP on Max (depth format is 12MP)
             let redEyeStr: Float = {
                 if pendingSim == .nightShot { return 0.55 }
                 if pendingSim == .digiCam   { return 0.22 }
@@ -3079,7 +3126,27 @@ import CoreLocation
     nonisolated func computePhotoZoomCropFactor() -> CGFloat { return 1.0 }
 
     /// Apply the manual safety-net zoom crop, if needed.
-    nonisolated func applyPhotoZoomCrop(_ image: CIImage) -> CIImage {
+    nonisolated func applyPhotoZoomCrop(_ image: CIImage, upscale: Bool = true) -> CIImage {
+        let cropped = zoomCropOnly(image)
+        return upscale && pendingFull48 ? Self.upscaleTo48(cropped) : cropped
+    }
+
+    /// Max / Natural: a photo smaller than 48MP (a zoom crop, the 12MP
+    /// telephoto / ultra-wide, Portrait's depth format) is resampled to 48MP
+    /// so every shot comes out the same size, and the film grain is laid down
+    /// at the same scale. Lanczos, upright pixels at the origin.
+    nonisolated static func upscaleTo48(_ image: CIImage) -> CIImage {
+        let e = image.extent
+        let px = e.width * e.height
+        guard px > 1, px < 47_000_000 else { return image }
+        let s = (48_771_072 / px).squareRoot()        // 8064 × 6048
+        let up = image.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+            .applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": s, "inputAspectRatio": 1])
+        return up.transformed(by: CGAffineTransform(translationX: -up.extent.minX, y: -up.extent.minY))
+            .cropped(to: CGRect(x: 0, y: 0, width: (e.width * s).rounded(.down), height: (e.height * s).rounded(.down)))
+    }
+
+    nonisolated private func zoomCropOnly(_ image: CIImage) -> CIImage {
         let factor = pendingZoomCropFactor
         guard factor > 1.05 else { return image }
         let extent = image.extent
@@ -3147,13 +3214,20 @@ import CoreLocation
         #endif
         let strips = h > 3000 ? 8 : 1
         let rowsPer = (h + strips - 1) / strips
+        let epoch = Self.backgroundEpoch
+        let startedOnGPU = !Self.inBackground
+        for pass in 0..<2 {
+        // GPU work is cut off when the app leaves the foreground: a render
+        // that spanned the switch is redone on the CPU.
+        if pass == 1 && !(startedOnGPU && epoch != Self.backgroundEpoch) { break }
         for i in 0..<strips {
             let y0 = i * rowsPer, y1 = min(h, y0 + rowsPer)
             guard y1 > y0 else { break }
             // Bitmap row 0 is the top; Core Image's y runs up from the bottom.
             let stripBounds = CGRect(x: bounds.minX, y: bounds.maxY - CGFloat(y1), width: bounds.width, height: CGFloat(y1 - y0))
-            photoContext.render(cropped, toBitmap: pixels.advanced(by: y0 * w * 4), rowBytes: w * 4, bounds: stripBounds,
+            (pass == 1 ? cpuPhotoContext : photoContext).render(cropped, toBitmap: pixels.advanced(by: y0 * w * 4), rowBytes: w * 4, bounds: stripBounds,
                                 format: .RGBA8, colorSpace: p3)
+        }
         }
         #if DEBUG
         print(String(format: "[perf] %.2f RENDER %dx%d in %.0f ms (%d strips)", CACurrentMediaTime(), w, h, (CACurrentMediaTime() - t0) * 1000, strips))
@@ -3317,7 +3391,7 @@ import CoreLocation
         //   • Unified-zoom mode is on AND the preset isn't ultrawide (which can only
         //     be reached via the physical builtInUltraWideCamera).
         let useVirtual = preset.useVirtualDevice
-            || ((unifiedZoomMode || portraitModeEnabled) && preset.deviceType != .builtInUltraWideCamera)
+            || ((oneLensActive || portraitModeEnabled) && preset.deviceType != .builtInUltraWideCamera)
 
         // intentZoom = preset's mm in our 26mm-based scale. setZoom takes intent.
         // For swap calls that take a device-specific zoom we apply the prospective
@@ -3616,6 +3690,7 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             }
         }
         guard error == nil else {
+            dropShot(id: photo.resolvedSettings.uniqueID)
             DispatchQueue.main.async {
                 self.isCapturing = false
                 self.isBursting = false
@@ -3726,7 +3801,7 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
                 guard var ciImage = CIImage(data: capturedData) else { return }
                 let metadata = ciImage.properties
                 ciImage = ciImage.oriented(forExifOrientation: Int32(ciImage.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
-                ciImage = applyPhotoZoomCrop(ciImage)
+                ciImage = applyPhotoZoomCrop(ciImage, upscale: false)
                 pendingSceneISO = Self.captureISO(metadata)      // context-aware grain
                 let recipe = pendingRecipe()
                 let processed = applySimAndGrain(to: ciImage)
