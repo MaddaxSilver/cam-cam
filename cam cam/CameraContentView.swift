@@ -524,6 +524,47 @@ struct CameraContentView: View {
                     }
                 }
             }
+            if ProcessInfo.processInfo.arguments.contains("-resProbe") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { camera.debugResolutionProbe() }
+            }
+            if ProcessInfo.processInfo.arguments.contains("-pipelineAudit") {
+                // Shots in several setups, measured instead of saved; the
+                // user's settings are put back afterwards.
+                let saved = (camera.photoQuality, camera.rawEnabled, UserDefaults.standard.object(forKey: "cc_rawSeparate"),
+                             camera.unifiedZoomMode, camera.selectedSim)
+                let film = camera.selectedSim
+                typealias Setup = (String, Int, Bool, Bool, Bool, FilmSimulation)
+                let setups: [Setup] = [
+                    ("max-nofilm", 2, false, true, false, .none),
+                    ("max-film", 2, false, true, false, film),
+                    ("max-rawcombined", 2, true, false, false, film),
+                    ("max-rawseparate", 2, true, true, false, film),
+                    ("onelens-max", 2, false, true, true, film),
+                    ("natural-film", 3, false, true, false, film),
+                ]
+                func run(_ i: Int) {
+                    guard i < setups.count else {
+                        PipelineAudit.tag = nil
+                        camera.photoQuality = saved.0; camera.rawEnabled = saved.1
+                        UserDefaults.standard.set(saved.2, forKey: "cc_rawSeparate")
+                        camera.unifiedZoomMode = saved.3; camera.selectedSim = saved.4
+                        PipelineAudit.log("done")
+                        return
+                    }
+                    let s = setups[i]
+                    camera.photoQuality = s.1; camera.rawEnabled = s.2
+                    UserDefaults.standard.set(s.3, forKey: "cc_rawSeparate")
+                    if camera.unifiedZoomMode != s.4 { camera.unifiedZoomMode = s.4; camera.routeForPortrait() }
+                    camera.selectedSim = s.5
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                        PipelineAudit.tag = s.0
+                        PipelineAudit.log("\(s.0) sim \(s.5.rawValue) grain \(camera.grainEnabled) \(camera.grainAmount) smartAE \(SmartExposure.shared.enabled) status \(SmartExposure.shared.status)")
+                        camera.capturePhoto()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 9) { run(i + 1) }
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { run(0) }
+            }
             if ProcessInfo.processInfo.arguments.contains("-perfShots") {
                 frameAdvisor.enabled = !ProcessInfo.processInfo.arguments.contains("-noGuide")
                 MainHitchProbe.shared.start()

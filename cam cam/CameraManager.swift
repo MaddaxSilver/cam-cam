@@ -2146,6 +2146,48 @@ import CoreLocation
         }
     }
 
+    #if DEBUG
+    /// -resProbe: which settings give a real 48MP photo here and now.
+    nonisolated func debugResolutionProbe() {
+        func listFormats(_ d: AVCaptureDevice) {
+            for f in d.formats {
+                let v = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                let ph = f.supportedMaxPhotoDimensions.map { "\($0.width)x\($0.height)" }.joined(separator: ",")
+                let fps = f.videoSupportedFrameRateRanges.map { $0.maxFrameRate }.max() ?? 0
+                PipelineAudit.log("fmt \(d.localizedName) \(v.width)x\(v.height) @\(Int(fps)) photo [\(ph)] depth \(f.supportedDepthDataFormats.count) fov \(f.videoFieldOfView)")
+            }
+        }
+        if let t = AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) { listFormats(t) }
+        sessionQueue.async { [self] in
+            guard let device = currentDevice else { return }
+            PipelineAudit.log("probe device \(device.localizedName) active max \(device.activeFormat.supportedMaxPhotoDimensions.map { "\($0.width)x\($0.height)" }) output max \(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height) iso \(device.iso)")
+            let big = device.activeFormat.supportedMaxPhotoDimensions.max { $0.width * $0.height < $1.width * $1.height }!
+            let tests: [(String, AVCapturePhotoOutput.QualityPrioritization, Bool, CGFloat)] =
+                [("probe-q-z1", .quality, false, 1.0), ("probe-q-z1.3", .quality, false, 1.3), ("probe-q-z1.6", .quality, false, 1.6), ("probe-q-z2", .quality, false, 2),
+                 ("probe-q-z2.7", .quality, false, 2.7), ("probe-raw-z1.6", .quality, true, 1.6)]
+            for (k, t) in tests.enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2 + Double(k) * 4) { [self] in
+                    sessionQueue.async { [self] in
+                        if (try? device.lockForConfiguration()) != nil { device.videoZoomFactor = t.3; device.unlockForConfiguration() }
+                        Thread.sleep(forTimeInterval: 0.5)
+                        PipelineAudit.tag = t.0
+                        let settings: AVCapturePhotoSettings
+                        if t.2, let pro = photoOutput.availableRawPhotoPixelFormatTypes.first(where: { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) }) {
+                            settings = AVCapturePhotoSettings(rawPixelFormatType: pro)
+                        } else {
+                            settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+                        }
+                        settings.photoQualityPrioritization = t.1
+                        settings.maxPhotoDimensions = big
+                        photoOutput.capturePhoto(with: settings, delegate: self)
+                    }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { PipelineAudit.tag = nil; PipelineAudit.log("done") }
+        }
+    }
+    #endif
+
     // MARK: Burst Capture
 
     func startBurst() {
@@ -3150,6 +3192,13 @@ import CoreLocation
     ///   the recipe attached → revertible and re-gradable in cam cam.
     nonisolated func renderAndSave(ciImage: CIImage, metadata: [String: Any] = [:],
                                    base: CIImage? = nil, recipe: ShotRecipe? = nil, raw: Data? = nil) {
+        #if DEBUG
+        if PipelineAudit.tag != nil {
+            PipelineAudit.log("\(PipelineAudit.tag!) recipe \(recipe?.displayName ?? "none") raw \(raw.map { "\($0.count / 1_000_000)MB" } ?? "no")")
+            PipelineAudit.dump(base: base, rendered: ciImage, ctx: photoContext)
+            return
+        }
+        #endif
         let location = LocationTagger.shared.locationForPhoto()
         let heic = AVFileType.heic.rawValue as CFString
         let original: Data
@@ -3578,6 +3627,21 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // saved alongside the graded photo; RAW-only falls back to a bare DNG.
         let pairedRAWID: Int64? = photo.resolvedSettings.rawPhotoDimensions.width > 0
             && photo.resolvedSettings.photoDimensions.width > 0 ? photo.resolvedSettings.uniqueID : nil
+        #if DEBUG
+        if let tag = PipelineAudit.tag, photo.isRawPhoto {
+            let r = photo.resolvedSettings
+            PipelineAudit.log("\(tag) delivered RAW \(r.rawPhotoDimensions.width)x\(r.rawPhotoDimensions.height) processed \(r.photoDimensions.width)x\(r.photoDimensions.height)")
+            if tag.hasPrefix("probe") { return }
+        }
+        if let tag = PipelineAudit.tag, tag.hasPrefix("probe") {
+            let r = photo.resolvedSettings
+            PipelineAudit.log("\(tag) delivered \(r.photoDimensions.width)x\(r.photoDimensions.height)")
+            if tag == "probe-q-z1", let d = photo.fileDataRepresentation() {
+                try? d.write(to: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("test48.heic"))
+            }
+            return
+        }
+        #endif
         if photo.isRawPhoto, let natural = takeNatural(photo.resolvedSettings.uniqueID),
            let data = photo.fileDataRepresentation() {
             let shot = takeShot(id: photo.resolvedSettings.uniqueID)
@@ -3603,6 +3667,12 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
            (currentDevice?.activeFormat.supportedMaxPhotoDimensions.map { Int($0.width) * Int($0.height) }.max() ?? 0) > 40_000_000 {
             print("⚠️ cam cam: photo delivered at \(dims.width)×\(dims.height) although the lens supports 48MP")
         }
+        #if DEBUG
+        if let tag = PipelineAudit.tag {
+            let r = photo.resolvedSettings
+            PipelineAudit.log("\(tag) delivered photo \(r.photoDimensions.width)x\(r.photoDimensions.height) raw \(r.rawPhotoDimensions.width)x\(r.rawPhotoDimensions.height) device \(currentDevice?.localizedName ?? "?") zoom \(String(format: "%.2f", currentDevice?.videoZoomFactor ?? 0)) constituent \((currentDevice?.activePrimaryConstituent?.localizedName) ?? "-") format max \(currentDevice?.activeFormat.supportedMaxPhotoDimensions.last.map { "\($0.width)x\($0.height)" } ?? "?") output max \(output.maxPhotoDimensions.width)x\(output.maxPhotoDimensions.height)")
+        }
+        #endif
         let shot = takeShot(id: photo.resolvedSettings.uniqueID)
         guard let data = photo.fileDataRepresentation() else {
             if shot != nil { shotRendered() }

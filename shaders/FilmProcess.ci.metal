@@ -190,4 +190,49 @@ float4 filmDevelop(sample_t s, sample_t near, sample_t far, float strength)
     return float4(linearToSrgb(lin * clamp(gain, 0.35, 2.5)), s.a);
 }
 
+/// The "scan" after every film look (what a lab scanner does to a print):
+///  1. Shadow floor: a look may darken the deep shadows, but not by more than
+///     `floorK` (linear ratio) below the original, so gradation survives
+///     instead of going to flat black. Fades out by the mid-shadows.
+///  2. White point: looks printing paper white at ~0.8 get their highlights
+///     lifted (gain `whiteGain` reached at the look's white `lookWhite`), so a
+///     photo keeps its range. Midtones untouched.
+///  3. Detail: `detail` × the original's fine local contrast is put back
+///     where the look flattened it (encoded luma, so shadows count).
+/// look/orig: the image after/before the look; lookBlur/origBlur: the same,
+/// slightly blurred (high-pass reference). All gamma-encoded.
+float4 scanGuard(sample_t look, sample_t orig, sample_t lookBlur, sample_t origBlur,
+                 float floorK, float whiteGain, float lookWhite, float detail)
+{
+    const float3 w = float3(0.2126, 0.7152, 0.0722);
+    float3 o = srgbToLinear(look.rgb);
+    float3 i = srgbToLinear(orig.rgb);
+    float yo = dot(o, w), yi = dot(i, w);
+    float3 chroma = yo > 1e-4 ? o / yo : (yi > 1e-5 ? i / yi : float3(1.0));
+
+    // 1. Shadow floor.
+    float fade = 1.0 - smoothstep(0.03, 0.14, yi);
+    float floorY = floorK * yi * fade;
+    if (yo < floorY) { o += (floorY - yo) * chroma; yo = floorY; }
+
+    // 2. White point.
+    if (whiteGain > 1.0001) {
+        float s = smoothstep(0.2, max(lookWhite, 0.21), yo);
+        float g = 1.0 + (whiteGain - 1.0) * s;
+        o *= g; yo *= g;
+    }
+
+    // 3. Detail transfer.
+    if (detail > 0.0) {
+        float eo = dot(look.rgb, w), eob = dot(lookBlur.rgb, w);
+        float ei = dot(orig.rgb, w), eib = dot(origBlur.rgb, w);
+        float lost = (ei - eib) - (eo - eob);
+        float eNow = linearToSrgb(float3(max(yo, 0.0))).x;
+        float eNew = clamp(eNow + detail * lost, 0.0, 1.2);
+        float yNew = srgbToLinear(float3(eNew)).x;
+        o = yo > 1e-5 ? o * (yNew / yo) : o + yNew * chroma;
+    }
+    return float4(linearToSrgb(o), look.a);
+}
+
 }}

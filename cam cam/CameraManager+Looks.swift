@@ -47,6 +47,13 @@ extension CameraManager {
                                         mask: SkinMask.shared.live(for: img.extent))
             }
         }
+        if !cachedThermalThrottle {
+            let key = custom.map { "c-\(String(describing: $0).hashValue)" } ?? "s-\(sim.rawValue)"
+            img = Self.scan(img, original: input, sim: custom == nil ? sim : nil, lookKey: key, measure: false) { [self] x in
+                custom.map { applyCustomSim(to: x, sim: $0) }
+                    ?? applyFilmSim(to: x, sim: sim, grainEnabled: false, grain: 0, digiCamQuality: cachedDigiCamQuality)
+            }
+        }
         // Under thermal pressure, keep the base look but drop the expensive
         // extras from the live path (captures are unaffected).
         if cachedDevelopment > 0 { img = applyDevelopment(img, strength: cachedDevelopment) }
@@ -234,6 +241,11 @@ extension CameraManager {
             image = applyFilmSim(to: image, sim: .crossProcess, grainEnabled: false, grain: 0,
                                  digiCamQuality: r.digiCamQuality)
         }
+        image = Self.scan(image, original: input, sim: r.custom == nil ? r.sim : nil,
+                          lookKey: Self.lookKey(r), measure: !(portraitFStop != nil && !flatten)) { [self] x in
+            r.custom.map { applyCustomSim(to: x, sim: $0) }
+                ?? applyFilmSim(to: x, sim: r.sim, grainEnabled: false, grain: 0, digiCamQuality: r.digiCamQuality)
+        }
 
         // Live portrait depth blur — applied BEFORE film sim effects so bokeh looks natural
         if let fStop = portraitFStop {
@@ -314,6 +326,85 @@ extension CameraManager {
         }
         return image
     }
+
+    // MARK: - Scan (shadow floor, white point, detail) after every look
+
+    nonisolated static func lookKey(_ r: ShotRecipe) -> String {
+        r.custom.map { "c-\(String(describing: $0).hashValue)" } ?? "s-\(r.sim.rawValue)"
+    }
+
+    /// Per-film scan settings: (shadow floor, white-point lift allowed, detail).
+    nonisolated static func scanProfile(_ sim: FilmSimulation?) -> (floor: Float, white: Bool, detail: Float)? {
+        guard let sim else { return (0.35, true, 0.45) }          // custom sims / imported LUTs
+        switch sim {
+        case .none, .circuitBent, .circuitBentHeavy: return nil
+        case .polaroid600, .polaroidSpectra, .polaroidSX70, .fujiInstax, .goldenHaze, .expiredFilm,
+             .saltPrint, .platinum, .vanDyke, .cyanotype, .digiCam:
+            return (0.35, true, 0)                                  // soft by design
+        case .tintype, .daguerreotype:  return (0.25, false, 0)
+        case .kodakAerochrome:          return (0.25, false, 0.4)
+        case .neonNoir, .styleStarkBW, .styleDramatic, .bleachBypass, .nightShot:
+            return (0.15, true, 0.5)                                 // contrast is the point
+        default: return (0.35, true, 0.45)
+        }
+    }
+
+    nonisolated(unsafe) private static var lookWhites: [String: Float] = [:]
+    nonisolated(unsafe) private static var lookWhitesPending: Set<String> = []
+    nonisolated private static let lookWhitesLock = NSLock()
+    nonisolated private static let scanQueue = DispatchQueue(label: "cam.scan.measure", qos: .utility)
+    nonisolated private static let scanContext = CIContext(options: [
+        .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!, .cacheIntermediates: false])
+
+    /// Linear luminance the look prints a near-white (0.96) at.
+    nonisolated private static func measureWhite(_ look: (CIImage) -> CIImage) -> Float {
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+        let patch = CIImage(color: CIColor(red: 0.96, green: 0.96, blue: 0.96, colorSpace: p3)!)
+            .cropped(to: CGRect(x: 0, y: 0, width: 32, height: 32))
+        var px = [Float](repeating: 0, count: 4)
+        scanContext.render(look(patch), toBitmap: &px, rowBytes: 16, bounds: CGRect(x: 16, y: 16, width: 1, height: 1),
+                           format: .RGBAf, colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3))
+        let y = 0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]
+        return y.isFinite ? y : 1
+    }
+
+    /// - measure: true on the photo path (measures the look's white now if
+    ///   unknown); the live path measures in the background and skips the
+    ///   white lift until it's known.
+    nonisolated static func scan(_ image: CIImage, original: CIImage, sim: FilmSimulation?, lookKey: String,
+                                 measure: Bool, look: @escaping (CIImage) -> CIImage) -> CIImage {
+        guard scanEnabled, let prof = scanProfile(sim), let k = filmKernel("scanGuard") else { return image }
+        var white: Float = 1
+        if prof.white {
+            lookWhitesLock.lock()
+            let known = lookWhites[lookKey]
+            let pending = lookWhitesPending.contains(lookKey)
+            if known == nil && !pending && !measure { lookWhitesPending.insert(lookKey) }
+            lookWhitesLock.unlock()
+            if let known { white = known }
+            else if measure {
+                white = measureWhite(look)
+                lookWhitesLock.lock(); lookWhites[lookKey] = white; lookWhitesLock.unlock()
+            } else if !pending {
+                scanQueue.async {
+                    let w = measureWhite(look)
+                    lookWhitesLock.lock(); lookWhites[lookKey] = w; lookWhitesPending.remove(lookKey); lookWhitesLock.unlock()
+                }
+            }
+        }
+        // Lift to where 0.96 would sit untouched (0.91 linear), at most +0.5 EV.
+        let gain = prof.white ? max(1, min(1.41, 0.91 / max(white, 0.05))) : 1
+        let e = image.extent
+        let radius = max(1.0, Double(max(e.width, e.height)) / 3000)
+        func blur(_ x: CIImage) -> CIImage {
+            x.clampedToExtent().applyingGaussianBlur(sigma: radius).cropped(to: e)
+        }
+        let detail = prof.detail
+        let lb = detail > 0 ? blur(image) : image, ob = detail > 0 ? blur(original) : original
+        return k.apply(extent: e, arguments: [image, original, lb, ob, prof.floor, gain, min(white, 1), detail]) ?? image
+    }
+    /// Off = looks exactly as before (for A/B in the audit).
+    nonisolated(unsafe) static var scanEnabled = true
 
     /// Capture-path entry: renders with the settings snapshotted at shutter time.
     nonisolated func applyFilmSim(to image: CIImage) -> CIImage {

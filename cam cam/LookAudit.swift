@@ -20,6 +20,67 @@
 import UIKit
 import CoreImage
 
+nonisolated enum PipelineAudit {
+    /// Set while -pipelineAudit runs: shots are measured and written to
+    /// Documents/pipeline instead of going to Photos.
+    nonisolated(unsafe) static var tag: String?
+    nonisolated(unsafe) static var lines: [String] = []
+
+    static func log(_ s: String) { print("[pipe] " + s); lines.append(s) }
+
+    struct Stats { var w = 0, h = 0; var mean: Float = 0, p1: Float = 0, p50: Float = 0, p99: Float = 0
+                   var clipHi: Float = 0, crushLo: Float = 0, detail: Float = 0 }
+
+    static func stats(_ img: CIImage, ctx: CIContext) -> Stats {
+        var st = Stats(); st.w = Int(img.extent.width); st.h = Int(img.extent.height)
+        let e = img.extent
+        let s = 512 / max(e.width, e.height)
+        let small = img.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+            .applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": s, "inputAspectRatio": 1])
+        let sw = Int(e.width * s), sh = Int(e.height * s)
+        var buf = [Float](repeating: 0, count: sw * sh * 4)
+        ctx.render(small, toBitmap: &buf, rowBytes: sw * 16, bounds: CGRect(x: 0, y: 0, width: sw, height: sh),
+                   format: .RGBAf, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        var y = (0..<(sw * sh)).map { 0.2126 * buf[$0 * 4] + 0.7152 * buf[$0 * 4 + 1] + 0.0722 * buf[$0 * 4 + 2] }
+        st.mean = y.reduce(0, +) / Float(max(y.count, 1))
+        st.clipHi = Float(y.filter { $0 > 0.98 }.count) / Float(y.count)
+        st.crushLo = Float(y.filter { $0 < 0.02 }.count) / Float(y.count)
+        y.sort()
+        st.p1 = y[y.count / 100]; st.p50 = y[y.count / 2]; st.p99 = y[y.count * 99 / 100]
+        // Fine texture at 100%: mean |high-pass| on a centre 512² crop.
+        let c = CGRect(x: e.midX - 256, y: e.midY - 256, width: 512, height: 512).integral
+        let hp = LookAudit.highPass(img, crop: c, ctx: ctx)
+        st.detail = hp.map { abs($0) }.reduce(0, +) / Float(hp.count) * 1000
+        return st
+    }
+
+    static func describe(_ s: Stats) -> String {
+        String(format: "%dx%d (%.1fMP) mean %.3f p1 %.3f p50 %.3f p99 %.3f clip %.2f%% crush %.2f%% detail %.2f",
+               s.w, s.h, Double(s.w * s.h) / 1e6, s.mean, s.p1, s.p50, s.p99, s.clipHi * 100, s.crushLo * 100, s.detail)
+    }
+
+    static func dump(base: CIImage?, rendered: CIImage, ctx: CIContext) {
+        guard let tag else { return }
+        let fm = FileManager.default
+        let dir = fm.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("pipeline")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        func save(_ img: CIImage, _ name: String) {
+            let e = img.extent
+            let c = CGRect(x: e.midX - 400, y: e.midY - 400, width: 800, height: 800).integral
+            try? ctx.writePNGRepresentation(of: img.cropped(to: c), to: dir.appendingPathComponent("\(tag)-\(name)-crop.png"),
+                                            format: .RGBA8, colorSpace: srgb)
+            let s = 1600 / max(e.width, e.height)
+            let small = img.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+                .applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": s, "inputAspectRatio": 1])
+            try? ctx.writeJPEGRepresentation(of: small, to: dir.appendingPathComponent("\(tag)-\(name).jpg"), colorSpace: srgb)
+        }
+        if let base { log("\(tag) base " + describe(stats(base, ctx: ctx))); save(base, "base") }
+        log("\(tag) film " + describe(stats(rendered, ctx: ctx))); save(rendered, "film")
+        try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("log.txt"), atomically: true, encoding: .utf8)
+    }
+}
+
 nonisolated enum LookAudit {
 
     // MARK: Lens samples (-lensSamples <image>) — every lens profile on one photo.
@@ -136,7 +197,35 @@ nonisolated enum LookAudit {
         func row(_ label: String, _ r: ShotRecipe) {
             let out = camera.renderLook(input, recipe: r, flatten: true).cropped(to: input.extent)
             let d = detail(out, vs: ref, crop: crop, ctx: ctx)
-            print(String(format: "[quality] %@  detail %.2f  added %.2f", label, d.slope, d.noise))
+            let st = PipelineAudit.stats(out, ctx: ctx)
+            print(String(format: "[quality] %@  detail %.2f  added %.2f | mean %.3f p1 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
+                         label, d.slope, d.noise, st.mean, st.p1, st.p99, st.crushLo * 100, st.clipHi * 100))
+        }
+        let inSt = PipelineAudit.stats(input, ctx: ctx)
+        print(String(format: "[quality] INPUT | mean %.3f p1 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
+                     inSt.mean, inSt.p1, inSt.p99, inSt.crushLo * 100, inSt.clipHi * 100))
+        if ProcessInfo.processInfo.arguments.contains("-noScan") { CameraManager.scanEnabled = false }
+        if ProcessInfo.processInfo.arguments.contains("-dumpSims") {
+            let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("sims")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let sc = 1400 / max(w, h)
+            let small = input.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": sc, "inputAspectRatio": 1])
+            let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+            for sim in [FilmSimulation.none, .kodakPortra, .fujiVelvia, .ilfordHP5, .cinestill800T, .kodakGold, .fujiClassicChrome] {
+                var x = ShotRecipe(); x.sim = sim
+                for on in [false, true] {
+                    CameraManager.scanEnabled = on
+                    let o = camera.renderLook(small, recipe: x, flatten: true).cropped(to: small.extent)
+                    try? ctx.writeJPEGRepresentation(of: o, to: dir.appendingPathComponent("\(sim.rawValue)-\(on ? "scan" : "old").jpg"), colorSpace: p3)
+                }
+            }
+            CameraManager.scanEnabled = true
+            print("[quality] dumped")
+            return
+        }
+        if ProcessInfo.processInfo.arguments.contains("-simsOnly") {
+            for sim in FilmSimulation.allCases { var x = ShotRecipe(); x.sim = sim; row("sim \(sim.rawValue)", x) }
+            return
         }
         var base = ShotRecipe(); base.sim = .kodakPortra
         row("Portra look only", base)
