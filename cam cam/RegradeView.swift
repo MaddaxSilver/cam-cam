@@ -11,6 +11,7 @@
 
 import SwiftUI
 import Photos
+import PhotosUI
 import CoreImage
 
 struct RegradeView: View {
@@ -25,6 +26,8 @@ struct RegradeView: View {
     @State private var filmFilter: String?       // albums by film
     @State private var makingSheet = false
     @State private var names: [String: String] = [:]
+    @State private var addingPhotos = false
+    @State private var picked: [PhotosPickerItem] = []
     private var shownIDs: [String] {
         guard let f = filmFilter else { return assetIDs }
         return assetIDs.filter { names[$0] == f }
@@ -56,6 +59,14 @@ struct RegradeView: View {
                 grid.transition(.move(edge: .leading))
             }
         }
+        .photosPicker(isPresented: $addingPhotos, selection: $picked, maxSelectionCount: 50,
+                      matching: .images, photoLibrary: .shared())
+        .onChange(of: picked) { _, items in
+            let ids = items.compactMap(\.itemIdentifier)
+            picked = []
+            guard !ids.isEmpty else { return }
+            Task { await PhotoSaver.addToAlbum(ids); await load() }
+        }
         .animation(.snappy(duration: 0.3), value: open)
         .animation(.easeOut(duration: 0.2), value: viewing)
         .preferredColorScheme(.dark)
@@ -78,6 +89,14 @@ struct RegradeView: View {
                     Text("\(assetIDs.count) photos").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
+                // Your own photos (shot anywhere): add them here to give them a film.
+                Button { addingPhotos = true } label: {
+                    Image(systemName: "plus").font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white).frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Circle())
+                .accessibilityLabel("Add photos from your library")
                 // Contact sheet of what's shown (the film filter = one roll).
                 Button { Task { await makeContactSheet() } } label: {
                     Group {

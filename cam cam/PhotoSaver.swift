@@ -181,6 +181,21 @@ nonisolated enum PhotoSaver {
         return placeholder
     }
 
+    /// Put photos from the library (shot anywhere) into the cam cam album so
+    /// the gallery can give them a film. Nothing is copied or changed.
+    static func addToAlbum(_ localIDs: [String]) async {
+        guard await authorize() == .authorized || PHPhotoLibrary.authorizationStatus(for: .readWrite) == .limited else { return }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: localIDs, options: nil)
+        guard assets.count > 0 else { return }
+        try? await PHPhotoLibrary.shared().performChanges {
+            if let album = albumIfExists() {
+                PHAssetCollectionChangeRequest(for: album)?.addAssets(assets)
+            } else {
+                PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: albumTitle).addAssets(assets)
+            }
+        }
+    }
+
     static func albumIfExists() -> PHAssetCollection? {
         let opts = PHFetchOptions()
         opts.predicate = NSPredicate(format: "title == %@", albumTitle)
