@@ -2914,8 +2914,14 @@ import CoreLocation
             let sx = ciImage.extent.width  / depthCI.extent.width
             let sy = ciImage.extent.height / depthCI.extent.height
             let s  = max(sx, sy)
-            let scaledDepth = depthCI.transformed(by: CGAffineTransform(scaleX: s, y: s))
-            let blurred = applyPortraitBlurFromCIImage(to: ciImage, disparityCI: scaledDepth, fStop: pendingPortraitFStop)
+            var scaledDepth = depthCI.transformed(by: CGAffineTransform(scaleX: s, y: s))
+            // Pixel-2-style: the subject's segmentation fixes the coarse depth
+            // (edges, hair, an off-centre subject).
+            var focus: CGRect?
+            if let r = SubjectDepth.refine(disparity: scaledDepth, image: ciImage, context: photoContext) {
+                scaledDepth = r.disparity; focus = r.focusRect
+            }
+            let blurred = applyPortraitBlurFromCIImage(to: ciImage, disparityCI: scaledDepth, fStop: pendingPortraitFStop, focusRect: focus)
             pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
             let recipe = pendingRecipe()
             publishQuickPreview(blurred, recipe: recipe)
@@ -3051,17 +3057,17 @@ import CoreLocation
         return rings.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: blurred]).cropped(to: e)
     }
 
-    nonisolated func applyPortraitBlurFromCIImage(to image: CIImage, disparityCI: CIImage, fStop: Float) -> CIImage {
+    nonisolated func applyPortraitBlurFromCIImage(to image: CIImage, disparityCI: CIImage, fStop: Float, focusRect: CGRect? = nil) -> CIImage {
         if Self.bokehStyle == 1 {
             let far = disparityCI.applyingFilter("CIColorInvert")
                 .applyingFilter("CIColorControls", parameters: [kCIInputContrastKey: 2.0])
-            return soapBubbles(applySmoothPortraitBlur(image, disparityCI: disparityCI, fStop: fStop),
+            return soapBubbles(applySmoothPortraitBlur(image, disparityCI: disparityCI, fStop: fStop, focusRect: focusRect),
                                original: image, far: far, fStop: fStop)
         }
-        return applySmoothPortraitBlur(image, disparityCI: disparityCI, fStop: fStop)
+        return applySmoothPortraitBlur(image, disparityCI: disparityCI, fStop: fStop, focusRect: focusRect)
     }
 
-    nonisolated private func applySmoothPortraitBlur(_ image: CIImage, disparityCI: CIImage, fStop: Float) -> CIImage {
+    nonisolated private func applySmoothPortraitBlur(_ image: CIImage, disparityCI: CIImage, fStop: Float, focusRect: CGRect? = nil) -> CIImage {
         if let filter = CIFilter(name: "CIDepthBlurEffect") {
             filter.setValue(image,        forKey: kCIInputImageKey)
             filter.setValue(disparityCI,  forKey: "inputDisparityImage")
@@ -3070,8 +3076,8 @@ import CoreLocation
             let cx = image.extent.midX
             let cy = image.extent.midY
             let focusSize = min(image.extent.width, image.extent.height) * 0.3
-            filter.setValue(CIVector(cgRect: CGRect(x: cx - focusSize/2, y: cy - focusSize/2,
-                                                    width: focusSize, height: focusSize)),
+            filter.setValue(CIVector(cgRect: focusRect ?? CGRect(x: cx - focusSize/2, y: cy - focusSize/2,
+                                                                  width: focusSize, height: focusSize)),
                             forKey: "inputFocusRect")
             if let out = filter.outputImage { return out.cropped(to: image.extent) }
         }
