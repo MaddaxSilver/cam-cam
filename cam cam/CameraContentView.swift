@@ -524,6 +524,19 @@ struct CameraContentView: View {
                     }
                 }
             }
+            if ProcessInfo.processInfo.arguments.contains("-portraitAudit") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    camera.portraitModeEnabled = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                        PipelineAudit.tag = "portrait"
+                        PipelineAudit.log("portrait device \(camera.currentDevice?.localizedName ?? "?") liveDepth \(camera.latestDepthPixelBuffer != nil) mono \(camera.latestMonoDisparity != nil)")
+                        camera.capturePhoto()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+                            PipelineAudit.tag = nil; camera.portraitModeEnabled = false; PipelineAudit.log("done")
+                        }
+                    }
+                }
+            }
             if ProcessInfo.processInfo.arguments.contains("-teleAudit") {
                 let savedIdx = camera.selectedFocalIndex
                 func shoot(_ idx: Int, _ tag: String, then: @escaping () -> Void) {

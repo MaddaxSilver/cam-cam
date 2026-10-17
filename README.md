@@ -59,6 +59,8 @@ Requirements: Xcode 26 or later (iOS 26.2 SDK), and an iPhone. The simulator has
 2. Under *Signing & Capabilities* for the **cam cam** target, pick your own team and set a unique bundle identifier.
 3. Build and run on a device.
 
+Optional: `scripts/fetch-models.sh` downloads Depth Anything V2 Small (Apache-2.0, Apple's Core ML conversion, ~50 MB; kept out of git). With it, Portrait works at 48MP on any lens, with depth taken from the photo itself and fitted to the camera's depth when that exists. Without it, Portrait uses the camera's depth stream.
+
 The Core Image Metal kernels in `shaders/` are compiled ahead of time into `cam cam/*.metallib`, so normal builds don't need the Metal toolchain. After editing a shader, run:
 
 ```sh
@@ -95,4 +97,5 @@ In Debug builds, these launch arguments run a test and print `[pipe]`, `[quality
 
 ## Credits
 
+- Portrait depth (optional): Depth Anything V2 Small, Apache-2.0, via Apple's Core ML conversion.
 - The measured film stocks are LUTs from **spektrafilm** by Andrea Volpato, licensed CC BY-SA 4.0. See `cam cam/Films/SPEKTRAFILM_LICENSE.txt`.

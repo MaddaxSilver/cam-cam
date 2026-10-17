@@ -549,9 +549,9 @@ struct GlassChrome<Shutter: View>: View {
                     Tile(title: "Push / pull", symbol: "plusminus", isOn: $camera.pushPullEnabled),
                     Tile(title: "RAW+", symbol: "r.square", isOn: $camera.rawEnabled),
                     Tile(title: "Portrait", symbol: "person.crop.circle", isOn: $camera.portraitModeEnabled,
-                         enabled: camera.portraitModeAvailable && CameraManager.hasDepthCamera
+                         enabled: MonoDepth.available || (camera.portraitModeAvailable && CameraManager.hasDepthCamera
                             && focalPresets.indices.contains(camera.selectedFocalIndex)
-                            && focalPresets[camera.selectedFocalIndex].deviceType != .builtInUltraWideCamera),
+                            && focalPresets[camera.selectedFocalIndex].deviceType != .builtInUltraWideCamera)),
                     Tile(title: "Manual focus", symbol: "scope",
                          isOn: Binding(get: { camera.manualFocusEnabled }, set: { camera.setManualFocusEnabled($0) })),
                     Tile(title: "One lens", symbol: "arrow.left.and.right.circle", isOn: $camera.unifiedZoomMode),

@@ -39,3 +39,7 @@ audit/
 # Frame guide training data (pulled from the phone)
 training/data/
 training/.build/
+
+# Optional ML models (scripts/fetch-models.sh)
+cam cam/Models/*.mlpackage/
+cam cam/Models/*.task

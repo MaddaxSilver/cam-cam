@@ -205,6 +205,52 @@ nonisolated enum LookAudit {
         print(String(format: "[quality] INPUT | mean %.3f p1 %.3f p50 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
                      inSt.mean, inSt.p1, inSt.p50, inSt.p99, inSt.crushLo * 100, inSt.clipHi * 100))
         if ProcessInfo.processInfo.arguments.contains("-noScan") { CameraManager.scanEnabled = false }
+        if ProcessInfo.processInfo.arguments.contains("-depthTest") {
+            let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let t0 = CACurrentMediaTime()
+            guard let d = MonoDepth.disparity(of: input) else { print("[quality] depth: no model"); return }
+            let tA = CACurrentMediaTime()
+            _ = MonoDepth.disparity(of: input).map { PipelineAudit.stats($0, ctx: ctx) }
+            let previewSize = input.transformed(by: CGAffineTransform(scaleX: 0.08, y: 0.08))
+            let tB = CACurrentMediaTime()
+            _ = MonoDepth.disparity(of: previewSize).map { PipelineAudit.stats($0, ctx: ctx) }
+            print(String(format: "[quality] depth first %.0f ms, again (48MP) %.0f ms, preview-size %.0f ms",
+                         (tA - t0) * 1000, (tB - tA) * 1000, (CACurrentMediaTime() - tB) * 1000))
+            let cal = MonoDepth.calibrated(d, to: nil, context: ctx)
+            let sc = 1200 / max(w, h)
+            let small = cal.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": sc / 2, "inputAspectRatio": 1])
+            try? ctx.writePNGRepresentation(of: small, to: dir.appendingPathComponent("depth.png"), format: .RGBA8,
+                                            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+            let mt = CACurrentMediaTime()
+            if let r = SubjectDepth.refine(disparity: cal, image: input, context: ctx) {
+                print(String(format: "[quality] subject box %@", NSCoder.string(for: r.focusRect)))
+                let rs = r.disparity.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": sc / 2, "inputAspectRatio": 1])
+                try? ctx.writePNGRepresentation(of: rs, to: dir.appendingPathComponent("depth-refined.png"), format: .RGBA8,
+                                                colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+            }
+            print(String(format: "[quality] depth %.0f ms, subject %.0f ms", (mt - t0) * 1000, (CACurrentMediaTime() - mt) * 1000))
+            let r = SubjectDepth.refine(disparity: cal, image: input, context: ctx)
+            for (name, disp, focus) in [("mono", cal, nil as CGRect?), ("refined", r?.disparity ?? cal, r?.focusRect)] {
+                let t1 = CACurrentMediaTime()
+                let out = camera.applyPortraitBlurFromCIImage(to: input, disparityCI: disp, fStop: 2.8, focusRect: focus)
+                let st = PipelineAudit.stats(out, ctx: ctx)
+                print(String(format: "[quality] blur %@ mean %.3f extent %@ %.0f ms", name, st.mean, NSCoder.string(for: out.extent), (CACurrentMediaTime() - t1) * 1000))
+            }
+            var pin = input.oriented(.right)
+            pin = pin.transformed(by: CGAffineTransform(translationX: -pin.extent.minX, y: -pin.extent.minY))
+            if let pd = MonoDepth.disparity(of: pin) {
+                let pc = MonoDepth.calibrated(pd, to: nil, context: ctx)
+                let pst = PipelineAudit.stats(pc, ctx: ctx)
+                let pr = SubjectDepth.refine(disparity: pc, image: pin, context: ctx)
+                let out = camera.applyPortraitBlurFromCIImage(to: pin, disparityCI: pr?.disparity ?? pc, fStop: 2.8, focusRect: pr?.focusRect)
+                let ost = PipelineAudit.stats(out, ctx: ctx)
+                print(String(format: "[quality] portrait-orient disparity mean %.3f extent %@ | blur mean %.3f extent %@", pst.mean,
+                             NSCoder.string(for: pc.extent), ost.mean, NSCoder.string(for: out.extent)))
+            } else { print("[quality] portrait-orient: no depth") }
+            let dst = PipelineAudit.stats(cal, ctx: ctx)
+            print(String(format: "[quality] disparity mean %.3f p1 %.3f p99 %.3f extent %@", dst.mean, dst.p1, dst.p99, NSCoder.string(for: cal.extent)))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-volumes") {
             for sim in FilmSimulation.allCases {
                 var x = ShotRecipe(); x.sim = sim

@@ -98,11 +98,16 @@ import CoreLocation
     // Portrait mode
     var portraitModeEnabled: Bool = false {
         didSet {
-            portraitSessionWanted = portraitModeEnabled
+            portraitSessionWanted = portraitNeedsDepthCamera
+            if portraitModeEnabled { MonoDepth.prewarm() }
             applyPortraitModeSession()
             if portraitModeEnabled != oldValue { routeForPortrait() }
         }
     }
+    /// Portrait needs the multi-lens camera's 12MP depth format — unless
+    /// Depth Anything is bundled and we're at Max: then Portrait stays on the
+    /// 48MP main lens and the depth comes from the photo itself.
+    var portraitNeedsDepthCamera: Bool { portraitModeEnabled && !(full48 && MonoDepth.available) }
     /// Portrait wanted (read on the session queue when picking formats).
     @ObservationIgnored nonisolated(unsafe) var portraitSessionWanted = false
     /// The phone has a multi-lens back camera, which is what produces depth.
@@ -260,7 +265,10 @@ import CoreLocation
     var photoQuality: Int = 2 { // 0 speed, 1 balanced, 2 quality (Max), 3 natural (ProRAW, no Apple processing)
         didSet {
             UserDefaults.standard.set(photoQuality, forKey: "cc_photoQuality")
-            if unifiedZoomMode, (oldValue >= 2) != (photoQuality >= 2), currentDevice != nil { routeForPortrait() }
+            if (oldValue >= 2) != (photoQuality >= 2), currentDevice != nil, unifiedZoomMode || portraitModeEnabled {
+                portraitSessionWanted = portraitNeedsDepthCamera
+                routeForPortrait()
+            }
         }
     }
     /// Observable so the UI follows it; the capture/render queues read the mirror.
@@ -924,7 +932,7 @@ import CoreLocation
         guard preset.deviceType != .builtInUltraWideCamera else { return }   // no depth there
         let onVirtual = [.builtInTripleCamera, .builtInDualCamera, .builtInDualWideCamera]
             .contains(currentDevice?.deviceType)
-        let wantsVirtual = portraitModeEnabled || preset.useVirtualDevice || oneLensActive
+        let wantsVirtual = portraitNeedsDepthCamera || preset.useVirtualDevice || oneLensActive
         let intentZoom = CGFloat(Double(currentMM) / 26.0)
         lastRequestedZoom = intentZoom
         if wantsVirtual && !onVirtual {
@@ -1799,7 +1807,8 @@ import CoreLocation
     /// Also clears the depth cache so we don't apply stale depth from a
     /// previous (depth-capable) device to a new (no-depth) device's photo.
     nonisolated func updateDepthAvailability(for device: AVCaptureDevice) {
-        let supportsDepth = !device.activeFormat.supportedDepthDataFormats.isEmpty
+        // With Depth Anything bundled, any lens can do Portrait (depth from the photo).
+        let supportsDepth = !device.activeFormat.supportedDepthDataFormats.isEmpty || MonoDepth.available
         // Always clear the cache on swap — it was captured against the OLD device.
         latestDepthPixelBuffer = nil
         DispatchQueue.main.async {
@@ -2889,7 +2898,7 @@ import CoreLocation
     }
 
     /// Portrait capture using the live-streamed depth pixel buffer from AVCaptureDepthDataOutput.
-    nonisolated func processAndSavePortraitFromBuffer(imageData: Data, depthBuffer: CVPixelBuffer, rawID: Int64? = nil, shot: (@Sendable () -> Void)? = nil) {
+    nonisolated func processAndSavePortraitFromBuffer(imageData: Data, depthBuffer: CVPixelBuffer?, rawID: Int64? = nil, shot: (@Sendable () -> Void)? = nil) {
         DispatchQueue.main.async { self.isCapturing = false }
         // CVPixelBuffer is not Sendable — rebind before the closure captures it
         nonisolated(unsafe) let sendableBuffer = depthBuffer
@@ -2910,11 +2919,26 @@ import CoreLocation
             // Scale the depth map uniformly to full photo resolution. Using max()
             // ensures depth covers the image even on slight aspect mismatch and
             // prevents geometric warping that would mis-project subject depth.
-            let depthCI = CIImage(cvPixelBuffer: sendableBuffer)
-            let sx = ciImage.extent.width  / depthCI.extent.width
-            let sy = ciImage.extent.height / depthCI.extent.height
-            let s  = max(sx, sy)
-            var scaledDepth = depthCI.transformed(by: CGAffineTransform(scaleX: s, y: s))
+            var cameraDepth: CIImage?
+            if let buf = sendableBuffer {
+                let depthCI = CIImage(cvPixelBuffer: buf)
+                let sx = ciImage.extent.width  / depthCI.extent.width
+                let sy = ciImage.extent.height / depthCI.extent.height
+                let s  = max(sx, sy)
+                cameraDepth = depthCI.transformed(by: CGAffineTransform(scaleX: s, y: s)).cropped(to: ciImage.extent)
+            }
+            // Depth Anything (if bundled): sharper, scene-wide depth from the
+            // photo itself, fitted to the camera's depth when there is one.
+            var scaledDepth: CIImage
+            if let mono = MonoDepth.disparity(of: ciImage) {
+                scaledDepth = MonoDepth.calibrated(mono, to: cameraDepth, context: photoContext)
+            } else if let cameraDepth {
+                scaledDepth = cameraDepth
+            } else {
+                renderAndSave(ciImage: applySimAndGrain(to: ciImage), metadata: originalMetadata, base: ciImage,
+                              recipe: pendingRecipe(), raw: takeRAW(id: rawID))
+                return
+            }
             // Pixel-2-style: the subject's segmentation fixes the coarse depth
             // (edges, hair, an off-centre subject).
             var focus: CGRect?
@@ -2922,6 +2946,14 @@ import CoreLocation
                 scaledDepth = r.disparity; focus = r.focusRect
             }
             let blurred = applyPortraitBlurFromCIImage(to: ciImage, disparityCI: scaledDepth, fStop: pendingPortraitFStop, focusRect: focus)
+            #if DEBUG
+            if PipelineAudit.tag != nil {
+                for (n, im) in [("in", ciImage), ("depth", scaledDepth), ("blurred", blurred)] {
+                    PipelineAudit.log("portrait step \(n) " + PipelineAudit.describe(PipelineAudit.stats(im, ctx: photoContext)) + " extent \(im.extent)")
+                }
+                PipelineAudit.log("portrait fstop \(pendingPortraitFStop) focus \(String(describing: focus))")
+            }
+            #endif
             pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
             let recipe = pendingRecipe()
             publishQuickPreview(blurred, recipe: recipe)
@@ -3098,9 +3130,34 @@ import CoreLocation
     }
 
     /// Applies a fast live-preview portrait blur to a video frame using the cached depth buffer.
+    /// Live preview depth from Depth Anything when the camera streams none
+    /// (48MP Portrait on the main lens), refreshed a few times a second.
+    @ObservationIgnored nonisolated(unsafe) var latestMonoDisparity: CIImage?
+    @ObservationIgnored nonisolated(unsafe) private var monoBusy = false
+    @ObservationIgnored nonisolated(unsafe) private var monoAt: Double = 0
+    nonisolated private static let monoQueue = DispatchQueue(label: "cam.monodepth", qos: .utility)
+    nonisolated func updateLiveMonoDepth(_ frame: CIImage) {
+        let t = CACurrentMediaTime()
+        guard MonoDepth.available, !monoBusy, t - monoAt > 0.35, !hasShotsInFlight else { return }
+        monoBusy = true; monoAt = t
+        let s = 640 / max(frame.extent.width, frame.extent.height)
+        let small = frame.transformed(by: CGAffineTransform(scaleX: s, y: s))
+        Self.monoQueue.async { [self] in
+            defer { monoBusy = false }
+            guard let cg = gpuPhotoContext.createCGImage(small, from: small.extent),
+                  let d = MonoDepth.disparity(of: CIImage(cgImage: cg)),
+                  let dcg = gpuPhotoContext.createCGImage(MonoDepth.calibrated(d, to: nil, context: gpuPhotoContext),
+                                                          from: d.extent, format: .RGBAh, colorSpace: nil)
+            else { return }
+            latestMonoDisparity = CIImage(cgImage: dcg)
+        }
+    }
+
     nonisolated func applyLivePortraitBlur(to image: CIImage, fStop: Float) -> CIImage {
-        guard let depthBuffer = latestDepthPixelBuffer else { return image }
-        let disparityImage = CIImage(cvPixelBuffer: depthBuffer)
+        let disparityImage: CIImage
+        if let depthBuffer = latestDepthPixelBuffer { disparityImage = CIImage(cvPixelBuffer: depthBuffer) }
+        else if let mono = latestMonoDisparity { disparityImage = mono }
+        else { return image }
 
         // Scale uniformly using the larger of the two ratios so the depth map
         // always covers the full image. Non-uniform scale would warp the depth
@@ -3454,7 +3511,7 @@ import CoreLocation
         //   • Unified-zoom mode is on AND the preset isn't ultrawide (which can only
         //     be reached via the physical builtInUltraWideCamera).
         let useVirtual = preset.useVirtualDevice
-            || ((oneLensActive || portraitModeEnabled) && preset.deviceType != .builtInUltraWideCamera)
+            || ((oneLensActive || portraitNeedsDepthCamera) && preset.deviceType != .builtInUltraWideCamera)
 
         // intentZoom = preset's mm in our 26mm-based scale. setZoom takes intent.
         // For swap calls that take a device-specific zoom we apply the prospective
@@ -3466,7 +3523,7 @@ import CoreLocation
         // 120mm: the real telephoto, always. Through the multi-lens camera iOS
         // kept the main lens and cropped 6.9× in dim light (soft 12MP, wrong
         // exposure) — "switching on me". Portrait / One lens still use it.
-        if preset.useVirtualDevice, !portraitModeEnabled, !oneLensActive, Self.teleIntent != nil {
+        if preset.useVirtualDevice, !portraitNeedsDepthCamera, !oneLensActive, Self.teleIntent != nil {
             if currentType == .builtInTelephotoCamera, let device = currentDevice {
                 sessionQueue.async { [weak self] in self?.applyZoom(factor: 1, on: device) }
             } else {
@@ -3720,7 +3777,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         var filtered = applyLiveLook(scaled, grainTextures: true)
 
         // Live portrait depth blur in preview (uses cached depth from AVCaptureDepthDataOutput)
-        if pendingPortraitEnabled && latestDepthPixelBuffer != nil {
+        if pendingPortraitEnabled && latestDepthPixelBuffer == nil { updateLiveMonoDepth(ciImage) }
+        if pendingPortraitEnabled && (latestDepthPixelBuffer != nil || latestMonoDisparity != nil) {
             filtered = applyLivePortraitBlur(to: filtered, fStop: pendingPortraitFStop)
         }
 
@@ -3894,8 +3952,8 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         // Portrait mode: apply high-quality depth blur using the most recent live depth frame.
         // (Depth is delivered via AVCaptureDepthDataOutput, not embedded in AVCapturePhoto
         //  when a separate depth output is in the session.)
-        if shot?.portrait ?? pendingPortraitEnabled, let depthBuffer = latestDepthPixelBuffer {
-            processAndSavePortraitFromBuffer(imageData: data, depthBuffer: depthBuffer, rawID: pairedRAWID, shot: shot?.apply)
+        if shot?.portrait ?? pendingPortraitEnabled, latestDepthPixelBuffer != nil || MonoDepth.available {
+            processAndSavePortraitFromBuffer(imageData: data, depthBuffer: latestDepthPixelBuffer, rawID: pairedRAWID, shot: shot?.apply)
         } else {
             processAndSaveJPEG(imageData: data, rawID: pairedRAWID, shot: shot?.apply)
         }
