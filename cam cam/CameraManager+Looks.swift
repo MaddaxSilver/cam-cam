@@ -2630,8 +2630,11 @@ extension CameraManager {
     /// little before adding film grain so the grain replaces it instead of
     /// stacking on top (how a real film shot looks: grain, not speckle).
     nonisolated static func cleanSensorNoise(_ image: CIImage, iso: Float?) -> CIImage {
-        guard let iso, iso >= 640 else { return image }
-        let level = min(0.035, 0.008 * log2(iso / 320))
+        // From ISO 200: below 640 the sensor's own (finer) noise was left under
+        // the film grain, and two grain textures of different sizes read as
+        // grain applied twice. Gentle at low ISO, as before at high ISO.
+        guard let iso, iso >= 200 else { return image }
+        let level = min(0.035, 0.006 * log2(iso / 100))
         return image.applyingFilter("CINoiseReduction", parameters: ["inputNoiseLevel": level, "inputSharpness": 0.45])
             .cropped(to: image.extent)
     }
