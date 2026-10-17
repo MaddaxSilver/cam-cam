@@ -58,6 +58,10 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
     /// Developed as a cross-process (slide film in C-41).
     var crossProcessed = false
 
+    /// Look strength: 1 = the film as designed, 0 = the original (mixed
+    /// before grain and effects). See LookVolume.
+    var strength: Float = 1
+
     /// A recipe that changes nothing (no sim, no effects).
     var isIdentity: Bool {
         sim == .none && custom == nil && !grainEnabled && !crosstalkEnabled
@@ -79,7 +83,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         case crosstalkEnabled, crosstalk, halationEnabled, halation, rolloffEnabled, rolloff
         case pushPullEnabled, pushPull, anamorphicFlare, lightArtifacts, filmScratches
         case randomization, randomSeed
-        case styleTone, styleColor, stylePalette, crossProcessed, development, sceneISO
+        case styleTone, styleColor, stylePalette, crossProcessed, development, sceneISO, strength
     }
 
     init() {}
@@ -112,6 +116,7 @@ nonisolated struct ShotRecipe: Codable, Sendable, Equatable {
         crossProcessed   = v(.crossProcessed, false)
         development      = v(.development, Float(0))
         sceneISO         = (try? c.decodeIfPresent(Float.self, forKey: .sceneISO)) ?? nil
+        strength         = v(.strength, Float(1))
     }
 
     func encoded() -> Data? { try? JSONEncoder().encode(self) }

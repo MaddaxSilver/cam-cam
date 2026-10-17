@@ -71,6 +71,18 @@ struct FilmLibrarySheet: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 0, trailing: 16))
                 }
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Look strength")
+                            Spacer()
+                            Text("\(Int((camera.lookStrength * 100).rounded()))%").monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        Slider(value: $camera.lookStrength, in: 0...1, step: 0.05).tint(.yellow)
+                    }
+                } footer: {
+                    Text("Volume is how strongly a film changes colour and tone, measured on a colour chart (ΔE: 5 subtle, 10 clear, 20+ heavy). Strength turns every film down toward the original.")
+                }
                 let pinned = items.filter { favorites.isFavorite($0.key) }
                 if !pinned.isEmpty && filter != .pinned {
                     Section("Pinned") { ForEach(pinned) { row($0) } }
@@ -104,7 +116,8 @@ struct FilmLibrarySheet: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.label).font(.body.weight(isSel ? .bold : .regular))
                     .foregroundStyle(isSel ? Color.yellow : .primary)
-                Text(kind(item)).font(.footnote).foregroundStyle(.secondary)
+                Text([kind(item), tones.volumeText(item.key)].compactMap { $0 }.joined(separator: " · "))
+                    .font(.footnote).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
             }
             Spacer()
             Button { favorites.toggle(item.key) } label: {

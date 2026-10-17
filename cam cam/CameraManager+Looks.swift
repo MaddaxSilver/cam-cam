@@ -54,6 +54,10 @@ extension CameraManager {
                     ?? applyFilmSim(to: x, sim: sim, grainEnabled: false, grain: 0, digiCamQuality: cachedDigiCamQuality)
             }
         }
+        img = Self.mixStrength(input: input, look: img,
+                               strength: cachedLookStrength * (custom == nil ? Self.loudnessGain(sim, measure: false) { [self] x in
+                                   applyFilmSim(to: x, sim: sim, grainEnabled: false, grain: 0, digiCamQuality: cachedDigiCamQuality)
+                               } : 1))
         // Under thermal pressure, keep the base look but drop the expensive
         // extras from the live path (captures are unaffected).
         if cachedDevelopment > 0 { img = applyDevelopment(img, strength: cachedDevelopment) }
@@ -164,6 +168,7 @@ extension CameraManager {
         r.randomization = pendingRandomizationEnabled
         r.randomSeed = pendingRandomSeed
         r.styleTone = StyleSettings.cTone; r.styleColor = StyleSettings.cColor; r.stylePalette = StyleSettings.cPalette
+        r.strength = pendingLookStrength
         return r
     }
 
@@ -189,6 +194,7 @@ extension CameraManager {
         r.randomization = cachedFilmRandomization
         r.randomSeed = seed
         r.styleTone = StyleSettings.cTone; r.styleColor = StyleSettings.cColor; r.stylePalette = StyleSettings.cPalette
+        r.strength = cachedLookStrength
         return r
     }
 
@@ -246,6 +252,10 @@ extension CameraManager {
             r.custom.map { applyCustomSim(to: x, sim: $0) }
                 ?? applyFilmSim(to: x, sim: r.sim, grainEnabled: false, grain: 0, digiCamQuality: r.digiCamQuality)
         }
+        image = Self.mixStrength(input: input, look: image,
+                                 strength: r.strength * (r.custom == nil ? Self.loudnessGain(r.sim, measure: !(portraitFStop != nil && !flatten)) { [self] x in
+                                     applyFilmSim(to: x, sim: r.sim, grainEnabled: false, grain: 0, digiCamQuality: r.digiCamQuality)
+                                 } : 1))
 
         // Live portrait depth blur — applied BEFORE film sim effects so bokeh looks natural
         if let fStop = portraitFStop {
@@ -405,6 +415,63 @@ extension CameraManager {
         let lb = detail > 0 ? blur(image) : image, ob = detail > 0 ? blur(original) : original
         return k.apply(extent: e, arguments: [image, original, lb, ob, prof.floor, gain, min(white, 1), detail]) ?? image
     }
+    // MARK: Loudness normalisation
+    //
+    // Measured on a colour chart (LookVolume), most film stocks change colour
+    // and tone by ΔE 7–11; a few hand-built ones went to 16–29 (strong casts,
+    // +20–45% saturation): the "filter app" look. Like audio loudness
+    // normalisation, a photographic colour film louder than the target is
+    // turned down to it. B&W (measured), alternative processes and the
+    // deliberately creative looks are left as designed.
+
+    nonisolated static let loudnessTarget: Float = 12
+    nonisolated static let creativeLooks: Set<FilmSimulation> = [
+        .none, .kodakAerochrome, .lomochromePurple, .lomochromeMetropolis, .lomochromeTurquoise,
+        .cyanotype, .daguerreotype, .tintype, .platinum, .vanDyke, .saltPrint, .duotone,
+        .neonNoir, .retroChrome, .goldenHaze, .urbanJade, .expiredFilm, .crossProcess, .bleachBypass,
+        .nightShot, .digiCam, .circuitBent, .circuitBentHeavy, .lomography,
+        .polaroid600, .polaroidSX70, .polaroidSpectra, .polaroidiType, .fujiInstax,
+    ]
+    nonisolated(unsafe) private static var loudness: [FilmSimulation: Float] = [:]
+    nonisolated(unsafe) private static var loudnessPending: Set<FilmSimulation> = []
+    nonisolated private static let loudnessLock = NSLock()
+
+    /// 0…1 multiplier on the look's strength (1 = as designed).
+    nonisolated static func loudnessGain(_ sim: FilmSimulation, measure: Bool, look: @escaping (CIImage) -> CIImage) -> Float {
+        guard !creativeLooks.contains(sim), sim.styleKind == nil else { return 1 }
+        loudnessLock.lock()
+        if let g = loudness[sim] { loudnessLock.unlock(); return g }
+        let pending = loudnessPending.contains(sim)
+        if !measure && !pending { loudnessPending.insert(sim) }
+        loudnessLock.unlock()
+        func compute() -> Float {
+            let ctx = CameraManager.inBackground ? scanCPUContext : scanContext
+            guard let v = LookVolume.measure(look, context: ctx) else { return 1 }
+            if v.saturation < -0.8 { return 1 }                    // black and white
+            return v.deltaE > loudnessTarget ? loudnessTarget / v.deltaE : 1
+        }
+        if measure {
+            let g = compute()
+            loudnessLock.lock(); loudness[sim] = g; loudnessLock.unlock()
+            return g
+        }
+        if !pending {
+            scanQueue.async {
+                let g = compute()
+                loudnessLock.lock(); loudness[sim] = g; loudnessPending.remove(sim); loudnessLock.unlock()
+            }
+        }
+        return 1
+    }
+
+    /// Look strength: mix the graded image with the original.
+    nonisolated static func mixStrength(input: CIImage, look: CIImage, strength: Float) -> CIImage {
+        guard strength < 0.995 else { return look }
+        let e = look.extent
+        return input.applyingFilter("CIDissolveTransition", parameters: [
+            kCIInputTargetImageKey: look, "inputTime": max(0, min(1, strength))]).cropped(to: e)
+    }
+
     /// Off = looks exactly as before (for A/B in the audit).
     nonisolated(unsafe) static var scanEnabled = true
 
@@ -2333,13 +2400,11 @@ extension CameraManager {
         return curve.outputImage ?? input
     }
 
-    nonisolated func claritySharpen(input: CIImage) -> CIImage {
-        let filter = CIFilter.unsharpMask()
-        filter.inputImage = input
-        filter.intensity = 0.6
-        filter.radius = 1.5
-        return filter.outputImage ?? input
-    }
+    /// Used to be a 1.5 px unsharp mask at 60%: on a 48MP iPhone photo
+    /// (already sharpened by Apple) it sharpened sensor noise, which read as
+    /// a second grain and the crunchy "filter app" look. The scan stage now
+    /// keeps the photo's real detail instead, so this is a no-op.
+    nonisolated func claritySharpen(input: CIImage) -> CIImage { input }
 
     /// Isolate one of R/G/B as its own grayscale-in-channel image. Used by
     /// circuitBend to separate planes before shifting them spatially.

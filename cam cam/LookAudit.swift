@@ -205,6 +205,16 @@ nonisolated enum LookAudit {
         print(String(format: "[quality] INPUT | mean %.3f p1 %.3f p50 %.3f p99 %.3f crush %.1f%% clip %.1f%%",
                      inSt.mean, inSt.p1, inSt.p50, inSt.p99, inSt.crushLo * 100, inSt.clipHi * 100))
         if ProcessInfo.processInfo.arguments.contains("-noScan") { CameraManager.scanEnabled = false }
+        if ProcessInfo.processInfo.arguments.contains("-volumes") {
+            for sim in FilmSimulation.allCases {
+                var x = ShotRecipe(); x.sim = sim
+                if let v = LookVolume.measure({ camera.renderLook($0, recipe: x, flatten: false) }, context: ctx) {
+                    print(String(format: "[volume] %@ dE %.1f tone %.1f colour %.1f sat %+.0f%% mid %+.2fEV contrast %.2f",
+                                 sim.rawValue, v.deltaE, v.tone, v.colour, v.saturation * 100, v.midEV, v.contrast))
+                }
+            }
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-cpuTest") {
             let cpu = CIContext(options: [.useSoftwareRenderer: true, .workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3)!])
             let sc = 4032 / max(w, h)

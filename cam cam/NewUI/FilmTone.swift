@@ -18,6 +18,8 @@ final class FilmToneStore {
     static let shared = FilmToneStore()
 
     private(set) var tones: [String: Color] = [:]
+    /// Measured look volume per film: [ΔE, mid-grey EV, saturation] (LookVolume).
+    private(set) var volumes: [String: [Double]] = [:]
     @ObservationIgnored private var pending: Set<String> = []
     /// Measured tones survive launches (hue, saturation, brightness per key),
     /// so the dial doesn't re-render every film (and re-parse every LUT) on
@@ -29,6 +31,7 @@ final class FilmToneStore {
 
     init() {
         saved = UserDefaults.standard.dictionary(forKey: Self.cacheKey) as? [String: [Double]] ?? [:]
+        volumes = UserDefaults.standard.dictionary(forKey: Self.cacheKey + "_vol") as? [String: [Double]] ?? [:]
         for (k, v) in saved where v.count == 3 {
             tones[k] = Color(hue: v[0], saturation: v[1], brightness: v[2])
         }
@@ -36,17 +39,27 @@ final class FilmToneStore {
 
     func tone(_ key: String) -> Color { tones[key] ?? .white }
 
+    /// "volume 12 · tone −0.2 EV · saturation +8%", once measured.
+    func volumeText(_ key: String) -> String? {
+        guard let v = volumes[key], v.count == 3 else { return nil }
+        return String(format: "volume %.0f · %+.1f EV · saturation %+.0f%%", v[0], v[1], v[2] * 100)
+    }
+
     /// Compute tones for any keys not yet known. Cheap: 4 tiny patches each.
     func ensure(_ items: [ArcItem], camera: CameraManager) {
-        let todo = items.filter { tones[$0.key] == nil && !pending.contains($0.key) }
+        let todo = items.filter { (tones[$0.key] == nil || volumes[$0.key] == nil) && !pending.contains($0.key) }
         guard !todo.isEmpty else { return }
         todo.forEach { pending.insert($0.key) }
         nonisolated(unsafe) let cam = camera
         let jobs = todo.map { ($0.key, $0.sim, $0.custom) }
         Task.detached(priority: .utility) {
-            var out: [String: [Double]] = [:]
+            var out: [String: [Double]] = [:], vols: [String: [Double]] = [:]
             for (key, sim, custom) in jobs {
                 out[key] = FilmToneStore.measure(sim: sim, custom: custom, camera: cam)
+                var r = ShotRecipe(); r.sim = sim ?? .none; r.custom = custom
+                if let v = LookVolume.measure({ cam.renderLook($0, recipe: r, flatten: false) }, context: cam.ciContext) {
+                    vols[key] = [Double(v.deltaE), Double(v.midEV), Double(v.saturation)]
+                }
             }
             await MainActor.run {
                 let store = FilmToneStore.shared
@@ -56,6 +69,8 @@ final class FilmToneStore {
                     store.saved[k] = v
                 }
                 UserDefaults.standard.set(store.saved, forKey: FilmToneStore.cacheKey)
+                for (k, v) in vols { store.volumes[k] = v }
+                UserDefaults.standard.set(store.volumes, forKey: FilmToneStore.cacheKey + "_vol")
             }
         }
     }
@@ -64,6 +79,7 @@ final class FilmToneStore {
     func invalidate(_ key: String) {
         tones[key] = nil
         saved[key] = nil
+        volumes[key] = nil
         UserDefaults.standard.set(saved, forKey: Self.cacheKey)
     }
 

@@ -41,6 +41,15 @@ import CoreLocation
     }
     var isLandscape: Bool = false
     var deviceAngle: Double = 0
+    /// Look strength (0…1): how much of the film look is applied.
+    var lookStrength: Float = UserDefaults.standard.object(forKey: "cc_lookStrength") as? Float ?? 1 {
+        didSet {
+            UserDefaults.standard.set(lookStrength, forKey: "cc_lookStrength")
+            cachedLookStrength = lookStrength
+        }
+    }
+    @ObservationIgnored nonisolated(unsafe) var cachedLookStrength: Float = UserDefaults.standard.object(forKey: "cc_lookStrength") as? Float ?? 1
+    @ObservationIgnored nonisolated(unsafe) var pendingLookStrength: Float = 1
     var grainAmount: Float = 0.0 {
         didSet {
             UserDefaults.standard.set(grainAmount, forKey: "cc_grainAmount")
@@ -2072,6 +2081,7 @@ import CoreLocation
         let shotPortraitFStop = portraitFStop
         let shotZoomCropFactor = computePhotoZoomCropFactor()
         let shotFull48 = full48
+        let shotStrength = lookStrength
         let applySettings: @Sendable () -> Void = { [self] in
             pendingSim = shotSim
             pendingGrain = shotGrain
@@ -2104,6 +2114,7 @@ import CoreLocation
             pendingPortraitFStop = shotPortraitFStop
             pendingZoomCropFactor = shotZoomCropFactor
             pendingFull48 = shotFull48
+            pendingLookStrength = shotStrength
         }
 
         if isLongExposure {
