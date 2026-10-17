@@ -524,6 +524,28 @@ struct CameraContentView: View {
                     }
                 }
             }
+            if ProcessInfo.processInfo.arguments.contains("-mfAudit") {
+                let savedIdx = camera.selectedFocalIndex, savedQ = camera.photoQuality
+                camera.photoQuality = 2
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    camera.selectFocalPreset(4)                     // 70 mm: a 2.7× crop of the main lens
+                    func shoot(_ tag: String, multi: Bool, then: @escaping () -> Void) {
+                        UserDefaults.standard.set(multi, forKey: "cc_multiFrameZoom")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                            PipelineAudit.tag = tag
+                            camera.capturePhoto()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { PipelineAudit.tag = nil; then() }
+                        }
+                    }
+                    shoot("zoom-single", multi: false) {
+                        shoot("zoom-multi", multi: true) {
+                            UserDefaults.standard.removeObject(forKey: "cc_multiFrameZoom")
+                            camera.selectFocalPreset(savedIdx); camera.photoQuality = savedQ
+                            PipelineAudit.log("done")
+                        }
+                    }
+                }
+            }
             if ProcessInfo.processInfo.arguments.contains("-portraitAudit") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     camera.portraitModeEnabled = true
@@ -554,6 +576,9 @@ struct CameraContentView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     shoot(1, "wide28") { shoot(5, "tele120") { shoot(1, "wide28b") { camera.selectFocalPreset(savedIdx); PipelineAudit.log("done") } } }
                 }
+            }
+            if ProcessInfo.processInfo.arguments.contains("-burstProbe") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { camera.debugBurstProbe() }
             }
             if ProcessInfo.processInfo.arguments.contains("-resProbe") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { camera.debugResolutionProbe() }

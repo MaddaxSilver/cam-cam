@@ -62,6 +62,14 @@ struct cam_camApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("-mfTest") {
+            let camera = CameraManager()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+                if ProcessInfo.processInfo.arguments.contains("-synth") { LookAudit.runMultiFrameSynthetic(camera: camera) }
+                else { LookAudit.runMultiFrame(camera: camera) }
+                exit(0)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("-poseCards") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("posecards")

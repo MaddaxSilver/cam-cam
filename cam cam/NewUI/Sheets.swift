@@ -296,6 +296,7 @@ struct CamSettingsSheet: View {
 
     @AppStorage("cc_bokehStyle") private var bokehStyle = 0
     @AppStorage("cc_filmSuggest") private var filmSuggest = true
+    @AppStorage("cc_multiFrameZoom") private var multiFrameZoom = true
 
     var body: some View {
         NavigationStack {
@@ -305,6 +306,11 @@ struct CamSettingsSheet: View {
                         Text("Speed").tag(0); Text("Balanced").tag(1); Text("Max").tag(2); Text("Natural").tag(3)
                     }
                     .pickerStyle(.segmented)
+                    if camera.photoQuality == 2 {
+                        Toggle("Multi-frame zoom", isOn: $multiFrameZoom)
+                        Text("Zoomed shots (1.5× and up on a lens) in good light take a quick burst of 6 frames and merge them: less noise and cleaner detail than one enlarged frame. In dim light Apple's own processing is better, so it's used instead.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     if camera.photoQuality == 2 {
                         Text("48MP every shot. Zoomed, telephoto and ultra-wide photos are upscaled to 48MP so every photo is the same size. One lens is paused here: iOS limits it to 24MP.")
                             .font(.footnote).foregroundStyle(.secondary)

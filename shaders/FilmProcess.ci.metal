@@ -235,4 +235,33 @@ float4 scanGuard(sample_t look, sample_t orig, sample_t lookBlur, sample_t origB
     return float4(linearToSrgb(o), look.a);
 }
 
+/// Multi-frame zoom merge (see MultiFrameZoom.swift). Each burst frame,
+/// aligned and resampled onto the output grid, is weighted by how well its
+/// slightly blurred version agrees with the reference's: noise averages out,
+/// anything that moved between frames (a different value) is rejected, so no
+/// ghosts. Sums are kept in RGB (alpha stays 1: Core Image premultiplies).
+float4 mfWeighted(sample_t frame, sample_t fb, sample_t rb, float invSigma2)
+{
+    float3 d = fb.rgb - rb.rgb;
+    float w = exp(-dot(d, d) * invSigma2);
+    return float4(frame.rgb * w, 1.0);
+}
+
+float4 mfWeight(sample_t fb, sample_t rb, float invSigma2)
+{
+    float3 d = fb.rgb - rb.rgb;
+    float w = exp(-dot(d, d) * invSigma2);
+    return float4(w, w, w, 1.0);
+}
+
+float4 mfAdd(sample_t a, sample_t b)
+{
+    return float4(a.rgb + b.rgb, 1.0);
+}
+
+float4 mfDivide(sample_t sum, sample_t wsum)
+{
+    return float4(sum.rgb / max(wsum.r, 1e-4), 1.0);
+}
+
 }}

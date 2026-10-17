@@ -83,6 +83,125 @@ nonisolated enum PipelineAudit {
 
 nonisolated enum LookAudit {
 
+    // MARK: Multi-frame zoom, synthetic (-mfSynth): a static 48MP photo is the
+    // truth; six handheld 2.7× frames are simulated from it (random sub-pixel
+    // shift, sampled at the sensor's real resolution, enlarged back like the
+    // camera does, plus noise). Single frame vs merged, against the truth.
+    static func runMultiFrameSynthetic(camera: CameraManager) {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let ctx = camera.photoContext
+        guard var truth = CIImage(contentsOf: docs.appendingPathComponent("test48.heic")) else { print("[mf] no test48"); return }
+        truth = truth.transformed(by: CGAffineTransform(translationX: -truth.extent.minX, y: -truth.extent.minY))
+        let W = truth.extent.width, H = truth.extent.height
+        let zoom: CGFloat = 2.7
+        let cw = (W / zoom).rounded(), ch = (H / zoom).rounded()           // the crop the sensor really has
+        let crop0 = CGRect(x: (W - cw) / 2, y: (H - ch) / 2, width: cw, height: ch)
+        let outW: CGFloat = 4032, s = outW / cw                               // camera delivers it enlarged to 12MP
+        var rng = SystemRandomNumberGenerator()
+        func frame(_ dx: CGFloat, _ dy: CGFloat, seed: Int) -> CIImage {
+            let shifted = truth.transformed(by: CGAffineTransform(translationX: -crop0.minX + dx, y: -crop0.minY + dy))
+                .cropped(to: CGRect(x: 0, y: 0, width: cw, height: ch))
+            let up = shifted.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": s, "inputAspectRatio": 1])
+                .cropped(to: CGRect(x: 0, y: 0, width: (cw * s).rounded(.down), height: (ch * s).rounded(.down)))
+            let noise = CIFilter(name: "CIRandomGenerator")!.outputImage!
+                .transformed(by: CGAffineTransform(translationX: CGFloat(seed * 977), y: CGFloat(seed * 491)))
+                .transformed(by: CGAffineTransform(scaleX: s, y: s))
+                .applyingFilter("CIColorMatrix", parameters: [
+                    "inputRVector": CIVector(x: 0.04, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: 0.04, z: 0, w: 0),
+                    "inputBVector": CIVector(x: 0, y: 0, z: 0.04, w: 0), "inputBiasVector": CIVector(x: -0.02, y: -0.02, z: -0.02, w: 0)])
+                .cropped(to: up.extent)
+            return noise.applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: up]).cropped(to: up.extent)
+        }
+        var frames: [CIImage] = []
+        for k in 0..<6 {
+            let dx = k == 0 ? 0 : CGFloat.random(in: -2...2, using: &rng), dy = k == 0 ? 0 : CGFloat.random(in: -2...2, using: &rng)
+            // Render each to pixels (as the camera would deliver them).
+            guard let cg = ctx.createCGImage(frame(dx, dy, seed: k), from: frame(dx, dy, seed: k).extent) else { return }
+            frames.append(CIImage(cgImage: cg))
+        }
+        let outPixels = W * H
+        guard let merged = MultiFrameZoom.merge(frames, outputPixels: outPixels, reference: 0, context: ctx) else { print("[mf] merge failed"); return }
+        if let soft = MultiFrameZoom.merge(frames, outputPixels: outPixels, reference: 0, sharpen: false, context: ctx) {
+            let cc = CGRect(x: soft.extent.midX - 256, y: soft.extent.midY - 256, width: 512, height: 512).integral
+            let tt = truth.transformed(by: CGAffineTransform(translationX: -crop0.minX, y: -crop0.minY))
+                .cropped(to: CGRect(x: 0, y: 0, width: cw, height: ch))
+                .applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": soft.extent.width / cw, "inputAspectRatio": 1])
+            let a = LookAuditShared.luma(soft, crop: cc, ctx: ctx), b = LookAuditShared.luma(tt, crop: cc, ctx: ctx)
+            var mse: Float = 0; for i in a.indices { mse += (a[i] - b[i]) * (a[i] - b[i]) }
+            print(String(format: "[mf] merged without sharpen PSNR %.2f dB", 10 * log10(1 / max(mse / Float(a.count), 1e-10))))
+            func score(_ x: CIImage) -> Float {
+                let v = LookAuditShared.luma(x, crop: cc, ctx: ctx); var m: Float = 0
+                for i in v.indices { m += (v[i] - b[i]) * (v[i] - b[i]) }
+                return 10 * log10(1 / max(m / Float(v.count), 1e-10))
+            }
+            let upS = soft.extent.width / frames[0].extent.width
+            let single0 = frames[0].applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": upS, "inputAspectRatio": 1]).cropped(to: soft.extent)
+            for r in [0.8, 1.2, 1.8, 2.6] { for k in [0.3, 0.6, 1.0, 1.5] {
+                let sm = soft.applyingFilter("CIUnsharpMask", parameters: [kCIInputRadiusKey: r * upS, kCIInputIntensityKey: k])
+                let ss = single0.applyingFilter("CIUnsharpMask", parameters: [kCIInputRadiusKey: r * upS, kCIInputIntensityKey: k])
+                print(String(format: "[mf] sharpen r %.1f k %.1f: merged %.2f dB single %.2f dB", r, k, score(sm), score(ss)))
+            } }
+        }
+        let single = frames[0].applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": merged.extent.width / frames[0].extent.width, "inputAspectRatio": 1])
+            .cropped(to: merged.extent)
+        // Truth on the same grid: the crop, enlarged to the merged size.
+        let truthCrop = truth.transformed(by: CGAffineTransform(translationX: -crop0.minX, y: -crop0.minY))
+            .cropped(to: CGRect(x: 0, y: 0, width: cw, height: ch))
+            .applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": merged.extent.width / cw, "inputAspectRatio": 1])
+            .cropped(to: merged.extent)
+        let e = merged.extent
+        let c = CGRect(x: e.midX - 256, y: e.midY - 256, width: 512, height: 512).integral
+        func px(_ x: CIImage) -> [Float] { LookAuditShared.luma(x, crop: c, ctx: ctx) }
+        let t = px(truthCrop)
+        for (n, x) in [("truth", truthCrop), ("single", single), ("merged", merged)] {
+            let v = px(x); print(String(format: "[mf] %@ extent %@ sample %.4f %.4f mean %.4f", n, NSCoder.string(for: x.extent), v[1000], v[200000], v.reduce(0, +) / Float(v.count)))
+        }
+        func psnr(_ x: CIImage) -> Float {
+            let a = px(x); var mse: Float = 0
+            for i in a.indices { mse += (a[i] - t[i]) * (a[i] - t[i]) }
+            return 10 * log10(1 / max(mse / Float(a.count), 1e-10))
+        }
+        let rt = highPass(truthCrop, crop: c, ctx: ctx)
+        func detail(_ x: CIImage) -> (Float, Float) { let d = Self.detail(x, vs: rt, crop: c, ctx: ctx); return (d.slope, d.noise) }
+        let ds = detail(single), dm = detail(merged)
+        print(String(format: "[mf] synthetic 6 frames: PSNR single %.2f dB merged %.2f dB | detail single %.2f (added %.2f) merged %.2f (added %.2f)",
+                     psnr(single), psnr(merged), ds.0, ds.1, dm.0, dm.1))
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        for (n, x) in [("truth", truthCrop), ("single", single), ("merged", merged)] {
+            try? ctx.writePNGRepresentation(of: x.cropped(to: c), to: docs.appendingPathComponent("mfs-\(n).png"), format: .RGBA8, colorSpace: srgb)
+        }
+        print("[mf] done")
+    }
+
+    // MARK: Multi-frame zoom (-mfTest): merge Documents/burst-*.heic
+    static func runMultiFrame(camera: CameraManager) {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let ctx = camera.photoContext
+        var frames: [CIImage] = []
+        for i in 1...8 {
+            guard let f = CIImage(contentsOf: docs.appendingPathComponent("burst-\(i).heic")) else { continue }
+            let o = (f.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
+            frames.append(f.oriented(forExifOrientation: o))
+        }
+        print("[mf] \(frames.count) frames \(frames.first.map { NSCoder.string(for: $0.extent) } ?? "")")
+        guard frames.count >= 2 else { return }
+        let t0 = CACurrentMediaTime()
+        guard let merged = MultiFrameZoom.merge(frames, context: ctx) else { print("[mf] merge failed"); return }
+        let single = CameraManager.upscaleTo48(frames[0].transformed(by: CGAffineTransform(translationX: -frames[0].extent.minX, y: -frames[0].extent.minY)))
+        let e = merged.extent
+        let crop = CGRect(x: e.midX - 300, y: e.midY - 300, width: 600, height: 600).integral
+        // Noise: high-pass energy in a flat-ish region isn't known; report both
+        // the centre high-pass and the frame-to-frame agreement.
+        func hp(_ x: CIImage) -> Float { let h = highPass(x, crop: crop, ctx: ctx); return h.map { abs($0) }.reduce(0, +) / Float(h.count) * 1000 }
+        let st = PipelineAudit.stats(merged, ctx: ctx)
+        print(String(format: "[mf] merged %@ in %.0f ms | hp merged %.2f single %.2f | mean %.3f",
+                     NSCoder.string(for: e), (CACurrentMediaTime() - t0) * 1000, hp(merged), hp(single), st.mean))
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+        try? ctx.writePNGRepresentation(of: merged.cropped(to: crop), to: docs.appendingPathComponent("mf-merged.png"), format: .RGBA8, colorSpace: srgb)
+        try? ctx.writePNGRepresentation(of: single.cropped(to: crop), to: docs.appendingPathComponent("mf-single.png"), format: .RGBA8, colorSpace: srgb)
+        print("[mf] done")
+    }
+
     // MARK: Lens samples (-lensSamples <image>) — every lens profile on one photo.
     static func runLenses(camera: CameraManager, path: String) {
         let fm = FileManager.default
@@ -157,20 +276,7 @@ nonisolated enum LookAudit {
     }
 
     static func highPass(_ img: CIImage, crop: CGRect, ctx: CIContext) -> [Float] {
-        let n = Int(crop.width)
-        var buf = [Float](repeating: 0, count: n * n * 4)
-        ctx.render(img, toBitmap: &buf, rowBytes: n * 16, bounds: crop, format: .RGBAf,
-                   colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
-        var y = [Float](repeating: 0, count: n * n)
-        for i in 0..<(n * n) { y[i] = 0.2126 * buf[i * 4] + 0.7152 * buf[i * 4 + 1] + 0.0722 * buf[i * 4 + 2] }
-        // high-pass = luma − 3×3 mean
-        var out = [Float](repeating: 0, count: n * n)
-        for r in 1..<(n - 1) { for c in 1..<(n - 1) {
-            var m: Float = 0
-            for dy in -1...1 { for dx in -1...1 { m += y[(r + dy) * n + c + dx] } }
-            out[r * n + c] = y[r * n + c] - m / 9
-        } }
-        return out
+        LookAuditShared.highPass(img, crop: crop, ctx: ctx)
     }
 
     static func runQuality(camera: CameraManager, path: String) {
