@@ -2506,7 +2506,16 @@ import CoreLocation
             return
         }
 
-        // Slider drag while on physical telephoto — swap back to virtual.
+        // On the physical telephoto: zooming further in stays on it (digital
+        // zoom on the telephoto's own sensor); only going wider than the
+        // telephoto swaps back to the multi-lens camera.
+        if currentType == .builtInTelephotoCamera, let tele = Self.teleIntent, factor >= tele * 0.9,
+           let device = currentDevice {
+            let z = max(1, factor / tele)
+            currentMM = Int(round(26.0 * Double(factor)))
+            sessionQueue.async { [weak self] in self?.applyZoom(factor: z, on: device) }
+            return
+        }
         if currentType == .builtInTelephotoCamera {
             guard !isSwappingLens else { return }
             isSwappingLens = true
@@ -3323,6 +3332,16 @@ import CoreLocation
 
     /// Query the back physical wide directly and record its FOV reference.
     /// Doesn't activate the device — just reads its default active format's FOV.
+    /// The physical telephoto's field of view as an intent zoom (1 = the main
+    /// lens), e.g. 5 on a 5× telephoto; nil without one.
+    nonisolated static let teleIntent: CGFloat? = {
+        guard let tele = AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back),
+              let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return nil }
+        let t = tele.activeFormat.videoFieldOfView, w = wide.activeFormat.videoFieldOfView
+        guard t > 0, w > 0 else { return nil }
+        return CGFloat(tan(Double(w) * .pi / 360) / tan(Double(t) * .pi / 360))
+    }()
+
     nonisolated func recordPhysicalWideFOV() {
         guard let physical = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else { return }
         let fov = physical.activeFormat.videoFieldOfView
@@ -3410,6 +3429,23 @@ import CoreLocation
         // preset lands above the 5x switchover and actually engages the telephoto.
         let intentZoom = CGFloat(Double(preset.mm) / 26.0)
         lastRequestedZoom = intentZoom
+
+        // 120mm: the real telephoto, always. Through the multi-lens camera iOS
+        // kept the main lens and cropped 6.9× in dim light (soft 12MP, wrong
+        // exposure) — "switching on me". Portrait / One lens still use it.
+        if preset.useVirtualDevice, !portraitModeEnabled, !oneLensActive, Self.teleIntent != nil {
+            if currentType == .builtInTelephotoCamera, let device = currentDevice {
+                sessionQueue.async { [weak self] in self?.applyZoom(factor: 1, on: device) }
+            } else {
+                skipNextReconcile = true
+                swapInputDevice(to: FocalPreset(mm: preset.mm, deviceType: .builtInTelephotoCamera, zoomFactor: 1), animate: false)
+            }
+            DispatchQueue.main.async {
+                self.currentMM = preset.mm
+                self.zoom = Double(preset.mm) / 26.0
+            }
+            return
+        }
 
         if useVirtual {
             let onVirtual = currentType == .builtInTripleCamera

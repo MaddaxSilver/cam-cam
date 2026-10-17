@@ -524,6 +524,24 @@ struct CameraContentView: View {
                     }
                 }
             }
+            if ProcessInfo.processInfo.arguments.contains("-teleAudit") {
+                let savedIdx = camera.selectedFocalIndex
+                func shoot(_ idx: Int, _ tag: String, then: @escaping () -> Void) {
+                    camera.selectFocalPreset(idx)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                        if let d = camera.currentDevice {
+                            let lens = d.activePrimaryConstituent ?? d
+                            PipelineAudit.log("\(tag) device \(d.localizedName) lens \(lens.localizedName) f/\(lens.lensAperture) iso \(Int(d.iso)) shutter 1/\(Int(1 / max(CMTimeGetSeconds(d.exposureDuration), 1e-4))) EV \(String(format: "%.1f", SmartExposure.sceneEV(d))) bias \(d.exposureTargetBias) status \(SmartExposure.shared.status)")
+                        }
+                        PipelineAudit.tag = tag
+                        camera.capturePhoto()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { PipelineAudit.tag = nil; then() }
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    shoot(1, "wide28") { shoot(5, "tele120") { shoot(1, "wide28b") { camera.selectFocalPreset(savedIdx); PipelineAudit.log("done") } } }
+                }
+            }
             if ProcessInfo.processInfo.arguments.contains("-resProbe") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { camera.debugResolutionProbe() }
             }

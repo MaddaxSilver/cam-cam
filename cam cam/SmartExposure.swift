@@ -105,6 +105,7 @@ final class SmartExposure {
     @ObservationIgnored nonisolated(unsafe) private var aeBusy = false
     /// AUTO mode: how far exposure is pulled down for a bright subject on dark.
     @ObservationIgnored nonisolated(unsafe) private var autoProtect: Float = 0
+    @ObservationIgnored nonisolated(unsafe) private var lastConstituent: String?
 
     /// Called for every video frame. Metering reads its grid back from the
     /// GPU, which waits whenever the GPU is busy (a photo rendering): done on
@@ -133,6 +134,13 @@ final class SmartExposure {
               device.exposureMode == .continuousAutoExposure,
               !camera.cachedIsRecording, !camera.isCollectingFrames else { return }
 
+        // iOS switched lenses inside the multi-lens camera (e.g. to the
+        // telephoto): different aperture and sensor, so start over.
+        let constituent = device.activePrimaryConstituent?.uniqueID
+        if constituent != lastConstituent {
+            if lastConstituent != nil { deviceChanged() }
+            lastConstituent = constituent
+        }
         camera.cachedLiveISO = device.iso         // context-aware grain in the preview
         // Every film, every custom sim and imported LUT: measure how the
         // active look moves mid-grey (re-measured ~every 1.5 s).
@@ -144,33 +152,18 @@ final class SmartExposure {
                 if let o = Self.measureLook(camera) { lookOffset = o }
             }
         }
-        // AUTO (Smart AE off): Apple's exposure, corrected only for the film.
+        // Apple auto (Smart off): Apple's exposure exactly, plus your offset.
+        // (It used to add a film correction and a bright-subject pull-down
+        // here, so switching Smart off never fully turned cam cam's own
+        // exposure processing off.)
         guard cachedEnabled else {
-            if smart != 0 { smart = 0 }
-            // Apple's auto averages the frame: a bright subject on a dark
-            // background gets blown out. Pull exposure down for that case only.
+            if smart != 0 || autoProtect != 0 { smart = 0; autoProtect = 0 }
             let frame = CIImage(cvPixelBuffer: pixelBuffer)
-            if abs(device.exposureTargetOffset) < 0.3, let grid = Self.lumaGrid(frame) {
-                if time - lastSaliency > 0.5 { lastSaliency = time; updateSaliency(frame) }
+            if let grid = Self.lumaGrid(frame) {
                 camera.cachedFrameLuma = pow(grid.reduce(0, +) / Float(max(grid.count, 1)), 1 / 2.2)
-                var target: Float = 0
-                if let sal = saliency {
-                    var sw: Float = 0, sl: Float = 0
-                    for i in grid.indices { let w2 = sal[i] * sal[i]; sw += w2; sl += w2 * grid[i] }
-                    let subject = sw > 1e-3 ? sl / sw : 0
-                    let overall = grid.reduce(0, +) / Float(max(grid.count, 1))
-                    if subject > 0.02, subject > overall * 2.2 {
-                        target = max(-2, min(0, autoProtect + log2(0.42 / subject)))
-                    }
-                }
-                autoProtect += (target - autoProtect) * 0.3
-                if abs(autoProtect) < 0.02 { autoProtect = 0 }
             }
-            apply(bias: camera.cachedUserBias - lookOffset + autoProtect, camera: camera)
-            let parts = [abs(lookOffset) >= 0.05 ? String(format: "Film %+.1f EV", -lookOffset) : nil,
-                         autoProtect < -0.1 ? "Subject priority" : nil].compactMap { $0 }
-            let status = parts.joined(separator: " · ")
-            if status != lastStatus { lastStatus = status; publish(status: status, correction: autoProtect - lookOffset) }
+            apply(bias: camera.cachedUserBias, camera: camera)
+            if !lastStatus.isEmpty { lastStatus = ""; publish(status: "", correction: 0) }
             return
         }
 
@@ -247,8 +240,11 @@ final class SmartExposure {
             for i in lum.indices { let w2 = sal[i] * sal[i]; sw += w2; sl += w2 * lum[i] }
             let subject = sw > 1e-3 ? sl / sw : 0
             let overall = lum.reduce(0, +) / Float(max(lum.count, 1))
-            if subject > 0.02, subject > overall * 2.2 {
-                let gSubject = 0.42 / subject            // ≈ a light, well-exposed subject
+            // Only when the subject would really clip at the mean solution,
+            // and never more than 1 EV down (stronger pulls made everyday
+            // scenes with a bright window or sky read as "too dark").
+            if subject > 0.02, subject > overall * 3, subject * g > 0.7 {
+                let gSubject = max(0.55 / subject, g * 0.5)
                 if gSubject < g { g = gSubject; reason = "Subject priority" }
             }
         }
@@ -290,7 +286,7 @@ final class SmartExposure {
         // Calibrated on device: under Apple's own AE a normal daylight/indoor
         // frame meters ~0.26 here, so that's "no correction"; darker scenes
         // are aimed progressively darker than Apple would make them.
-        let pts: [(Float, Float)] = [(0, 0.14), (3, 0.20), (6, 0.26), (8, 0.29), (11, 0.30)]
+        let pts: [(Float, Float)] = [(0, 0.17), (3, 0.22), (6, 0.26), (8, 0.29), (11, 0.30)]
         if ev <= pts[0].0 { return pts[0].1 }
         for i in 1..<pts.count where ev <= pts[i].0 {
             let (e0, t0) = pts[i - 1], (e1, t1) = pts[i]
@@ -301,7 +297,10 @@ final class SmartExposure {
 
     /// Scene EV100 from the current exposure (aperture, shutter, ISO).
     nonisolated static func sceneEV(_ device: AVCaptureDevice) -> Float {
-        let n = max(device.lensAperture, 1)
+        // On the multi-lens camera, the lens actually in use (the telephoto is
+        // f/2.8, the main f/1.78: using the main's aperture judged telephoto
+        // scenes 1.3 EV too dark and aimed them at the night target).
+        let n = max((device.activePrimaryConstituent ?? device).lensAperture, 1)
         let t = max(Float(CMTimeGetSeconds(device.exposureDuration)), 1e-5)
         let iso = max(device.iso, 1)
         return log2(n * n / t) - log2(iso / 100)
