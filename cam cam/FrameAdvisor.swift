@@ -206,12 +206,16 @@ final class FrameAdvisor {
 
     /// Zoom by `ratio` (>1 in, <1 out) within the subject's lens range.
     /// Returns the zoom ratio actually applied, or nil if it didn't change.
+    /// Outdoors (bright daylight): the guide zooms further in and suggests
+    /// wider views more readily than in a room.
+    @ObservationIgnored nonisolated(unsafe) var outdoors = false
+
     @discardableResult
     func zoom(by ratio: Double, minMM: Int, camera: CameraManager, allowLensSwitch: Bool = false) -> Double? {
         let cur = Double(max(camera.currentMM, 13))
         // Straight to the framing, up to 200 mm (a 6× per-tap cap stopped
         // 13 mm → 100 mm subjects at ~78 mm).
-        let lo = Double(max(minMM, 13)), hi = 200.0
+        let lo = Double(max(minMM, 13)), hi = outdoors ? 200.0 : 100.0
         var want = min(max(cur * ratio, lo), max(hi, lo))
         // Stay on the lens you're on: switching lenses reconfigures the
         // camera (~1 s preview freeze, measured), and so does switching back.
@@ -395,11 +399,19 @@ final class FrameAdvisor {
 
         try? handler.perform([horizonReq])
         let horizonTilt = flatNow ? nil : Self.tilt(horizonReq)
+        // Indoors or out, from how much light there is (daylight outside is
+        // EV 10–15, rooms 5–8), with hysteresis so it doesn't flicker.
+        if let d = camera.currentDevice {
+            let ev = SmartExposure.sceneEV(d)
+            if ev > 10 { outdoors = true } else if ev < 8.5 { outdoors = false }
+        }
         if scanRequested {
             scanRequested = false
             // Tighter crops than the passive suggestion (up to 5×), top three.
+            // Outside there's more to pick from far away: crops down to ~7×;
+            // a room is mostly within reach: ~3×.
             let r = SceneFraming.top(handler: handler, image: image, context: Self.ciContext,
-                                     minScale: 0.2, n: 3, margin: 0.1, useHorizon: !flatNow)
+                                     minScale: outdoors ? 0.14 : 0.33, n: 3, margin: 0.1, useHorizon: !flatNow)
             let a = frameAngle
             publishPicks(r.map { Self.toBuffer($0.view, angle: a) }, attitude: frameAttitude)
             return
@@ -414,14 +426,15 @@ final class FrameAdvisor {
             if time - lastSceneAt > 0.9 {
                 lastSceneAt = time
                 lastScene = nil
-                if let r = SceneFraming.best(handler: handler, image: image, context: Self.ciContext, useHorizon: !flatNow) {
+                if let r = SceneFraming.best(handler: handler, image: image, context: Self.ciContext,
+                                             minScale: outdoors ? 0.16 : 0.45, useHorizon: !flatNow) {
                     var c = Composition()
                     c.anchor = CGPoint(x: 0.5, y: 0.5); c.target = CGPoint(x: 0.5, y: 0.5)
                     c.fill = 0.97; c.isScene = true
                     lastScene = (r.view, false, c)
                     lastSceneAttitude = frameAttitude
                     sceneWhy = r.why
-                } else if found == nil, frameFov < 90, SceneFraming.wantsWider(handler: handler) {
+                } else if found == nil, frameFov < 90, SceneFraming.wantsWider(handler: handler, threshold: outdoors ? 0.35 : 0.5) {
                     sceneWhy = "wider"
                 } else {
                     sceneWhy = ""

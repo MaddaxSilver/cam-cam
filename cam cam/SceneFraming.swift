@@ -213,10 +213,10 @@ nonisolated enum SceneFraming {
     }
 
     /// The interest runs off the edges of the full view: a wider lens would help.
-    static func wantsWider(handler: VNImageRequestHandler) -> Bool {
+    static func wantsWider(handler: VNImageRequestHandler, threshold: Double = 0.45) -> Bool {
         guard let sal = saliencyGrid(handler, g: 16) else { return false }
         var edge = 0.0
         for y in 0..<16 { for x in 0..<16 where x == 0 || y == 0 || x == 15 || y == 15 { edge += sal[y * 16 + x] } }
-        return edge > 0.45
+        return edge > threshold
     }
 }
