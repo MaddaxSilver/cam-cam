@@ -256,6 +256,12 @@ struct SonyView: View {
             VolumeButtonObserver.overrideOnDown = { cycleSim(forward: false) }
             guides.attach(sony: sony, camera: camera)
         }
+        .alert("Calibrate the level", isPresented: $guides.showCalibration) {
+            Button("Calibrate") { guides.calibrate() }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("Hold the camera level and pointed straight ahead (phone mounted as you'll shoot), then tap Calibrate. Redo it if you move the phone.")
+        }
         .onDisappear {
             guides.detach()
             motion.stopUpdates()
@@ -334,6 +340,7 @@ struct SonyView: View {
                         .resizable()
                         .scaledToFit()
                         .overlay { SonyFrameGuideOverlay(guides: guides) }
+                        .overlay { SonyShotPicksOverlay(guides: guides) }
                         .overlay { GeometryReader { g in PoseSkeletonOverlay(pw: g.size.width, ph: g.size.height) } }
                         .frame(
                             width:  isSideways ? geo.size.height : geo.size.width,
@@ -372,6 +379,28 @@ struct SonyView: View {
                         }
                     }
                     .frame(width: geo.size.width, height: geo.size.height)
+                }
+
+                // Frame guide on the Sony: level, Shot finder, Calibrate.
+                if guides.frameOn, !cleanMode, sony.liveViewImage != nil {
+                    SonyLevelOverlay(guides: guides)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    VStack(spacing: 10) {
+                        Button { guides.findShots() } label: {
+                            Image(systemName: "sparkle.magnifyingglass").font(.system(size: 17, weight: .semibold))
+                                .foregroundStyle(.white).frame(width: 44, height: 44)
+                        }
+                        .buttonStyle(.plain).glassEffect(.regular.interactive(), in: Circle())
+                        .accessibilityLabel("Shot finder")
+                        Button { guides.showCalibration = true } label: {
+                            Image(systemName: "level").font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(guides.calibrated ? .white : .yellow).frame(width: 44, height: 44)
+                        }
+                        .buttonStyle(.plain).glassEffect(.regular.interactive(), in: Circle())
+                        .accessibilityLabel("Calibrate the level")
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                    .padding(.trailing, 14)
                 }
 
                 // Frame / Pose guide hint
