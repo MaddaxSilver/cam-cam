@@ -297,6 +297,7 @@ struct CamSettingsSheet: View {
     @AppStorage("cc_bokehStyle") private var bokehStyle = 0
     @AppStorage("cc_filmSuggest") private var filmSuggest = true
     @AppStorage("cc_multiFrameZoom") private var multiFrameZoom = true
+    @AppStorage("cc_multiFrameRAW") private var multiFrameRAW = true
 
     var body: some View {
         NavigationStack {
@@ -308,7 +309,14 @@ struct CamSettingsSheet: View {
                     .pickerStyle(.segmented)
                     if camera.photoQuality == 2 {
                         Toggle("Multi-frame zoom", isOn: $multiFrameZoom)
-                        Text("Zoomed shots (1.5× and up on a lens) in good light take a quick burst of 6 frames and merge them: less noise and cleaner detail than one enlarged frame. In dim light Apple's own processing is better, so it's used instead.")
+                        if multiFrameZoom {
+                            Toggle("Use RAW frames", isOn: $multiFrameRAW)
+                        }
+                        Text(multiFrameZoom
+                             ? (multiFrameRAW
+                                ? "Zoomed shots (1.5× and up) in good light merge a burst of 6 RAW frames, tone-matched to a normal photo: the most real detail, ~5 s to develop."
+                                : "Zoomed shots (1.5× and up) in good light merge a burst of 6 processed frames: less noise, ~1–2 s to develop.")
+                             : "Zoomed shots are a single enlarged frame.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     if camera.photoQuality == 2 {
