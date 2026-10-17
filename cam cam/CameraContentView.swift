@@ -2370,7 +2370,7 @@ private struct FrameGuideOverlay<Pinch: Gesture>: View {
 
 /// Pose guide: the subject's live skeleton, green where the pose matches and
 /// yellow where it's off (the main subject), faint for others in frame.
-private struct PoseSkeletonOverlay: View {
+struct PoseSkeletonOverlay: View {
     let pw: CGFloat, ph: CGFloat
     @State private var guide = PoseGuide.shared
 

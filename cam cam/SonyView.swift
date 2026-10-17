@@ -72,6 +72,8 @@ struct SonyView: View {
 
     // Icon rotation (same MotionManager used by CameraView)
     @State private var motion = MotionManager()
+    @State private var guides = SonyGuides.shared
+    @State private var poseGuide = PoseGuide.shared
 
     // ── environment for dismissing the fullScreenCover
     @Environment(\.dismiss) private var dismiss
@@ -254,8 +256,10 @@ struct SonyView: View {
             // CameraView's existing observer instead of creating our own.
             VolumeButtonObserver.overrideOnUp   = { cycleSim(forward: true) }
             VolumeButtonObserver.overrideOnDown = { cycleSim(forward: false) }
+            guides.attach(sony: sony, camera: camera)
         }
         .onDisappear {
+            guides.detach()
             motion.stopUpdates()
             // Restore CameraView's default volume-button behavior
             VolumeButtonObserver.overrideOnUp   = nil
@@ -331,6 +335,8 @@ struct SonyView: View {
                     Image(uiImage: frame)
                         .resizable()
                         .scaledToFit()
+                        .overlay { SonyFrameGuideOverlay(guides: guides) }
+                        .overlay { GeometryReader { g in PoseSkeletonOverlay(pw: g.size.width, ph: g.size.height) } }
                         .frame(
                             width:  isSideways ? geo.size.height : geo.size.width,
                             height: isSideways ? geo.size.width  : geo.size.height
@@ -368,6 +374,21 @@ struct SonyView: View {
                         }
                     }
                     .frame(width: geo.size.width, height: geo.size.height)
+                }
+
+                // Frame / Pose guide hint
+                if !cleanMode, sony.liveViewImage != nil,
+                   let text = guides.frameOn ? guides.hint : (poseGuide.enabled && poseGuide.present
+                        ? [poseGuide.pose?.name, poseGuide.matched ? "Hold it" : poseGuide.cue].compactMap { $0 }.joined(separator: " · ") : nil) {
+                    Text(text)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(guides.aligned || poseGuide.matched ? .green : .white)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.black.opacity(0.55), in: Capsule())
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .padding(.top, 64)
+                        .allowsHitTesting(false)
+                        .animation(.easeOut(duration: 0.2), value: text)
                 }
 
                 // Live histogram (measured pre-preview-lift)
@@ -620,6 +641,11 @@ struct SonyView: View {
                         HStack(spacing: 10) {
                             sonyMenuToggle(icon: "chart.bar.fill",       title: "Histo", isOn: $sony.showHistogram)
                             sonyMenuToggle(icon: "line.diagonal",        title: "Zebra", isOn: $sony.showZebras)
+                        }
+                        HStack(spacing: 10) {
+                            sonyMenuToggle(icon: "viewfinder.rectangular", title: "Frame", isOn: $guides.frameOn)
+                            sonyMenuToggle(icon: "figure.stand",           title: "Pose",  isOn: $poseGuide.enabled)
+                            sonyMenuToggle(icon: "camera.shutter.button",  title: "Auto",  isOn: $guides.autoShoot)
                         }
                         .padding(.bottom, 6)
                         .transition(.opacity.combined(with: .move(edge: .top)))

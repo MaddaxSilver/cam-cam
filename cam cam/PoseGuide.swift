@@ -466,7 +466,7 @@ final class PoseGuide {
     fileprivate func timerFire(camera: CameraManager) {
         disarmTimer()
         UINotificationFeedbackGenerator().notificationOccurred(.success)
-        if !camera.isCapturing { camera.capturePhoto() }
+        if let ext = externalShutter { ext() } else if !camera.isCapturing { camera.capturePhoto() }
         SmartTake.shared.blinkFlash(camera)                   // tells the people in front it fired
     }
 
@@ -482,6 +482,16 @@ final class PoseGuide {
 
     /// A shot was taken: stand aside while it processes.
     nonisolated func noteShot() { pauseUntil = CACurrentMediaTime() + 1.0 }
+
+    /// Set on the Sony: a matched pose / the self-timer fires this instead
+    /// of the iPhone camera.
+    @ObservationIgnored nonisolated(unsafe) var externalShutter: (@Sendable () -> Void)?
+
+    /// A frame from another camera (the Sony's live view), upright.
+    nonisolated func analyseExternal(_ cg: CGImage, time: Double, camera: CameraManager) {
+        guard cachedEnabled else { return }
+        analyse(cg, time: time, angle: 0, bufAspect: CGFloat(cg.width) / CGFloat(max(cg.height, 1)), camera: camera)
+    }
 
     nonisolated func process(_ pixelBuffer: CVPixelBuffer, time: Double, camera: CameraManager) {
         guard cachedEnabled, !busy, time - lastTick >= 0.16, CACurrentMediaTime() >= pauseUntil,
@@ -578,7 +588,7 @@ final class PoseGuide {
                     if armed { PoseGuide.shared.timerFire(camera: camera) }
                     else {
                         UINotificationFeedbackGenerator().notificationOccurred(.success)
-                        if !camera.isCapturing { camera.capturePhoto() }
+                        if let ext = self.externalShutter { ext() } else if !camera.isCapturing { camera.capturePhoto() }
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { PoseGuide.shared.next() }
                 }

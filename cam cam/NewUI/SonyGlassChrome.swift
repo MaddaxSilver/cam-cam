@@ -223,6 +223,9 @@ struct SonyGlassChrome: View {
 
     // MARK: Options panel
 
+    @State private var guides = SonyGuides.shared
+    @State private var poseGuide = PoseGuide.shared
+
     private var panel: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("SONY").font(.system(size: 12, weight: .semibold)).tracking(0.8)
@@ -234,6 +237,9 @@ struct SonyGlassChrome: View {
                 tile("Lock turn", "lock.rotation", $rotationLocked)
                 tile("Auto-save", "square.and.arrow.down", $sony.autoSave)
                 tile("Log", "text.alignleft", $showDebugLog)
+                tile("Frame guide", "viewfinder.rectangular", $guides.frameOn)
+                tile("Pose guide", "figure.stand", $poseGuide.enabled)
+                tile("Auto shoot", "camera.shutter.button", $guides.autoShoot)
             }
             Button(action: onImportLUT) {
                 Label("Import LUT", systemImage: "cube")

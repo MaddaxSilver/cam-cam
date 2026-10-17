@@ -1670,6 +1670,7 @@ final class SonyConnector {
 
                         let jpeg = Data(buf[start ..< start + pSize])
                         guard let ciImage = CIImage(data: jpeg) else { continue }
+                        if SonyGuides.shared.active { SonyGuides.shared.feed(ciImage) }
                         // DO NOT apply EXIF for live view — Sony streams a fixed-size
                         // landscape JPEG; EXIF reflects camera tilt.
                         var simmed = ciImage
