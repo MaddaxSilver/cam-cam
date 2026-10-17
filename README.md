@@ -1,58 +1,98 @@
 # cam cam
 
-An iOS camera app with two shooting modes: the **iPhone camera** with a deep film-simulation pipeline, and a **Sony a7R III remote** that drives the camera over WiFi and pulls shots straight to your phone.
+A film camera for iPhone, and a Wi-Fi remote for a Sony a7R III that develops its shots the same way.
 
-> Personal / proprietary project. Built for my own shooting workflow.
-
----
-
-## Modes
-
-### 📷 CameraView — iPhone camera
-A manual-feeling camera with a live film-sim preview and a large library of looks.
-
-- **50+ built-in film simulations** — Leica, Fujifilm (Provia/Velvia/Classic Chrome/Eterna…), Kodak (Portra/Ektar/Gold…), Cinestill, slide, instant, B&W, and stylized stocks.
-- **Custom sims** — build your own looks in the editor (contrast, saturation, temp/tint, curves, grain…).
-- **LUT import** — drop in any `.cube` 3D LUT via the Files app; it applies live and saves with the shot.
-- **Circuit-bent effects** — `Bent` / `Bent++`: thermal false-color palettes with a grain-driven signal-ripple glitch (single-pass Metal warp kernel, composite fallback).
-- **DigiCam** — early-2000s CCD look with a quality slider (Off / 5–20) and an optional scanline "lines" toggle.
-- **Film-effect stack** — halation, channel crosstalk, highlight rolloff, anamorphic flares, light leaks, scratches, push/pull, context-aware grain.
-- Portrait depth blur, long exposure, burst, double-exposure masking, RAW.
-- Category tabs in the sim strip (Built-in / Custom / LUTs) so the list stays navigable.
-
-### 🎞 SonyView — Sony a7R III WiFi remote
-Controls a Sony a7R III over its Camera Remote API and transfers shots to the phone.
-
-- Live view stream with the same film-sim pipeline applied in real time.
-- **Physical-shutter auto-transfer** — shots taken on the body (or via the app) are caught through `getEvent v1.8`'s `takePicture` slot and pulled down automatically.
-- **Serial download queue** — burst/rapid shooting queues postview pulls one at a time so the live stream never chokes; on-screen "N queued" badge.
-- **Per-shot sim snapshot** — each queued photo is processed with the sim that was active when *that* shutter fired, so you can keep changing looks while the queue drains.
-- **EXIF-preserving saves** — camera/lens/exposure/date/GPS carried through even on sim-rendered shots.
-- Stream watchdog with reconnect escalation + full session reset for dropouts.
-- Volume buttons cycle film sims; rotation-lock defaults on; iPhone capture session pauses to save battery.
+Every photo keeps its untouched original. The film look is saved as a Photos edit with its recipe, so a shot can be re-graded later.
 
 ---
 
-## Requirements
+## What it does
 
-- Xcode (matching the current iOS SDK) with the **Metal Toolchain** component installed
-  (`xcodebuild -downloadComponent MetalToolchain`) — required to compile `Ripple.ci.metal`.
-- An iOS device for camera features (the simulator has no camera).
-- For Sony mode: an a7R III on firmware exposing the Camera Remote API, joined to the phone's WiFi.
+### Film looks
+- **90+ looks.** They come from three sources:
+  - film stocks measured with [spektrafilm](https://github.com/andreavolpato/spektrafilm) (Portra, Gold, Ektar, Vision3, Velvia, Provia and more);
+  - stocks modelled in exposure by a small film engine (Superia, Tri-X);
+  - hand-built and alternative-process looks (cyanotype, tintype, platinum and more), plus Styles.
+- **Custom films, `.cube` LUT import, "New look from a photo".** That last one builds a LUT by matching a reference picture's colour statistics.
+- **Scan stage after every look.** This is what a lab scanner does to a print:
+  - floors the deep shadows, so a look can't crush gradation to black;
+  - lifts the look's paper white back toward white;
+  - puts back the original's fine local contrast.
+- **Look volume.** Each film's strength is measured on a ColorChecker as mean ΔE, tone shift and saturation, and shown in the film library.
+  - Photographic colour films louder than ΔE 12 are turned down to it automatically, like audio loudness normalisation.
+  - *Look strength* turns any film down further.
+- **Grain.** A physical grain model sized to the frame, so it looks the same at 12MP and 48MP.
+  - It replaces the sensor's own noise at high ISO, rather than stacking on top of it.
+  - It is optionally context-aware, adding more grain when there was less light.
+- **Film effects:** halation, crosstalk, highlight rolloff, push/pull, development (agitated to stand), flares, light leaks, scratches and lens profiles. The lens profiles cover Takumar, Petzval, Pro-Mist, Sonnar, fisheye, tilt-shift and soap-bubble bokeh.
 
-`scripts/ensure-metal-toolchain.sh` re-mounts the Metal toolchain on login (it can unmount on reboot in recent Xcode betas).
+### iPhone camera
+- **Max:** 48MP on every shot. Zoomed, telephoto and ultra-wide photos are upscaled to 48MP before the film is applied, so the grain scale matches.
+- **Natural:** 48MP ProRAW developed in the app, without Apple's local tone mapping.
+- **RAW + film:** the film is developed from the DNG, keeping the highlight headroom the processed photo clips. The DNG is saved alongside the photo, either separately or as the same photo's RAW.
+- **120mm** uses the physical telephoto, so iOS can't swap in a cropped main lens.
+- **Smart exposure** meters the scene with saliency and compensates for each film's own brightness. *Apple auto* is Apple's exposure only.
+- **Frame guide.** It suggests the framing for people, pets, objects and scenes, then zooms to it and fires when you line it up.
+  - It reaches further outdoors than indoors.
+  - *Scan* offers three numbered picks.
+- **Pose guide.** Live body-pose coaching with a hands-free self-timer.
+- Portrait depth blur, long exposure, burst, double exposure, Film Roll mode with contact sheets, Apple Watch remote.
+- **Photos keep developing after you leave the app.** A Live Activity shows the progress in the Dynamic Island.
 
-## Project layout
+### Sony a7R III remote
+- Live view over the Camera Remote API, with the film pipeline applied live.
+- Shots taken in the app or on the body are pulled to the phone and developed with the film that was active when the shutter fired.
+- Frame guide and Pose guide on the Sony's live view; a matched pose or a lined-up framing can fire the camera.
 
-| File | Purpose |
-|------|---------|
-| `cam cam/CameraView.swift` | iPhone camera, film-sim pipeline, effects, UI |
-| `cam cam/SonyConnector.swift` | Sony Camera Remote API client, live view, download queue |
-| `cam cam/SonyView.swift` | Sony mode UI |
-| `cam cam/LUTManager.swift` | `.cube` LUT import / parse / apply |
-| `cam cam/Ripple.ci.metal` | Metal warp kernel for the circuit-bent ripple |
+### Gallery
+- Full-screen viewer with before/after comparison.
+- Re-grade any shot from its original, and filter albums by film.
+- Contact sheets, 4:5 export with a border, one-tap Instagram.
 
-## Notes
+---
 
-- The film-sim pipeline runs in Core Image; the per-frame path is `nonisolated` so it can run off the video-data callback thread.
-- Circuit-bent glitch intensity is driven by the grain slider; context-aware grain toggles the "wild" per-frame color/light drift.
+## Building
+
+Requirements: Xcode 26 or later (iOS 26.2 SDK), and an iPhone. The simulator has no camera.
+
+1. Open `cam cam.xcodeproj`.
+2. Under *Signing & Capabilities* for the **cam cam** target, pick your own team and set a unique bundle identifier.
+3. Build and run on a device.
+
+The Core Image Metal kernels in `shaders/` are compiled ahead of time into `cam cam/*.metallib`, so normal builds don't need the Metal toolchain. After editing a shader, run:
+
+```sh
+scripts/build-shaders.sh
+```
+
+## Layout
+
+| Path | What |
+|------|------|
+| `cam cam/CameraManager.swift` | Capture session, lenses, focus and exposure, photo pipeline, saving |
+| `cam cam/CameraManager+Looks.swift` | Film looks, scan stage, grain, effects, loudness normalisation |
+| `cam cam/FilmEngine.swift`, `Films/` | Exposure-modelled stocks; measured stock LUTs |
+| `shaders/FilmProcess.ci.metal` | Film engine, grain, scan, print-process and halation kernels |
+| `cam cam/LookVolume.swift` | Measures how strongly a look changes colour and tone |
+| `cam cam/SmartExposure.swift` | Smart auto exposure |
+| `cam cam/FrameAdvisor.swift`, `SceneFraming.swift` | Frame guide |
+| `cam cam/PoseGuide.swift` | Pose guide |
+| `cam cam/SonyConnector.swift`, `SonyView.swift`, `SonyGuides.swift` | Sony remote |
+| `cam cam/PhotoSaver.swift`, `ShotRecipe.swift`, `RegradeView.swift` | Non-destructive saves, recipes, gallery |
+| `cam cam/DevelopActivity.swift` | Background developing with a Live Activity |
+| `training/` | Optional Mac-side training of the Frame guide's framing scorer |
+
+### Debug harnesses
+
+In Debug builds, these launch arguments run a test and print `[pipe]`, `[quality]` or `[volume]` lines:
+
+| Argument | What it does |
+|---|---|
+| `-pipelineAudit` | Shots in several setups, measured rather than saved |
+| `-resProbe` | Delivered resolution at each setting and zoom |
+| `-teleAudit` | Main lens against the telephoto |
+| `-qualityAudit <file> [-simsOnly \| -volumes \| -dumpSims]` | Every look on a photo: detail, tone range and volume |
+
+## Credits
+
+- The measured film stocks are LUTs from **spektrafilm** by Andrea Volpato, licensed CC BY-SA 4.0. See `cam cam/Films/SPEKTRAFILM_LICENSE.txt`.
