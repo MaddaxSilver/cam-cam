@@ -62,6 +62,11 @@ nonisolated struct Skeleton: Sendable {
     /// Same joints, top-left normalized 0…1 (for drawing).
     var norm: [PJ: CGPoint]
     var noseConfidence: Float
+    /// From Vision's 3D body pose (main subject): how far the shoulders are
+    /// turned from facing the camera (0° facing, 90° side-on), and how far
+    /// the spine leans from vertical (+ = toward the camera). nil when unknown.
+    var turn: CGFloat? = nil
+    var lean: CGFloat? = nil
 
     subscript(_ j: PJ) -> CGPoint? { p[j] }
     var torso: CGFloat {
@@ -184,7 +189,8 @@ nonisolated enum PoseLibrary {
     }
     /// Body turned side-on (shoulders look narrow).
     static let sideOn = PoseCheck(fix: "Turn your body sideways to me") { s, _ in
-        (band(s.d(.lSh, .rSh), 0, 0.42, soft: 0.25), [.lSh, .rSh])
+        if let t = s.turn { return (band(t, 55, 90, soft: 15), [.lSh, .rSh]) }
+        return (band(s.d(.lSh, .rSh), 0, 0.42, soft: 0.25), [.lSh, .rSh])
     }
     static let faceToCamera = PoseCheck(fix: "Look back at me over your shoulder") { s, _ in
         (s.noseConfidence > 0.4 ? 1 : 0, [.nose, .neck])
@@ -235,6 +241,7 @@ nonisolated enum PoseLibrary {
     /// Leaning forward: seen from the side the torso tilts; seen from the
     /// front it looks shorter against the shoulders (foreshortened).
     static let leanForward = PoseCheck(fix: "Lean forward from the hips") { s, _ in
+        if let l = s.lean { return (band(abs(l), 15, 50, soft: 10), [.neck, .root]) }
         guard let N = s[.neck], let R = s[.root] else { return (0, [.neck, .root]) }
         let tilt = abs(atan2(N.x - R.x, R.y - N.y)) * 180 / .pi
         var short = 0.0
@@ -266,6 +273,7 @@ nonisolated enum PoseLibrary {
         return (min(drop, front), [.lHip, .lKn, .lAn, .rHip, .rKn, .rAn])
     }
     static let upright = PoseCheck(fix: "Stand tall, shoulders back") { s, _ in
+        if let l = s.lean { return (band(abs(l), 0, 12, soft: 10), [.neck, .root]) }
         guard let N = s[.neck], let R = s[.root] else { return (0, [.neck, .root]) }
         let tilt = abs(atan2(N.x - R.x, R.y - N.y)) * 180 / .pi
         return (band(tilt, 0, 12, soft: 10), [.neck, .root])
@@ -452,6 +460,30 @@ final class PoseGuide {
     @ObservationIgnored nonisolated(unsafe) private var contextSince: (PoseContext, Double)?
     @ObservationIgnored nonisolated(unsafe) private var smoothed = 0.0
     @ObservationIgnored nonisolated(unsafe) private var blazeAt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var pose3DAt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var pose3D: (turn: CGFloat, lean: CGFloat)?
+
+    /// Shoulder turn and spine lean of the most prominent person, in camera
+    /// space (Vision's 3D body pose, metres).
+    nonisolated static func turnAndLean(_ cg: CGImage) -> (turn: CGFloat, lean: CGFloat)? {
+        let req = VNDetectHumanBodyPose3DRequest()
+        guard (try? VNImageRequestHandler(cgImage: cg).perform([req])) != nil,
+              let obs = req.results?.first else { return nil }
+        func pos(_ j: VNHumanBodyPose3DObservation.JointName) -> SIMD3<Float>? {
+            guard let m = try? obs.cameraRelativePosition(j) else { return nil }
+            return SIMD3(m.columns.3.x, m.columns.3.y, m.columns.3.z)
+        }
+        guard let ls = pos(.leftShoulder), let rs = pos(.rightShoulder),
+              let root = pos(.root), let top = pos(.centerShoulder) else { return nil }
+        let sh = rs - ls
+        // 0° = shoulders square to the camera (all x), 90° = side-on (all z).
+        let turn = atan2(abs(sh.z), abs(sh.x)) * 180 / .pi
+        // Spine from vertical in the y–z plane; + = top toward the camera
+        // (camera space z grows away from the camera).
+        let sp = top - root
+        let lean = atan2(-sp.z, sp.y) * 180 / .pi
+        return (CGFloat(turn), CGFloat(lean))
+    }
     @ObservationIgnored nonisolated(unsafe) private var blazeExtra: [PJ: CGPoint] = [:]
 
     nonisolated private static let queue = DispatchQueue(label: "cam.poseguide", qos: .userInitiated)
@@ -562,6 +594,14 @@ final class PoseGuide {
         // part of the shot (at least ~half its size).
         skels.sort { $0.torso > $1.torso }
         if let big = skels.first { skels = skels.filter { $0.torso >= big.torso * 0.5 } }
+        // Vision 3D body pose for the main subject: real turn and lean (~3×/s).
+        if !skels.isEmpty {
+            if time - pose3DAt > 0.3 { pose3DAt = time; pose3D = Self.turnAndLean(cg) }
+            if let tl = pose3D { skels[0].turn = tl.turn; skels[0].lean = tl.lean }
+            #if DEBUG
+            if let tl = pose3D, time == pose3DAt { print(String(format: "[pose] 3D turn %.0f° lean %+.0f°", tl.turn, tl.lean)) }
+            #endif
+        }
         // BlazePose for the main subject: hands and feet (~3×/s).
         if !skels.isEmpty, let bp = BlazePose.shared {
             if time - blazeAt > 0.3 { blazeAt = time; blazeExtra = bp.detect(cg) }
