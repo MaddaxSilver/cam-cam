@@ -395,7 +395,8 @@ nonisolated enum PoseLibrary {
 
 @MainActor @Observable
 final class PoseGuide {
-    static let shared = PoseGuide()
+    nonisolated static let shared = PoseGuide()
+    nonisolated init() {}
 
     var enabled = UserDefaults.standard.object(forKey: "cc_poseGuide") as? Bool ?? false {
         didSet {

@@ -15,6 +15,11 @@ import CoreLocation
 @Observable
 final class LocationTagger: NSObject, CLLocationManagerDelegate {
     static let shared = LocationTagger()
+    /// The instance, for the save pipeline off the main thread (created on
+    /// main at launch; CLLocationManager wants the main run loop).
+    nonisolated(unsafe) private static weak var instance: LocationTagger?
+    /// Where the phone is now, for a photo being saved (any thread).
+    nonisolated static func photoLocation() -> CLLocation? { instance?.locationForPhoto() }
 
     /// User toggle (View menu). Persisted.
     var enabled: Bool = UserDefaults.standard.object(forKey: "cc_geotag") as? Bool ?? true {
@@ -28,10 +33,11 @@ final class LocationTagger: NSObject, CLLocationManagerDelegate {
     @ObservationIgnored private let manager = CLLocationManager()
     /// Most recent fix. Read off-main by the save pipeline, hence the lock.
     @ObservationIgnored nonisolated(unsafe) private var _latest: CLLocation?
-    @ObservationIgnored private let lock = NSLock()
+    @ObservationIgnored nonisolated private let lock = NSLock()
 
     override private init() {
         super.init()
+        Self.instance = self
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
         manager.distanceFilter = 25

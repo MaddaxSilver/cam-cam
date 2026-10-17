@@ -20,7 +20,7 @@ import Observation
 @MainActor @Observable
 final class FilmRoll {
 
-    static let shared = FilmRoll()
+    nonisolated static let shared = FilmRoll()
 
     struct Shot: Codable, Sendable {
         var original: String
@@ -40,7 +40,7 @@ final class FilmRoll {
         }
     }
 
-    struct Manifest: Codable, Sendable {
+    nonisolated struct Manifest: Codable, Sendable {
         var id = UUID()
         var capacity: Int
         var started = Date()
@@ -69,11 +69,13 @@ final class FilmRoll {
     }
     nonisolated private static var manifestURL: URL { directory.appendingPathComponent("roll.json") }
 
-    private init() {
+    nonisolated private init() {
         if let data = try? Data(contentsOf: Self.manifestURL),
            let m = try? JSONDecoder().decode(Manifest.self, from: data) {
             _store = m
-            manifest = m
+            // The observable copy is main-actor state (shared is created from
+            // whichever thread touches it first).
+            Task { @MainActor [weak self] in self?.manifest = m }
         }
     }
 

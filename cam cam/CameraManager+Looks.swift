@@ -2460,7 +2460,7 @@ extension CameraManager {
 
     // MARK: - Physically-modelled print processes (Metal)
 
-    enum PrintProcess {
+    nonisolated enum PrintProcess {
         case cyanotype, daguerreotype, tintype, platinum, vanDyke, saltPrint
 
         /// (spectral weights, exposure, contrast, dye at Dmax, paper, coating)
@@ -2570,7 +2570,7 @@ extension CameraManager {
             .cropped(to: extent)
     }
 
-    private static let statsLock = NSLock()
+    nonisolated private static let statsLock = NSLock()
     nonisolated(unsafe) private static var statsCache: [CGFloat: (Float, Float)] = [:]
     /// Mean and std of the blurred noise at this blur size (measured once on a patch).
     nonisolated static func noiseStats(_ sigma: CGFloat) -> (Float, Float) {

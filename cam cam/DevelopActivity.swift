@@ -29,7 +29,7 @@ nonisolated final class DevelopActivity: @unchecked Sendable {
 
     /// A shot was taken (call on the main thread: a submit must come from
     /// the foreground app, in response to the user).
-    func shotStarted() {
+    @MainActor func shotStarted() {
         lock.lock()
         total += 1
         let needTask = task == nil && !submitting
@@ -48,7 +48,7 @@ nonisolated final class DevelopActivity: @unchecked Sendable {
     }
 
     private func endBackgroundTime() {
-        DispatchQueue.main.async { [self] in
+        Task { @MainActor [self] in
             guard bgID != .invalid else { return }
             UIApplication.shared.endBackgroundTask(bgID); bgID = .invalid
         }

@@ -17,7 +17,7 @@
 //  pose, not a burst.
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreImage
 import Observation
 import UIKit
@@ -25,7 +25,8 @@ import Vision
 
 @MainActor @Observable
 final class SmartTake {
-    static let shared = SmartTake()
+    nonisolated static let shared = SmartTake()
+    nonisolated init() {}
 
     var enabled = UserDefaults.standard.bool(forKey: "cc_smartTake") {
         didSet {
@@ -191,7 +192,8 @@ final class SmartTake {
 
     /// The rear flash blinks after each shot so the group knows it fired.
     func blinkFlash(_ camera: CameraManager) {
-        guard let device = camera.currentDevice, device.position == .back, device.hasTorch else { return }
+        guard let dev = camera.currentDevice, dev.position == .back, dev.hasTorch else { return }
+        nonisolated(unsafe) let device = dev
         camera.sessionQueue.asyncAfter(deadline: .now() + 0.35) {
             guard (try? device.lockForConfiguration()) != nil else { return }
             try? device.setTorchModeOn(level: 0.3)

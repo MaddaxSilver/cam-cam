@@ -22,7 +22,8 @@ import Vision
 
 @MainActor @Observable
 final class SonyGuides {
-    static let shared = SonyGuides()
+    nonisolated static let shared = SonyGuides()
+    nonisolated init() {}
 
     var frameOn = UserDefaults.standard.bool(forKey: "cc_sonyFrameGuide") {
         didSet { UserDefaults.standard.set(frameOn, forKey: "cc_sonyFrameGuide"); cachedFrameOn = frameOn
@@ -121,11 +122,12 @@ final class SonyGuides {
         let shoot = ok && (time - (alignedSince ?? time)) > 0.6 && time - firedAt > 4
         if shoot { firedAt = time }
         let shown = rect.map { $0.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)) }
+        let (hintNow, okNow) = (hint, ok)
         Task { @MainActor in
             let g = SonyGuides.shared
             guard g.frameOn else { return }
-            if ok && !g.aligned { UINotificationFeedbackGenerator().notificationOccurred(.success) }
-            g.target = shown; g.hint = hint; g.aligned = ok
+            if okNow && !g.aligned { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+            g.target = shown; g.hint = hintNow; g.aligned = okNow
             if shoot && g.autoShoot { g.fire() }
         }
     }

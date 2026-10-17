@@ -488,12 +488,12 @@ import CoreLocation
     /// Bumped each time the app goes to the background (a render that spans
     /// the switch is redone on the CPU).
     nonisolated(unsafe) static var backgroundEpoch = 0
-    @ObservationIgnored nonisolated(unsafe) lazy var cpuPhotoContext: CIContext = {
+    @ObservationIgnored nonisolated let cpuPhotoContext: CIContext = {
         let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         return CIContext(options: [.workingColorSpace: p3, .outputColorSpace: p3,
                                    .cacheIntermediates: false, .useSoftwareRenderer: true])
     }()
-    @ObservationIgnored nonisolated(unsafe) lazy var gpuPhotoContext: CIContext = {
+    @ObservationIgnored nonisolated let gpuPhotoContext: CIContext = {
         let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         var opts: [CIContextOption: Any] = [.workingColorSpace: p3, .outputColorSpace: p3,
                                             .cacheIntermediates: false, .priorityRequestLow: true]
@@ -624,7 +624,7 @@ import CoreLocation
 
     nonisolated func registerShot(id: Int64, apply: @escaping @Sendable () -> Void, portrait: Bool) {
         rawStashLock.lock(); shotSettings[id] = (apply, portrait); rawStashLock.unlock()
-        DispatchQueue.main.async { DevelopActivity.shared.shotStarted() }
+        Task { @MainActor in DevelopActivity.shared.shotStarted() }
     }
 
     /// The capture failed: forget its settings (it would otherwise count as
@@ -2389,10 +2389,10 @@ import CoreLocation
             guard finishWriter.status == .completed, let url else { return }
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-            }, completionHandler: { [weak self] success, error in
+            }, completionHandler: { success, error in
                 if !success {
                     DispatchQueue.main.async {
-                        self?.saveErrorMessage = "Couldn't save video: \(error?.localizedDescription ?? "unknown error")"
+                        self.saveErrorMessage = "Couldn't save video: \(error?.localizedDescription ?? "unknown error")"
                     }
                 }
             })
@@ -2765,17 +2765,12 @@ import CoreLocation
             Self.lookAngle = pendingDeviceAngle         // which way is up for orientation-aware looks
             if let shot { shot() }
             defer { if shot != nil { shotRendered() } }
-            guard let raw = CIRAWFilter(imageData: dng, identifierHint: "com.adobe.raw-image") else {
+            // No local tone mapping, light noise reduction; highlights kept
+            // via the extended range. Upright like an EXIF-oriented photo.
+            guard var ciImage = Self.developWithHeadroom(dng, localToneMap: 0, noiseReduction: 0.15) else {
                 DispatchQueue.main.async { self.saveErrorMessage = "Couldn't develop the RAW" }
                 return
             }
-            if raw.isLocalToneMapSupported { raw.localToneMapAmount = 0 }
-            if raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = 0.15 }
-            if raw.isColorNoiseReductionSupported { raw.colorNoiseReductionAmount = max(0.3, raw.colorNoiseReductionAmount) }
-            // The filter applies the file's orientation, so the result is upright
-            // like an EXIF-oriented processed photo.
-            guard var ciImage = raw.outputImage else { return }
-            ciImage = ciImage.transformed(by: CGAffineTransform(translationX: -ciImage.extent.minX, y: -ciImage.extent.minY))
             let metadata = CIImage(data: dng)?.properties ?? [:]
             ciImage = applyPhotoZoomCrop(ciImage)
             let base = ciImage
@@ -2787,6 +2782,26 @@ import CoreLocation
             meta[kCGImagePropertyOrientation as String] = 1        // pixels are upright now
             renderAndSave(ciImage: processed, metadata: meta, base: base, recipe: recipe, raw: keepRAW ? dng : nil)
         }
+    }
+
+    /// Develop a DNG keeping what the processed photo clips: CIRAWFilter's
+    /// extended dynamic range (highlights above 1.0) brought back into the
+    /// photo with Apple's HDR tone mapper, so skies and lamps roll off instead
+    /// of clipping before the film sees them. Upright, at the origin.
+    nonisolated static func developWithHeadroom(_ dng: Data, localToneMap: Float? = nil,
+                                                noiseReduction: Float? = nil) -> CIImage? {
+        guard let raw = CIRAWFilter(imageData: dng, identifierHint: "com.adobe.raw-image") else { return nil }
+        if let l = localToneMap, raw.isLocalToneMapSupported { raw.localToneMapAmount = l }
+        if let n = noiseReduction, raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = n }
+        raw.extendedDynamicRangeAmount = 1
+        guard var img = raw.outputImage else { return nil }
+        img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
+        let headroom = max(img.contentHeadroom, 1)
+        if headroom > 1.01 {
+            img = img.applyingFilter("CIToneMapHeadroom", parameters: ["inputSourceHeadroom": headroom,
+                                                                       "inputTargetHeadroom": 1])
+        }
+        return img
     }
 
     nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil, shot: (@Sendable () -> Void)? = nil) {
@@ -2817,6 +2832,19 @@ import CoreLocation
                 if pendingSim == .digiCam   { return 0.22 }
                 return pendingCustomSim?.redEyeStrength ?? 0
             }()
+            // RAW + film: the film is developed from the DNG (same exposure,
+            // same framing) so the highlights Apple's processed photo clipped
+            // are still there. Falls back to the processed photo.
+            let raw = takeRAW(id: rawID)
+            if let raw, firstExposureCIImage == nil, redEyeStr == 0,
+               let dev = Self.developWithHeadroom(raw) {
+                let e = ciImage.extent, d = dev.extent
+                if abs(d.width / d.height - e.width / e.height) < 0.02, d.width > 0 {
+                    let s = e.width / d.width
+                    ciImage = dev.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": s, "inputAspectRatio": 1])
+                        .cropped(to: CGRect(x: 0, y: 0, width: e.width, height: e.height))
+                }
+            }
             let base = ciImage                                  // framed, un-graded original
             let isDoubleExposure = firstExposureCIImage != nil  // composites can't be re-graded
             pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
@@ -2825,7 +2853,6 @@ import CoreLocation
             if redEyeStr > 0 { ciImage = applyRedEyeCorrection(to: ciImage, strength: redEyeStr) }
 
             let processed = applySimAndGrain(to: ciImage)
-            let raw = takeRAW(id: rawID)
             if rawID != nil, raw == nil {
                 DispatchQueue.main.async { self.saveErrorMessage = "The RAW didn't arrive, saved the photo only" }
             }
@@ -3293,7 +3320,7 @@ import CoreLocation
             return
         }
         #endif
-        let location = LocationTagger.shared.locationForPhoto()
+        let location = LocationTagger.photoLocation()
         let heic = AVFileType.heic.rawValue as CFString
         let original: Data
         var rendered: Data? = nil

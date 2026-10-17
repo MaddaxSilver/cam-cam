@@ -1016,7 +1016,7 @@ final class SonyConnector {
         nonisolated(unsafe) let renderer = self.renderer
         let ctx = self.photoContext
         let hasLook = renderer != nil && !recipe.isIdentity
-        let location = LocationTagger.shared.locationForPhoto()
+        let location = LocationTagger.photoLocation()
 
         struct Rendered: @unchecked Sendable { let preview: UIImage; let jpeg: Data? }
         let rendered: Rendered? = await Task.detached(priority: .userInitiated) {

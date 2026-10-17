@@ -222,7 +222,7 @@ struct RollSheet: View {
                     Spacer()
                     Button {
                         let n = roll.shotCount
-                        nonisolated(unsafe) let cam = camera
+                        let cam = camera
                         let render: (Data, ShotRecipe) -> Data? = { data, r in
                             guard let ci = CIImage(data: data) else { return nil }
                             let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1

@@ -37,7 +37,8 @@ import Vision
 
 @MainActor @Observable
 final class SmartExposure {
-    static let shared = SmartExposure()
+    nonisolated static let shared = SmartExposure()
+    nonisolated init() {}
 
     var enabled: Bool = UserDefaults.standard.object(forKey: "cc_smartAE") as? Bool ?? true {
         didSet {
@@ -115,9 +116,10 @@ final class SmartExposure {
         guard !aeBusy, time - lastTick >= 0.15 || needsReset else { return }
         if camera.hasShotsInFlight && !needsReset { return }
         aeBusy = true
+        nonisolated(unsafe) let buffer = pixelBuffer
         Self.aeQueue.async { [self] in
             defer { aeBusy = false }
-            processNow(pixelBuffer, time: time, camera: camera)
+            processNow(buffer, time: time, camera: camera)
         }
     }
 

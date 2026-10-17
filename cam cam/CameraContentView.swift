@@ -2243,7 +2243,7 @@ struct CameraContentView: View {
         recipe.sim = sim
         recipe.custom = custom
         recipe.digiCamQuality = camera.digiCamQuality
-        nonisolated(unsafe) let cam = camera
+        let cam = camera
         Task.detached(priority: .userInitiated) {
             let text = LUTExporter.cube(title: "cam cam - \(name)") {
                 cam.renderLook($0, recipe: recipe, flatten: false)

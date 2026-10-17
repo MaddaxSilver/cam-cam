@@ -279,8 +279,7 @@ private struct FilmDialFace: View, Animatable {
                 if !(isSel || item.isSetSwitch) { mark(at: centers[i], height: 8, opacity: 0.85) }
                 var t = Text(item.label.uppercased()).font(Font(FilmArc.font)).tracking(FilmArc.tracking)
                 if item.isSetSwitch {
-                    t = Text(Image(systemName: "arrow.left.arrow.right.circle.fill")).font(.system(size: 13, weight: .semibold))
-                        + Text(" ") + t
+                    t = Text("\(Text(Image(systemName: "arrow.left.arrow.right.circle.fill")).font(.system(size: 13, weight: .semibold))) \(t)")
                 }
                 let color: Color = item.isSetSwitch ? .white : tones.tone(item.key)
                 let resolved = labels.resolve(t.foregroundStyle(color))

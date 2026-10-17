@@ -50,7 +50,7 @@ final class FilmToneStore {
         let todo = items.filter { (tones[$0.key] == nil || volumes[$0.key] == nil) && !pending.contains($0.key) }
         guard !todo.isEmpty else { return }
         todo.forEach { pending.insert($0.key) }
-        nonisolated(unsafe) let cam = camera
+        let cam = camera
         let jobs = todo.map { ($0.key, $0.sim, $0.custom) }
         Task.detached(priority: .utility) {
             var out: [String: [Double]] = [:], vols: [String: [Double]] = [:]
@@ -61,15 +61,16 @@ final class FilmToneStore {
                     vols[key] = [Double(v.deltaE), Double(v.midEV), Double(v.saturation)]
                 }
             }
+            let (outNow, volsNow) = (out, vols)
             await MainActor.run {
                 let store = FilmToneStore.shared
-                for (k, v) in out {
+                for (k, v) in outNow {
                     store.tones[k] = Color(hue: v[0], saturation: v[1], brightness: v[2])
                     store.pending.remove(k)
                     store.saved[k] = v
                 }
                 UserDefaults.standard.set(store.saved, forKey: FilmToneStore.cacheKey)
-                for (k, v) in vols { store.volumes[k] = v }
+                for (k, v) in volsNow { store.volumes[k] = v }
                 UserDefaults.standard.set(store.volumes, forKey: FilmToneStore.cacheKey + "_vol")
             }
         }
@@ -122,7 +123,7 @@ final class FilmToneStore {
 }
 
 /// One stop on the film arc: a built-in film or a custom film / LUT.
-struct ArcItem: Identifiable, Equatable {
+nonisolated struct ArcItem: Identifiable, Equatable {
     let key: String
     let label: String
     let sim: FilmSimulation?

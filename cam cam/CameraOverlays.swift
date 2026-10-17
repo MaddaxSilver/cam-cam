@@ -592,9 +592,10 @@ class PeakingUIView: UIView {
         // GPU, and on the camera queue that stalled the preview whenever a
         // photo was rendering.
         peakingBusy = true
+        nonisolated(unsafe) let buffer = pixelBuffer
         Self.peakingQueue.async { [self] in
             defer { peakingBusy = false }
-            renderPeaking(pixelBuffer)
+            renderPeaking(buffer)
         }
     }
 

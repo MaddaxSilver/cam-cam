@@ -379,13 +379,13 @@ private struct RegradeDetail: View {
               let url = input.fullSizeImageURL
         else { message = "Couldn't open this photo"; return }
         // Decode and downscale off the main thread (a 48MP decode froze the UI).
-        nonisolated(unsafe) let cam = camera
+        let cam = camera
+        let target = Screen.nativeHeight
         let loaded: (CIImage, UIImage)? = await Task.detached(priority: .userInitiated) {
             guard let ci = CIImage(contentsOf: url) else { return nil }
             let o = (ci.properties[kCGImagePropertyOrientation as String] as? NSNumber)?.int32Value ?? 1
             let upright = ci.oriented(forExifOrientation: o)
             // Screen resolution (1600 px was upscaled ~1.75× on a 2796 px screen: soft).
-            let target = UIScreen.main.nativeBounds.height
             let scale = min(1, target / max(upright.extent.width, upright.extent.height))
             var small = upright.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             guard let cg = cam.ciContext.createCGImage(small, from: small.extent) else { return nil }
@@ -411,7 +411,7 @@ private struct RegradeDetail: View {
         if rendering { renderAgain = true; return }
         rendering = true
         let r = recipe
-        nonisolated(unsafe) let cam = camera
+        let cam = camera
         Task.detached(priority: .userInitiated) {
             CameraManager.lookAngle = 0                       // upright already
             let out = cam.renderLook(original, recipe: r, flatten: false).cropped(to: original.extent)
@@ -427,7 +427,7 @@ private struct RegradeDetail: View {
     private func apply() async {
         busy = true; defer { busy = false }
         let r = recipe
-        nonisolated(unsafe) let cam = camera
+        let cam = camera
         do {
             try await PhotoSaver.regrade(assetID: assetID, recipe: r) { data in
                 guard let ci = CIImage(data: data) else { return nil }
@@ -508,7 +508,7 @@ private struct PhotoViewer: View {
                             }
                             .contentShape(Rectangle())
                             .gesture(DragGesture(minimumDistance: 0).onChanged { v in
-                                split = min(max(v.location.x / max(UIScreen.main.bounds.width, 1), 0), 1)
+                                split = min(max(v.location.x / max(Screen.width, 1), 0), 1)
                             })
                         }
                     }
@@ -616,7 +616,7 @@ private struct PhotoViewer: View {
         // never replaces the sharp one.
         let opts = PHImageRequestOptions()
         opts.deliveryMode = .opportunistic; opts.resizeMode = .exact; opts.isNetworkAccessAllowed = true
-        let side = UIScreen.main.bounds.height * UIScreen.main.scale
+        let side = Screen.pixelHeight
         AssetThumbImages.manager.requestImage(for: a, targetSize: CGSize(width: side, height: side),
                                               contentMode: .aspectFit, options: opts) { img, info in
             guard let img else { return }
@@ -629,7 +629,7 @@ private struct PhotoViewer: View {
     private func loadOriginal(_ id: String) async {
         guard originals[id] == nil, let a = assets[id] ?? PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject,
               let input = await PhotoSaver.editingInput(for: a), let url = input.fullSizeImageURL else { return }
-        let side = UIScreen.main.nativeBounds.height
+        let side = Screen.nativeHeight
         let img: UIImage? = await Task.detached(priority: .userInitiated) {
             guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
                   let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
@@ -683,3 +683,13 @@ private struct PhotoViewer: View {
 }
 
 private enum AssetThumbImages { static let manager = PHCachingImageManager() }
+
+/// The screen this app is on (UIScreen.main is deprecated in iOS 26).
+@MainActor enum Screen {
+    static var current: UIScreen? {
+        UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen }.first
+    }
+    static var nativeHeight: CGFloat { current?.nativeBounds.height ?? 2796 }
+    static var width: CGFloat { current?.bounds.width ?? 430 }
+    static var pixelHeight: CGFloat { (current?.bounds.height ?? 932) * (current?.scale ?? 3) }
+}

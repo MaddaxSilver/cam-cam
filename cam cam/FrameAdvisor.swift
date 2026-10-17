@@ -23,7 +23,7 @@
 //  object (objectness saliency — the fallback, and the least smart).
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreImage
 import Observation
 import UIKit
@@ -31,9 +31,9 @@ import Vision
 
 @MainActor @Observable
 final class FrameAdvisor {
-    static let shared = FrameAdvisor()
+    nonisolated static let shared = FrameAdvisor()
 
-    init() { _ = FrameLearning.folder }   // exists from the start, so the Mac can pull it
+    nonisolated init() { _ = FrameLearning.folder }   // exists from the start, so the Mac can pull it
 
     enum Stage: Equatable { case suggesting, locked, aligned }
 
@@ -41,7 +41,7 @@ final class FrameAdvisor {
     /// `anchor` is a point inside the subject box (e.g. the eye line),
     /// `target` where it goes in the frame (e.g. upper third), `fill` how much
     /// of the frame the subject box should fill after the lock's auto zoom.
-    struct Composition: Equatable, Sendable {
+    nonisolated struct Composition: Equatable, Sendable {
         var anchor = CGPoint(x: 0.5, y: 0.5)
         var target = CGPoint(x: 0.5, y: 0.5)
         var fill: CGFloat = 0.82
@@ -324,7 +324,7 @@ final class FrameAdvisor {
         let aspect = small.extent.width / max(small.extent.height, 1)     // upright
         SceneMotion.start()
         frameAttitude = SceneMotion.attitude(at: time)   // attitude when this frame was captured
-        let device = camera.currentDevice
+        nonisolated(unsafe) let device = camera.currentDevice
         Self.queue.async { [self] in
             defer { busy = false }
             // The lens FOV, read here, not on the camera queue: AVCaptureDevice

@@ -234,12 +234,10 @@ struct SonyView: View {
             camera.pauseForExternalUse()
             // Pure, thread-safe look pipeline (no shared capture state touched),
             // so the Sony live view and photo processing can both run off-main.
-            sony.renderer = { [weak camera] image, recipe, flatten in
-                guard let camera else { return image }
+            sony.renderer = { image, recipe, flatten in
                 return camera.renderLook(image, recipe: recipe, flatten: flatten)
             }
-            sony.recipeProvider = { [weak camera] sim, custom, seed in
-                guard let camera else { var r = ShotRecipe(); r.sim = sim; r.custom = custom; return r }
+            sony.recipeProvider = { sim, custom, seed in
                 return camera.liveRecipe(sim: sim, custom: custom, seed: seed)
             }
             LocationTagger.shared.start()

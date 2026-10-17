@@ -18,8 +18,8 @@ final class FavoritesStore {
     /// Ordered (pin order) keys: "b:<FilmSimulation.rawValue>" or "c:<UUID>".
     private(set) var keys: [String] = UserDefaults.standard.stringArray(forKey: "cc_favoriteSims") ?? []
 
-    static func key(_ sim: FilmSimulation) -> String { "b:\(sim.rawValue)" }
-    static func key(_ custom: CustomSimulation) -> String { "c:\(custom.id.uuidString)" }
+    nonisolated static func key(_ sim: FilmSimulation) -> String { "b:\(sim.rawValue)" }
+    nonisolated static func key(_ custom: CustomSimulation) -> String { "c:\(custom.id.uuidString)" }
 
     func isFavorite(_ key: String) -> Bool { keys.contains(key) }
 
