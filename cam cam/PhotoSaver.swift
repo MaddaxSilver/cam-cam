@@ -54,8 +54,10 @@ nonisolated enum PhotoSaver {
         UserDefaults.standard.object(forKey: "cc_rawSeparate") as? Bool ?? true
     }
 
+    /// - originalUTI: the original's type when it isn't a JPEG/HEIC (a camera
+    ///   RAW file imported over the cable).
     static func save(original: Data, rendered: Data?, recipe: ShotRecipe?,
-                     location: CLLocation?, raw: Data? = nil) async throws -> Result {
+                     location: CLLocation?, raw: Data? = nil, originalUTI: String? = nil) async throws -> Result {
         let status = await authorize()
         switch status {
         case .authorized, .limited:
@@ -91,7 +93,7 @@ nonisolated enum PhotoSaver {
             }
         }
         if assetID == nil {
-            assetID = try await createAsset(data: base, location: location)
+            assetID = try await createAsset(data: originalUTI == nil ? base : original, location: location, uti: originalUTI)
         }
 
         guard let rendered, let recipe, let assetID else {

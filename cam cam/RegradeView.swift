@@ -27,6 +27,7 @@ struct RegradeView: View {
     @State private var makingSheet = false
     @State private var names: [String: String] = [:]
     @State private var addingPhotos = false
+    @State private var importingFromCamera = false
     @State private var picked: [PhotosPickerItem] = []
     private var shownIDs: [String] {
         guard let f = filmFilter else { return assetIDs }
@@ -59,6 +60,9 @@ struct RegradeView: View {
                 grid.transition(.move(edge: .leading))
             }
         }
+        .sheet(isPresented: $importingFromCamera, onDismiss: { Task { await load() } }) {
+            CameraImportSheet(camera: camera)
+        }
         .photosPicker(isPresented: $addingPhotos, selection: $picked, maxSelectionCount: 50,
                       matching: .images, photoLibrary: .shared())
         .onChange(of: picked) { _, items in
@@ -89,6 +93,14 @@ struct RegradeView: View {
                     Text("\(assetIDs.count) photos").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
+                // Plug a camera in over USB-C and develop the whole card.
+                Button { importingFromCamera = true } label: {
+                    Image(systemName: "cable.connector").font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white).frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.interactive(), in: Circle())
+                .accessibilityLabel("Import from a camera over the cable")
                 // Your own photos (shot anywhere): add them here to give them a film.
                 Button { addingPhotos = true } label: {
                     Image(systemName: "plus").font(.system(size: 15, weight: .semibold))
