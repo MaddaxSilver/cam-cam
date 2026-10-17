@@ -177,6 +177,27 @@ nonisolated enum LookAudit {
     static func runMultiFrame(camera: CameraManager) {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let ctx = camera.photoContext
+        if ProcessInfo.processInfo.arguments.contains("-raw") {
+            var raws: [CIImage] = []
+            for i in 1...8 {
+                guard let d = try? Data(contentsOf: docs.appendingPathComponent("burst-3-rawpro-\(i).dng")) else { continue }
+                for edr: Float in [0, 1] {
+                    let r = CIRAWFilter(imageData: d, identifierHint: "com.adobe.raw-image")!
+                    r.extendedDynamicRangeAmount = edr
+                    let o = r.outputImage!
+                    print(String(format: "[mf] dng %d edr %.0f headroom %.2f ", i, edr, o.contentHeadroom) + PipelineAudit.describe(PipelineAudit.stats(o, ctx: ctx)))
+                }
+                if let dev = CameraManager.developWithHeadroom(d, sharpness: 0) {
+                    print("[mf] dng \(i) developWithHeadroom " + PipelineAudit.describe(PipelineAudit.stats(dev, ctx: ctx)))
+                    raws.append(dev)
+                }
+                if let p = CIImage(contentsOf: docs.appendingPathComponent("burst-3-rawpro-\(i).heic")) {
+                    print("[mf] heic \(i) " + PipelineAudit.describe(PipelineAudit.stats(p, ctx: ctx)))
+                }
+            }
+            if let m = MultiFrameZoom.merge(raws, context: ctx) { print("[mf] raw merged " + PipelineAudit.describe(PipelineAudit.stats(m, ctx: ctx))) }
+            return
+        }
         var frames: [CIImage] = []
         for i in 1...8 {
             guard let f = CIImage(contentsOf: docs.appendingPathComponent("burst-\(i).heic")) else { continue }

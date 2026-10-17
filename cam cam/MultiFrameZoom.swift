@@ -35,6 +35,16 @@ extension simd_float3x3 {
 nonisolated enum MultiFrameZoom {
     /// Settings toggle ("Multi-frame zoom", on by default).
     static var enabled: Bool { UserDefaults.standard.object(forKey: "cc_multiFrameZoom") as? Bool ?? true }
+    /// DEBUG audits: ignore the good-light gate.
+    nonisolated(unsafe) static var testing = false
+    /// Merge RAW (ProRAW) frames instead of processed ones.
+    static var useRAW: Bool { UserDefaults.standard.object(forKey: "cc_multiFrameRAW") as? Bool ?? true }
+    /// DNG (TIFF-based) rather than HEIC/JPEG bytes.
+    static func isDNG(_ d: Data) -> Bool {
+        guard d.count > 4 else { return false }
+        let b = [UInt8](d.prefix(4))
+        return (b[0] == 0x49 && b[1] == 0x49 && b[2] == 0x2A) || (b[0] == 0x4D && b[1] == 0x4D && b[3] == 0x2A)
+    }
 
     /// Merge upright frames of the same shot into one image of `outputPixels`.
     static func merge(_ frames: [CIImage], outputPixels: CGFloat = 48_771_072, reference: Int? = nil,
@@ -163,6 +173,43 @@ nonisolated enum MultiFrameZoom {
         }
         guard abs(dx) < 3, abs(dy) < 3 else { return nil }
         return (dx, dy)
+    }
+
+    /// A tone curve that maps `img`'s brightness distribution onto `ref`'s
+    /// (luma percentiles 2/25/50/75/98, in the working space), so RAW frames
+    /// match Apple's processed exposure and contrast but keep their detail.
+    static func matchTone(_ img: CIImage, to ref: CIImage, context: CIContext) -> ((CIImage) -> CIImage)? {
+        func pct(_ x: CIImage) -> [CGFloat]? {
+            let e = x.extent
+            let s = 384 / max(e.width, e.height)
+            let sm = x.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY)).transformed(by: CGAffineTransform(scaleX: s, y: s))
+            let w = Int(e.width * s), h = Int(e.height * s)
+            guard w > 8, h > 8 else { return nil }
+            var b = [Float](repeating: 0, count: w * h * 4)
+            context.render(sm, toBitmap: &b, rowBytes: w * 16, bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                           format: .RGBAf, colorSpace: context.workingColorSpace)
+            var y = (0..<(w * h)).map { 0.2126 * b[$0 * 4] + 0.7152 * b[$0 * 4 + 1] + 0.0722 * b[$0 * 4 + 2] }
+            y.sort()
+            return [0.02, 0.25, 0.5, 0.75, 0.98].map { CGFloat(y[min(y.count - 1, Int(Float(y.count) * $0))]) }
+        }
+        guard let a = pct(img), let b = pct(ref) else {
+            #if DEBUG
+            print("[mf] tone match: no percentiles")
+            #endif
+            return nil
+        }
+        // Strictly increasing x for CIToneCurve.
+        var xs = a, ys = b
+        for i in 1..<5 where xs[i] <= xs[i - 1] + 0.005 { xs[i] = xs[i - 1] + 0.005 }
+        for i in 0..<5 { xs[i] = min(max(xs[i], 0), 1); ys[i] = min(max(ys[i], 0), 1) }
+        let pts = (0..<5).map { CIVector(x: xs[$0], y: ys[$0]) }
+        #if DEBUG
+        print("[mf] tone match raw \(a.map { String(format: "%.3f", $0) }) -> ref \(b.map { String(format: "%.3f", $0) })")
+        #endif
+        return { x in
+            x.applyingFilter("CIToneCurve", parameters: ["inputPoint0": pts[0], "inputPoint1": pts[1], "inputPoint2": pts[2],
+                                                         "inputPoint3": pts[3], "inputPoint4": pts[4]]).cropped(to: x.extent)
+        }
     }
 
     /// Mean |Laplacian| of a centre crop at reduced size (relative sharpness).

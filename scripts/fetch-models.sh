@@ -16,4 +16,16 @@ mkdir -p "$PKG/Data/com.apple.CoreML/weights"
 for f in Manifest.json Data/com.apple.CoreML/model.mlmodel Data/com.apple.CoreML/weights/weight.bin; do
     [ -s "$PKG/$f" ] || curl -fL --retry 3 -o "$PKG/$f" "$BASE/$f"
 done
-echo "models in $DEST"
+
+
+#   MediaPipe Tasks Vision for iOS (Apache-2.0) + the BlazePose landmarker
+#   (33 body points incl. hands and feet), used by the Pose guide.
+MP="Vendor/MediaPipe"
+if [ ! -d "$MP/frameworks/MediaPipeTasksVision.xcframework" ]; then
+    mkdir -p "$MP"
+    curl -fL --retry 3 https://dl.google.com/cpdc/20260727-225047/MediaPipeTasksCommon-1.0.0.tar.gz | tar -xz -C "$MP"
+    curl -fL --retry 3 https://dl.google.com/cpdc/20260727-225049/MediaPipeTasksVision-1.0.0.tar.gz | tar -xz -C "$MP"
+fi
+[ -s "$DEST/pose_landmarker_full.task" ] || curl -fL --retry 3 -o "$DEST/pose_landmarker_full.task" \
+    https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
+echo "MediaPipe in $MP"

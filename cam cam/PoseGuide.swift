@@ -37,6 +37,8 @@ import Vision
 /// Joints (the subject's own left/right).
 nonisolated enum PJ: String, CaseIterable, Sendable {
     case nose, neck, lSh, rSh, lEl, rEl, lWr, rWr, root, lHip, rHip, lKn, rKn, lAn, rAn
+    /// From BlazePose (when bundled): index finger tips, heels, toes.
+    case lIdx, rIdx, lHeel, rHeel, lToe, rToe
 
     static let vision: [VNHumanBodyPoseObservation.JointName: PJ] = [
         .nose: .nose, .neck: .neck, .leftShoulder: .lSh, .rightShoulder: .rSh,
@@ -48,6 +50,8 @@ nonisolated enum PJ: String, CaseIterable, Sendable {
     static let bones: [(PJ, PJ)] = [
         (.neck, .root), (.lSh, .rSh), (.lSh, .lEl), (.lEl, .lWr), (.rSh, .rEl), (.rEl, .rWr),
         (.lHip, .rHip), (.lHip, .lKn), (.lKn, .lAn), (.rHip, .rKn), (.rKn, .rAn),
+        (.lWr, .lIdx), (.rWr, .rIdx), (.lAn, .lHeel), (.lHeel, .lToe), (.lAn, .lToe),
+        (.rAn, .rHeel), (.rHeel, .rToe), (.rAn, .rToe),
     ]
 }
 
@@ -78,6 +82,19 @@ nonisolated struct Skeleton: Sendable {
     }
     var hasLegs: Bool { p[.lKn] != nil || p[.rKn] != nil }
     var hasFeet: Bool { p[.lAn] != nil || p[.rAn] != nil }
+    /// Where a foot is: the middle of ankle, heel and toe when BlazePose
+    /// found them (steadier than the ankle alone), else the ankle.
+    func foot(_ left: Bool) -> CGPoint? {
+        let pts = (left ? [PJ.lAn, .lHeel, .lToe] : [.rAn, .rHeel, .rToe]).compactMap { p[$0] }
+        guard !pts.isEmpty else { return nil }
+        return CGPoint(x: pts.map(\.x).reduce(0, +) / CGFloat(pts.count), y: pts.map(\.y).reduce(0, +) / CGFloat(pts.count))
+    }
+    /// The hand: the index finger tip when known, else the wrist.
+    func hand(_ wrist: PJ) -> CGPoint? {
+        if wrist == .lWr, let t = p[.lIdx] { return t }
+        if wrist == .rWr, let t = p[.rIdx] { return t }
+        return p[wrist]
+    }
     var centre: CGPoint { p[.root] ?? p[.neck] ?? .zero }
     /// Sitting: the knees are nearly level with the hips — from the side the
     /// thighs are horizontal, from the front they point at the camera. Both
@@ -174,9 +191,10 @@ nonisolated enum PoseLibrary {
     }
     static let handUpToHead = PoseCheck(fix: "Raise one hand to your hair") { s, _ in
         eitherSide { sh, el, wr, _, _, _ in
-            guard let W = s[wr], let S = s[sh] else { return (0, [sh, el, wr]) }
+            guard let W = s.hand(wr), let S = s[sh] else { return (0, [sh, el, wr]) }
             let above = W.y < S.y ? 1.0 : 0.0
-            let near = band(s.d(wr, .nose) ?? s.d(wr, .neck), 0, 0.7, soft: 0.3)
+            let head = s[.nose] ?? s[.neck]
+            let near = band(head.map { hypot(W.x - $0.x, W.y - $0.y) / s.torso }, 0, 0.7, soft: 0.3)
             return (min(above, near), [sh, el, wr])
         }
     }
@@ -189,7 +207,7 @@ nonisolated enum PoseLibrary {
         return (min(atChest(L), atChest(Rw)), [.lEl, .lWr, .rEl, .rWr])
     }
     static let stride = PoseCheck(fix: "Walk slowly across — mid-step") { s, _ in
-        guard let a = s[.lAn], let b = s[.rAn] else { return (0, [.lAn, .rAn]) }
+        guard let a = s.foot(true), let b = s.foot(false) else { return (0, [.lAn, .rAn]) }
         // Feet apart AND a knee bending (not just a wide stance).
         let bend = min(s.angle(.lHip, .lKn, .lAn) ?? 180, s.angle(.rHip, .rKn, .rAn) ?? 180)
         return (min(band(abs(a.x - b.x) / s.torso, 0.45, 3, soft: 0.25), band(bend, 120, 170, soft: 8)),
@@ -206,7 +224,7 @@ nonisolated enum PoseLibrary {
         return (wide * high, [.lSh, .lEl, .lWr, .rSh, .rEl, .rWr])
     }
     static let wideStance = PoseCheck(fix: "Feet wider than your shoulders") { s, _ in
-        guard let a = s[.lAn], let b = s[.rAn] else { return (0, [.lAn, .rAn]) }
+        guard let a = s.foot(true), let b = s.foot(false) else { return (0, [.lAn, .rAn]) }
         let straight = min(band(s.angle(.lHip, .lKn, .lAn), 160, 180, soft: 15), band(s.angle(.rHip, .rKn, .rAn), 160, 180, soft: 15))
         return (min(band(abs(a.x - b.x) / s.torso, 0.7, 3, soft: 0.25), straight), [.lKn, .lAn, .rKn, .rAn])
     }
@@ -433,6 +451,8 @@ final class PoseGuide {
     @ObservationIgnored nonisolated(unsafe) private var pauseUntil: Double = 0
     @ObservationIgnored nonisolated(unsafe) private var contextSince: (PoseContext, Double)?
     @ObservationIgnored nonisolated(unsafe) private var smoothed = 0.0
+    @ObservationIgnored nonisolated(unsafe) private var blazeAt: Double = 0
+    @ObservationIgnored nonisolated(unsafe) private var blazeExtra: [PJ: CGPoint] = [:]
 
     nonisolated private static let queue = DispatchQueue(label: "cam.poseguide", qos: .userInitiated)
     nonisolated private static let ctx = CIContext(options: [.cacheIntermediates: false])
@@ -542,6 +562,14 @@ final class PoseGuide {
         // part of the shot (at least ~half its size).
         skels.sort { $0.torso > $1.torso }
         if let big = skels.first { skels = skels.filter { $0.torso >= big.torso * 0.5 } }
+        // BlazePose for the main subject: hands and feet (~3×/s).
+        if !skels.isEmpty, let bp = BlazePose.shared {
+            if time - blazeAt > 0.3 { blazeAt = time; blazeExtra = bp.detect(cg) }
+            for (j, tl) in blazeExtra where skels[0].p[j] == nil || [.lIdx, .rIdx, .lHeel, .rHeel, .lToe, .rToe].contains(j) {
+                skels[0].norm[j] = tl
+                skels[0].p[j] = CGPoint(x: tl.x * aspect, y: tl.y)
+            }
+        }
         guard let main = skels.first else {
             publish(people: [], off: [], match: 0, cue: nil, ctx: nil, matched: false, bufAspect: bufAspect)
             matchedSince = nil

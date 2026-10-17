@@ -630,9 +630,33 @@ import CoreLocation
         return !shotSettings.isEmpty || shotsRendering > 0
     }
 
-    nonisolated func registerShot(id: Int64, apply: @escaping @Sendable () -> Void, portrait: Bool) {
+    nonisolated func registerShot(id: Int64, apply: @escaping @Sendable () -> Void, portrait: Bool, burst: Bool = false) {
         rawStashLock.lock(); shotSettings[id] = (apply, portrait); rawStashLock.unlock()
-        Task { @MainActor in DevelopActivity.shared.shotStarted() }
+        Task { @MainActor in DevelopActivity.shared.shotStarted(burst: burst) }
+    }
+
+    /// RAW multi-frame zoom: the normal photo taken as the burst's tone
+    /// reference (reference capture ID → burst ID, then burst ID → photo).
+    @ObservationIgnored nonisolated(unsafe) private var toneRefFor: [Int64: Int64] = [:]
+    @ObservationIgnored nonisolated(unsafe) private var toneRefPhotos: [Int64: Data] = [:]
+    @ObservationIgnored nonisolated(unsafe) private var burstToneRef: [Int64: Int64] = [:]
+    nonisolated func storeToneReference(captureID: Int64, data: Data?) -> Bool {
+        rawStashLock.lock(); defer { rawStashLock.unlock() }
+        guard let burst = toneRefFor.removeValue(forKey: captureID) else { return false }
+        if let data { toneRefPhotos[burst] = data }
+        return true
+    }
+    /// Waits briefly for a burst's tone reference.
+    nonisolated func takeToneReference(burst: Int64) -> Data? {
+        rawStashLock.lock(); let refID = burstToneRef.removeValue(forKey: burst); rawStashLock.unlock()
+        guard let refID else { return nil }
+        for _ in 0..<40 {
+            rawStashLock.lock()
+            if let d = toneRefPhotos.removeValue(forKey: refID) { rawStashLock.unlock(); return d }
+            rawStashLock.unlock()
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return nil
     }
 
     /// Multi-frame zoom: the frames of a bracket, collected until all arrive.
@@ -690,6 +714,7 @@ import CoreLocation
     }
 
     @ObservationIgnored nonisolated(unsafe) var wantsShutterThumb = false
+
 
     nonisolated func publishShutterThumb(_ frame: CIImage) {
         let s = 240 / max(frame.extent.width, frame.extent.height)
@@ -2169,19 +2194,48 @@ import CoreLocation
             // Good light only: bracket frames get lighter noise reduction than
             // Apple's own multi-frame Max shot, and in dim light (measured in
             // a dark room) six of them merged were still noisier than it.
-            if multiFrameOK, let d = currentDevice, !d.isVirtualDevice, d.videoZoomFactor >= 1.5, d.iso <= 400,
+            if multiFrameOK, let d = currentDevice, !d.isVirtualDevice, d.videoZoomFactor >= 1.5, d.iso <= 400 || MultiFrameZoom.testing,
                photoOutput.maxBracketedCapturePhotoCount >= 2 {
                 // A quick bracket of identical frames (~75 ms apart), merged
                 // on the 48MP grid (MultiFrameZoom).
                 let n = min(6, photoOutput.maxBracketedCapturePhotoCount)
-                let same = (0..<n).map { _ in AVCaptureAutoExposureBracketedStillImageSettings.autoExposureSettings(exposureTargetBias: 0) }
+                // Auto-exposure brackets don't expose like a normal shot
+                // (measured: +0.4 EV processed, ~+1.3 EV with RAW; biased ones
+                // overshoot the other way), so the burst uses exactly the
+                // exposure the camera is metering now.
+                let dur = d.exposureDuration, iso = d.iso
+                let same = (0..<n).map { _ in
+                    AVCaptureManualExposureBracketedStillImageSettings.manualExposureSettings(exposureDuration: dur, iso: iso) }
+                let bias: Float = 0
                 let codec: AVVideoCodecType = photoOutput.availablePhotoCodecTypes.contains(.hevc) ? .hevc : .jpeg
-                let bs = AVCapturePhotoBracketSettings(rawPixelFormatType: 0, processedFormat: [AVVideoCodecKey: codec],
-                                                       bracketedSettings: same)
+                #if DEBUG
+                print("[mf] bracket bias \(bias) iso \(d.iso)")
+                #endif
+                // RAW frames (Apple ProRAW) keep the sensor's detail that the
+                // processed frames smooth away (measured on a test chart).
+                let pro = MultiFrameZoom.useRAW
+                    ? photoOutput.availableRawPhotoPixelFormatTypes.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } : nil
+                // RAW: iOS renders ProRAW brighter and flatter than its normal
+                // processing (measured ~+0.8 EV median at the same exposure),
+                // so a normal Max photo is taken first as the tone reference.
+                var refID: Int64?
+                if pro != nil {
+                    let ref = AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
+                    ref.photoQualityPrioritization = .quality
+                    ref.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+                    refID = ref.uniqueID
+                    rawStashLock.lock(); toneRefFor[ref.uniqueID] = ref.uniqueID; rawStashLock.unlock()
+                    photoOutput.capturePhoto(with: ref, delegate: self)
+                }
+                let bs = pro.map { AVCapturePhotoBracketSettings(rawPixelFormatType: $0, processedFormat: nil, bracketedSettings: same) }
+                    ?? AVCapturePhotoBracketSettings(rawPixelFormatType: 0, processedFormat: [AVVideoCodecKey: codec],
+                                                     bracketedSettings: same)
+                if let refID { rawStashLock.lock(); burstToneRef[bs.uniqueID] = refID; rawStashLock.unlock() }
                 bs.photoQualityPrioritization = .quality
                 bs.maxPhotoDimensions = photoOutput.maxPhotoDimensions
                 markMultiFrame(bs.uniqueID, count: n)
-                registerShot(id: bs.uniqueID, apply: applySettings, portrait: false)
+
+                registerShot(id: bs.uniqueID, apply: applySettings, portrait: false, burst: true)
                 photoOutput.capturePhoto(with: bs, delegate: self)
                 return
             }
@@ -2258,22 +2312,27 @@ import CoreLocation
             PipelineAudit.log("burst maxBracket \(photoOutput.maxBracketedCapturePhotoCount) device \(device.localizedName)")
             if (try? device.lockForConfiguration()) != nil { device.videoZoomFactor = 2.7; device.unlockForConfiguration() }
             Thread.sleep(forTimeInterval: 0.8)
-            for (k, q) in [AVCapturePhotoOutput.QualityPrioritization.balanced, .quality, .speed].enumerated() {
-                DispatchQueue.main.asyncAfter(deadline: .now() + Double(k) * 5) { [self] in
+            let raws = photoOutput.availableRawPhotoPixelFormatTypes
+            let bayer = raws.first { AVCapturePhotoOutput.isBayerRAWPixelFormat($0) } ?? 0
+            let pro = raws.first { AVCapturePhotoOutput.isAppleProRAWPixelFormat($0) } ?? 0
+            PipelineAudit.log("burst raw formats bayer \(bayer) proraw \(pro)")
+            for (k, (q, rawFmt)) in [(AVCapturePhotoOutput.QualityPrioritization.balanced, bayer), (.quality, pro), (.speed, bayer)].enumerated() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(k) * 6) { [self] in
                     sessionQueue.async { [self] in
                         let n = min(4, photoOutput.maxBracketedCapturePhotoCount)
                         let biases = (0..<n).map { _ in AVCaptureAutoExposureBracketedStillImageSettings.autoExposureSettings(exposureTargetBias: 0) }
-                        let bs = AVCapturePhotoBracketSettings(rawPixelFormatType: 0, processedFormat: [AVVideoCodecKey: AVVideoCodecType.hevc],
+                        let bs = AVCapturePhotoBracketSettings(rawPixelFormatType: rawFmt,
+                                                               processedFormat: rawFmt == pro ? [AVVideoCodecKey: AVVideoCodecType.hevc] : nil,
                                                                bracketedSettings: biases)
                         bs.photoQualityPrioritization = q
                         bs.maxPhotoDimensions = photoOutput.maxPhotoDimensions
-                        PipelineAudit.tag = "burst-\(q.rawValue)"
+                        PipelineAudit.tag = "burst-\(q.rawValue)-raw\(rawFmt == pro ? "pro" : "bayer")"
                         PipelineAudit.log(String(format: "burst-%d request n=%d t=%.3f", q.rawValue, n, CACurrentMediaTime()))
                         photoOutput.capturePhoto(with: bs, delegate: self)
                     }
                 }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 16) { PipelineAudit.tag = nil; PipelineAudit.log("done") }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { PipelineAudit.tag = nil; PipelineAudit.log("done") }
         }
     }
 
@@ -2861,8 +2920,9 @@ import CoreLocation
     /// photo with Apple's HDR tone mapper, so skies and lamps roll off instead
     /// of clipping before the film sees them. Upright, at the origin.
     nonisolated static func developWithHeadroom(_ dng: Data, localToneMap: Float? = nil,
-                                                noiseReduction: Float? = nil) -> CIImage? {
+                                                noiseReduction: Float? = nil, sharpness: Float? = nil) -> CIImage? {
         guard let raw = CIRAWFilter(imageData: dng, identifierHint: "com.adobe.raw-image") else { return nil }
+        if let sh = sharpness, raw.isSharpnessSupported { raw.sharpnessAmount = sh }
         if let l = localToneMap, raw.isLocalToneMapSupported { raw.localToneMapAmount = l }
         if let n = noiseReduction, raw.isLuminanceNoiseReductionSupported { raw.luminanceNoiseReductionAmount = n }
         raw.extendedDynamicRangeAmount = 1
@@ -2876,7 +2936,7 @@ import CoreLocation
         return img
     }
 
-    nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil, frames: [Data]? = nil,
+    nonisolated func processAndSaveJPEG(imageData: Data, rawID: Int64? = nil, frames: [Data]? = nil, shotID: Int64? = nil,
                                         shot: (@Sendable () -> Void)? = nil) {
         // Unblock shutter immediately — process and save in background
         DispatchQueue.main.async { self.isCapturing = false }
@@ -2895,10 +2955,33 @@ import CoreLocation
 
             // Multi-frame zoom: merge the bracket on the 48MP grid.
             if let frames, frames.count >= 2 {
-                let upright = frames.compactMap { d -> CIImage? in
+                func oriented(_ d: Data) -> CIImage? {
                     guard let f = CIImage(data: d) else { return nil }
                     return f.oriented(forExifOrientation: Int32(f.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
                 }
+                let dngs = frames.filter { MultiFrameZoom.isDNG($0) }
+                var processedFrames = frames.filter { !MultiFrameZoom.isDNG($0) }.compactMap(oriented)
+                if !dngs.isEmpty, let id = shotID, let ref = takeToneReference(burst: id).flatMap(oriented) {
+                    processedFrames.insert(ref, at: 0)
+                }
+                let upright0 = processedFrames
+                var upright = dngs.isEmpty ? upright0 : []
+                #if DEBUG
+                print("[mf] frames: \(dngs.count) DNG, \(processedFrames.count) processed")
+                #endif
+                if dngs.count >= 2, let refTone = processedFrames.first {
+                    // RAW frames: Apple's RAW development (its sharpening kept:
+                    // that's where the extra detail is), tone matched to the
+                    // normal photo taken just before the burst.
+                    let developed = dngs.compactMap { Self.developWithHeadroom($0) }
+                    if let first = developed.first, let match = MultiFrameZoom.matchTone(first, to: refTone, context: photoContext) {
+                        upright = developed.map(match)
+                    } else { upright = developed }
+                } else if dngs.count >= 2 {
+                    upright = dngs.compactMap { Self.developWithHeadroom($0) }      // no reference: as developed
+                }
+                // The base image (metadata, fallback) is the processed photo.
+                if let p = processedFrames.first { ciImage = p }
                 #if DEBUG
                 let t0 = CACurrentMediaTime()
                 #endif
@@ -3910,7 +3993,8 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         if error != nil, let frames = addMultiFrame(photo.resolvedSettings.uniqueID, data: nil) {
             // One frame of a bracket failed: merge what arrived.
             if !frames.isEmpty, let first = frames.first {
-                processAndSaveJPEG(imageData: first, frames: frames, shot: takeShot(id: photo.resolvedSettings.uniqueID)?.apply)
+                processAndSaveJPEG(imageData: first, frames: frames, shotID: photo.resolvedSettings.uniqueID,
+                                   shot: takeShot(id: photo.resolvedSettings.uniqueID)?.apply)
             }
             return
         }
@@ -3920,6 +4004,20 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
                 self.isCapturing = false
                 self.isBursting = false
             }
+            return
+        }
+
+        // RAW multi-frame zoom's tone reference photo.
+        if storeToneReference(captureID: photo.resolvedSettings.uniqueID, data: error == nil ? photo.fileDataRepresentation() : nil) {
+            DispatchQueue.main.async { self.isCapturing = false }
+            return
+        }
+        // Multi-frame zoom: collect the burst (processed or RAW frames) first —
+        // a RAW frame must not fall through to the plain DNG save below.
+        if let frames = addMultiFrame(photo.resolvedSettings.uniqueID, data: photo.fileDataRepresentation()) {
+            guard !frames.isEmpty, let first = frames.first else { return }      // still collecting
+            processAndSaveJPEG(imageData: first, frames: frames, shotID: photo.resolvedSettings.uniqueID,
+                                   shot: takeShot(id: photo.resolvedSettings.uniqueID)?.apply)
             return
         }
 
@@ -3935,11 +4033,12 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
         }
         if let tag = PipelineAudit.tag, tag.hasPrefix("burst") {
             let r = photo.resolvedSettings
-            PipelineAudit.log(String(format: "%@ frame %d/%d %dx%d t=%.3f err=%@", tag, photo.sequenceCount, r.expectedPhotoCount,
-                                     r.photoDimensions.width, r.photoDimensions.height, CACurrentMediaTime(), String(describing: error)))
+            PipelineAudit.log(String(format: "%@ frame %d/%d photo %dx%d raw %dx%d isRaw %d t=%.3f err=%@", tag, photo.sequenceCount, r.expectedPhotoCount,
+                                     r.photoDimensions.width, r.photoDimensions.height, r.rawPhotoDimensions.width, r.rawPhotoDimensions.height,
+                                     photo.isRawPhoto ? 1 : 0, CACurrentMediaTime(), String(describing: error)))
             if let d = photo.fileDataRepresentation() {
                 try? d.write(to: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("burst-\(photo.sequenceCount).heic"))
+                    .appendingPathComponent("\(tag)-\(photo.sequenceCount).\(photo.isRawPhoto ? "dng" : "heic")"))
             }
             return
         }
@@ -3983,11 +4082,6 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             PipelineAudit.log("\(tag) delivered photo \(r.photoDimensions.width)x\(r.photoDimensions.height) raw \(r.rawPhotoDimensions.width)x\(r.rawPhotoDimensions.height) device \(currentDevice?.localizedName ?? "?") zoom \(String(format: "%.2f", currentDevice?.videoZoomFactor ?? 0)) constituent \((currentDevice?.activePrimaryConstituent?.localizedName) ?? "-") format max \(currentDevice?.activeFormat.supportedMaxPhotoDimensions.last.map { "\($0.width)x\($0.height)" } ?? "?") output max \(output.maxPhotoDimensions.width)x\(output.maxPhotoDimensions.height)")
         }
         #endif
-        if let frames = addMultiFrame(photo.resolvedSettings.uniqueID, data: photo.fileDataRepresentation()) {
-            guard !frames.isEmpty, let first = frames.first else { return }      // still collecting
-            processAndSaveJPEG(imageData: first, frames: frames, shot: takeShot(id: photo.resolvedSettings.uniqueID)?.apply)
-            return
-        }
         let shot = takeShot(id: photo.resolvedSettings.uniqueID)
         guard let data = photo.fileDataRepresentation() else {
             if shot != nil { shotRendered() }

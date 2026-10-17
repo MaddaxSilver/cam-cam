@@ -43,3 +43,6 @@ training/.build/
 # Optional ML models (scripts/fetch-models.sh)
 cam cam/Models/*.mlpackage/
 cam cam/Models/*.task
+
+# MediaPipe SDK (scripts/fetch-models.sh)
+Vendor/

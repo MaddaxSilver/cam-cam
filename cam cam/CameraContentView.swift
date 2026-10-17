@@ -527,6 +527,7 @@ struct CameraContentView: View {
             if ProcessInfo.processInfo.arguments.contains("-mfAudit") {
                 let savedIdx = camera.selectedFocalIndex, savedQ = camera.photoQuality
                 camera.photoQuality = 2
+                MultiFrameZoom.testing = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     camera.selectFocalPreset(4)                     // 70 mm: a 2.7× crop of the main lens
                     func shoot(_ tag: String, multi: Bool, then: @escaping () -> Void) {
@@ -534,14 +535,19 @@ struct CameraContentView: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
                             PipelineAudit.tag = tag
                             camera.capturePhoto()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { PipelineAudit.tag = nil; then() }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 24) { PipelineAudit.tag = nil; then() }
                         }
                     }
                     shoot("zoom-single", multi: false) {
+                        UserDefaults.standard.set(false, forKey: "cc_multiFrameRAW")
                         shoot("zoom-multi", multi: true) {
+                            UserDefaults.standard.set(true, forKey: "cc_multiFrameRAW")
+                            shoot("zoom-raw", multi: true) {
+                            UserDefaults.standard.removeObject(forKey: "cc_multiFrameRAW")
                             UserDefaults.standard.removeObject(forKey: "cc_multiFrameZoom")
                             camera.selectFocalPreset(savedIdx); camera.photoQuality = savedQ
                             PipelineAudit.log("done")
+                            }
                         }
                     }
                 }

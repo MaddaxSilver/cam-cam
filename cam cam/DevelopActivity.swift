@@ -29,15 +29,22 @@ nonisolated final class DevelopActivity: @unchecked Sendable {
 
     /// A shot was taken (call on the main thread: a submit must come from
     /// the foreground app, in response to the user).
-    @MainActor func shotStarted() {
+    @MainActor func shotStarted(burst: Bool = false) {
         lock.lock()
         total += 1
-        let needTask = task == nil && !submitting
-        if needTask { submitting = true }
         let t = task
         lock.unlock()
         if let t { update(t) }
-        if needTask { submit() }
+        // No Live Activity for ordinary shots (it flashed up for every
+        // photo): once per zoom burst, or when you leave the app with photos
+        // still developing.
+        if burst { showIfStillDeveloping() }
+        if resignObserver == nil {
+            resignObserver = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification,
+                                                                    object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.showIfStillDeveloping() }
+            }
+        }
         // Belt and braces: ~30 s of background time even if iOS declines the task.
         if bgID == .invalid {
             bgID = UIApplication.shared.beginBackgroundTask(withName: "Develop photos") { [weak self] in self?.endBackgroundTime() }
@@ -45,6 +52,17 @@ nonisolated final class DevelopActivity: @unchecked Sendable {
         #if DEBUG
         print("[develop] started (\(total) in flight)")
         #endif
+    }
+
+    @MainActor private var resignObserver: NSObjectProtocol?
+
+    /// One Live Activity for the whole batch, only while work remains.
+    @MainActor private func showIfStillDeveloping() {
+        lock.lock()
+        let need = total > done && task == nil && !submitting
+        if need { submitting = true }
+        lock.unlock()
+        if need { submit() }
     }
 
     private func endBackgroundTime() {

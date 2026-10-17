@@ -595,6 +595,36 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksVision.xcframework/ios-arm64",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksCommon.xcframework/ios-arm64",
+				);
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksVision.xcframework/ios-arm64_x86_64-simulator",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksCommon.xcframework/ios-arm64_x86_64-simulator",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-framework",
+					MediaPipeTasksVision,
+					"-framework",
+					MediaPipeTasksCommon,
+					"-force_load",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/graph_libraries/libMediaPipeTasksCommon_device_graph.a",
+					"-lc++",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-framework",
+					MediaPipeTasksVision,
+					"-framework",
+					MediaPipeTasksCommon,
+					"-force_load",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/graph_libraries/libMediaPipeTasksCommon_simulator_graph.a",
+					"-lc++",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
@@ -630,6 +660,36 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksVision.xcframework/ios-arm64",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksCommon.xcframework/ios-arm64",
+				);
+				"FRAMEWORK_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksVision.xcframework/ios-arm64_x86_64-simulator",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/MediaPipeTasksCommon.xcframework/ios-arm64_x86_64-simulator",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-framework",
+					MediaPipeTasksVision,
+					"-framework",
+					MediaPipeTasksCommon,
+					"-force_load",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/graph_libraries/libMediaPipeTasksCommon_device_graph.a",
+					"-lc++",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-framework",
+					MediaPipeTasksVision,
+					"-framework",
+					MediaPipeTasksCommon,
+					"-force_load",
+					"$(PROJECT_DIR)/Vendor/MediaPipe/frameworks/graph_libraries/libMediaPipeTasksCommon_simulator_graph.a",
+					"-lc++",
+				);
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
