@@ -364,6 +364,23 @@ final class SonyConnector {
     // Tracked tasks — all cancelled in disconnect()
     private var pollTask:       Task<Void, Never>?
     private var liveViewTask:   Task<Void, Never>?
+
+    /// Live view at the larger "L" size (sharper, more delay). Off = "M".
+    var sharpLiveView: Bool = UserDefaults.standard.bool(forKey: "cc_sonySharpLive") {
+        didSet {
+            guard sharpLiveView != oldValue else { return }
+            UserDefaults.standard.set(sharpLiveView, forKey: "cc_sonySharpLive")
+            guard liveViewTask != nil else { return }
+            // Restart the stream at the new size.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.liveViewTask?.cancel()
+                self.heartbeatTask?.cancel()
+                self.lastFrameTime = .distantPast
+                await self.startLiveView()
+            }
+        }
+    }
     private var shutterTask:    Task<Void, Never>?
     private var timeoutTask:    Task<Void, Never>?
     private var watchdogTask:   Task<Void, Never>?
@@ -501,7 +518,7 @@ final class SonyConnector {
     private var eventVersion: String = "1.8"
 
     /// Lock-free snapshot of sim settings used by the live-view parser.
-    private let liveSimSnapshot: SonyLiveSimSnapshot = {
+    let liveSimSnapshot: SonyLiveSimSnapshot = {
         let s = SonyLiveSimSnapshot()
         s.zebras = UserDefaults.standard.bool(forKey: "cc_sonyZebras")
         s.histogram = UserDefaults.standard.bool(forKey: "cc_sonyHistogram")
@@ -509,21 +526,15 @@ final class SonyConnector {
     }()
 
     /// Wall-clock time of the most recent live-view frame.
-    private var lastFrameTime: Date = .distantPast
+    var lastFrameTime: Date = .distantPast
 
-    /// Single-slot frame mailbox flag — if true, parser drops new frames
-    /// until main has finished assigning the previous one. Prevents queue
-    /// buildup that causes growing latency in long sessions.
-    /// nonisolated(unsafe): cross-actor reads/writes; benign races just
-    /// mean an extra frame is dropped.
-    @ObservationIgnored nonisolated(unsafe) private var liveFrameQueued: Bool = false
-
-    /// Wall time of the last frame we actually rendered. Used by the parser
-    /// to throttle when a film sim is active (its filter chain takes
-    /// 30-50 ms/frame and we can't sustain stream rate). When no sim is
-    /// active, this throttle is bypassed — we render every frame and rely
-    /// on the mailbox flag alone for backpressure.
-    @ObservationIgnored nonisolated(unsafe) private var lastRenderStart: CFTimeInterval = 0
+    /// Newest live-view frame waiting to be rendered (older ones are dropped)
+    /// and whether the renderer is running.
+    @ObservationIgnored nonisolated(unsafe) var latestLiveJPEG: Data?
+    @ObservationIgnored nonisolated(unsafe) var liveRendering = false
+    @ObservationIgnored nonisolated(unsafe) var liveFrameCount = 0
+    @ObservationIgnored nonisolated let liveSlotLock = NSLock()
+    nonisolated static let liveRenderQueue = DispatchQueue(label: "cam.sony.liveRender", qos: .userInteractive)
 
     /// URLSession for the live-view stream. Inter-byte timeout 30s so a
     /// stalled WiFi link is detected promptly (instead of waiting 60min).
@@ -627,7 +638,7 @@ final class SonyConnector {
         liveViewImage = nil
         liveViewStatus = ""
         lastFrameTime = .distantPast
-        liveFrameQueued = false
+        latestLiveJPEG = nil
         state = .disconnected
     }
 
@@ -1362,16 +1373,14 @@ final class SonyConnector {
             return
         }
 
-        // Pick the right startLiveview variant. startLiveviewWithSize("L")
-        // gives a higher-resolution stream (~1024×680 vs. default ~640×424)
-        // for noticeably better quality. Some bodies only support the plain
-        // version; we detect that via availableAPIs and fall back.
+        // Stream size: "M" (~640×424, the default) is ~2–3× less data per
+        // frame than "L" (~1024×680) over the camera's 2.4 GHz Wi-Fi, so it
+        // keeps up with less delay. "Sharp live view" asks for L.
+        let sharp = sharpLiveView
         let supportsSized = availableAPIs.contains("startLiveviewWithSize")
-        let method = supportsSized ? "startLiveviewWithSize" : "startLiveview"
-        let params: [Any] = supportsSized ? ["L"] : []
-        if supportsSized {
-            log("📹 Using startLiveviewWithSize(\"L\") for higher quality stream")
-        }
+        let method = supportsSized && sharp ? "startLiveviewWithSize" : "startLiveview"
+        let params: [Any] = supportsSized && sharp ? ["L"] : []
+        log(sharp && supportsSized ? "📹 Live view L (sharp)" : "📹 Live view M (smooth)")
 
         liveViewStatus = "Waiting for camera ready…"
         for attempt in 1...15 {
@@ -1394,7 +1403,7 @@ final class SonyConnector {
                 liveViewStatus = "Connecting to stream…"
                 log("📹 Stream URL: \(urlStr)")
                 lastFrameTime = .distantPast
-                liveFrameQueued = false
+                latestLiveJPEG = nil
                 liveViewTask?.cancel()
                 liveViewTask = Task { [weak self] in
                     await self?.parseLiveViewStream(from: url)
@@ -1539,7 +1548,7 @@ final class SonyConnector {
         // NOT cancelling watchdogTask — that's us; we exit on return.
         liveViewImage = nil
         lastFrameTime = .distantPast
-        liveFrameQueued = false
+        latestLiveJPEG = nil
         isPolling = false
 
         // Try a polite stopLiveview first so the body releases its side
@@ -1614,7 +1623,6 @@ final class SonyConnector {
             var buf = [UInt8]()
             buf.reserveCapacity(2_000_000)
             var cursor = 0                 // start of unparsed data in buf
-            var frameCount = 0
             var loggedFirstBytes = false
 
             do {
@@ -1651,63 +1659,12 @@ final class SonyConnector {
                         cursor += total
                         guard pType == 0x01 else { continue }               // 0x02 = frame info
 
-                        // BACKPRESSURE: drop if main is still showing the previous frame.
-                        if let strong = self, strong.liveFrameQueued { continue }
-
-                        let renderer = snapshot.renderer
-                        let sim = snapshot.sim
-                        let custom = snapshot.custom
-                        let hasSim = renderer != nil && (sim != .none || custom != nil)
-
-                        // TIME THROTTLE: only when a sim is active. Without a sim,
-                        // decode + render sustain the camera's native ~15 fps; with
-                        // one, cap to ~14 fps (70 ms) for headroom.
-                        if hasSim {
-                            let now = CACurrentMediaTime()
-                            if now - (self?.lastRenderStart ?? 0) < 0.070 { continue }
-                            self?.lastRenderStart = now
-                        }
-
-                        let jpeg = Data(buf[start ..< start + pSize])
-                        guard let ciImage = CIImage(data: jpeg) else { continue }
-                        if SonyGuides.shared.active { SonyGuides.shared.feed(ciImage) }
-                        // DO NOT apply EXIF for live view — Sony streams a fixed-size
-                        // landscape JPEG; EXIF reflects camera tilt.
-                        var simmed = ciImage
-                        if hasSim, let renderer {
-                            let recipe = snapshot.recipeProvider?(sim, custom, 0)
-                                ?? { var r = ShotRecipe(); r.sim = sim; r.custom = custom; return r }()
-                            simmed = renderer(ciImage, recipe, false)
-                        }
-                        // Lift exposure for display only — Sony's live-view stream is
-                        // encoded ~half a stop dark vs the metered exposure. Applied
-                        // AFTER the sim so the sim sees an unmodified input. Saved
-                        // photos (postview path) are unaffected.
-                        var out = simmed.applyingFilter("CIExposureAdjust", parameters: ["inputEV": 0.7])
-                        // Exposure aids measure `simmed` (pre-lift = what the
-                        // photo records), drawn over the lifted display frame.
-                        if snapshot.zebras {
-                            out = ExposureAids.zebras(over: out, measuring: simmed)
-                        }
-                        if snapshot.histogram, frameCount % 3 == 0,
-                           let hist = ExposureAids.histogram(simmed, context: ctx) {
-                            Task { @MainActor [weak self] in self?.liveHistogram = hist }
-                        }
-                        guard let cg = ctx.createCGImage(out, from: out.extent) else { continue }
-                        let uiImg = UIImage(cgImage: cg)
-                        let isFirst = frameCount == 0
-                        self?.liveFrameQueued = true
-                        Task { @MainActor [weak self] in
-                            guard let self else { return }
-                            self.liveViewImage = uiImg
-                            self.lastFrameTime = Date()
-                            if isFirst {
-                                self.liveViewStatus = "Live"
-                                self.log("🎬 First live view frame!")
-                            }
-                            self.liveFrameQueued = false
-                        }
-                        frameCount += 1
+                        // Keep only the NEWEST frame and let the renderer take it
+                        // when it's free. Rendering here used to block the parser:
+                        // frames piled up behind a slow film render and the oldest
+                        // waiting one was drawn next, so the delay kept growing.
+                        guard let strong = self else { break }
+                        strong.offerLiveFrame(Data(buf[start ..< start + pSize]), snapshot: snapshot, ctx: ctx)
                     }
 
                     // Compact at most once per chunk (not once per byte).
@@ -1728,6 +1685,68 @@ final class SonyConnector {
             await parserTask.value
         } onCancel: {
             parserTask.cancel()
+        }
+    }
+}
+
+// MARK: - Live view rendering (newest frame only)
+
+extension SonyConnector {
+    /// A decoded-later JPEG from the stream: replaces any frame still waiting.
+    nonisolated func offerLiveFrame(_ jpeg: Data, snapshot: SonyLiveSimSnapshot, ctx: CIContext) {
+        liveSlotLock.lock()
+        latestLiveJPEG = jpeg
+        let start = !liveRendering
+        if start { liveRendering = true }
+        liveSlotLock.unlock()
+        guard start else { return }
+        Self.liveRenderQueue.async { [weak self] in self?.renderLatestLiveFrames(snapshot: snapshot, ctx: ctx) }
+    }
+
+    nonisolated private func renderLatestLiveFrames(snapshot: SonyLiveSimSnapshot, ctx: CIContext) {
+        while true {
+            liveSlotLock.lock()
+            guard let jpeg = latestLiveJPEG else { liveRendering = false; liveSlotLock.unlock(); return }
+            latestLiveJPEG = nil
+            liveSlotLock.unlock()
+            autoreleasepool { renderLiveFrame(jpeg, snapshot: snapshot, ctx: ctx) }
+        }
+    }
+
+    nonisolated private func renderLiveFrame(_ jpeg: Data, snapshot: SonyLiveSimSnapshot, ctx: CIContext) {
+        guard let ciImage = CIImage(data: jpeg) else { return }
+        if SonyGuides.shared.active { SonyGuides.shared.feed(ciImage) }
+        let renderer = snapshot.renderer
+        let sim = snapshot.sim, custom = snapshot.custom
+        let hasSim = renderer != nil && (sim != .none || custom != nil)
+        // DO NOT apply EXIF for live view — Sony streams a fixed-size
+        // landscape JPEG; EXIF reflects camera tilt.
+        var simmed = ciImage
+        if hasSim, let renderer {
+            let recipe = snapshot.recipeProvider?(sim, custom, 0)
+                ?? { var r = ShotRecipe(); r.sim = sim; r.custom = custom; return r }()
+            simmed = renderer(ciImage, recipe, false)
+        }
+        // Lift exposure for display only — Sony's live-view stream is encoded
+        // ~half a stop dark vs the metered exposure. Applied AFTER the sim so
+        // the sim sees an unmodified input. Saved photos are unaffected.
+        var out = simmed.applyingFilter("CIExposureAdjust", parameters: ["inputEV": 0.7])
+        if snapshot.zebras { out = ExposureAids.zebras(over: out, measuring: simmed) }
+        liveFrameCount += 1
+        if snapshot.histogram, liveFrameCount % 3 == 0, let hist = ExposureAids.histogram(simmed, context: ctx) {
+            Task { @MainActor [weak self] in self?.liveHistogram = hist }
+        }
+        guard let cg = ctx.createCGImage(out, from: out.extent) else { return }
+        let uiImg = UIImage(cgImage: cg)
+        let isFirst = liveFrameCount == 1
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.liveViewImage = uiImg
+            self.lastFrameTime = Date()
+            if isFirst {
+                self.liveViewStatus = "Live"
+                self.log("🎬 First live view frame!")
+            }
         }
     }
 }

@@ -280,13 +280,15 @@ extension CameraManager {
             // Context-aware grain: more grain the less light there was (ISO).
             if r.contextAwareGrain {
                 var luma: Float?
+                // Live previews (Sony live view): no GPU read-back per frame —
+                // it stalled every frame; ISO alone sets the amount there.
                 // Frame brightness from a small copy (full-res would render the look twice).
                 let s = 256 / max(input.extent.width, input.extent.height, 1)
                 let probe = input.transformed(by: CGAffineTransform(scaleX: s, y: s))
                 let avgFilter = CIFilter.areaAverage()
                 avgFilter.inputImage = probe
                 avgFilter.extent = probe.extent
-                if let avgImg = avgFilter.outputImage {
+                if flatten, let avgImg = avgFilter.outputImage {
                     var bitmap = [UInt8](repeating: 0, count: 4)
                     photoContext.render(avgImg, toBitmap: &bitmap, rowBytes: 4,
                                     bounds: CGRect(x: 0, y: 0, width: 1, height: 1),

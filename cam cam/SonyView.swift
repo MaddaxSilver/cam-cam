@@ -413,7 +413,7 @@ struct SonyView: View {
                         .padding(.horizontal, 14).padding(.vertical, 8)
                         .background(.black.opacity(0.55), in: Capsule())
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                        .padding(.top, 64)
+                        .padding(.top, 122)          // below the connection / status pill
                         .allowsHitTesting(false)
                         .animation(.easeOut(duration: 0.2), value: text)
                 }

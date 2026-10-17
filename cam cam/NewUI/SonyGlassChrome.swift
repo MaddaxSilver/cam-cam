@@ -240,6 +240,7 @@ struct SonyGlassChrome: View {
                 tile("Frame guide", "viewfinder.rectangular", $guides.frameOn)
                 tile("Pose guide", "figure.stand", $poseGuide.enabled)
                 tile("Auto shoot", "camera.shutter.button", $guides.autoShoot)
+                tile("Sharp live view", "4k.tv", $sony.sharpLiveView)
             }
             Button(action: onImportLUT) {
                 Label("Import LUT", systemImage: "cube")
