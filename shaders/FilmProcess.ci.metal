@@ -264,4 +264,17 @@ float4 mfDivide(sample_t sum, sample_t wsum)
     return float4(sum.rgb / max(wsum.r, 1e-4), 1.0);
 }
 
+/// HDR photos: carry the photo's own HDR brightness (Apple's gain map,
+/// expanded) onto the film-graded image. Per pixel, the ratio of HDR to SDR
+/// luminance (linear, 1…maxGain) multiplies the graded colour, so the film's
+/// colours stay and only the highlights gain their real range.
+float4 hdrLift(sample_t graded, sample_t hdr, sample_t sdr, float maxGain)
+{
+    const float3 w = float3(0.2126, 0.7152, 0.0722);
+    float yh = dot(srgbToLinear(hdr.rgb), w);
+    float ys = dot(srgbToLinear(sdr.rgb), w);
+    float g = clamp(yh / max(ys, 1e-3), 1.0, maxGain);
+    return float4(linearToSrgb(srgbToLinear(graded.rgb) * g), graded.a);
+}
+
 }}

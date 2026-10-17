@@ -2915,6 +2915,10 @@ import CoreLocation
         }
     }
 
+    /// Save photos with HDR highlights (a gain map) when the camera's photo
+    /// has them. Settings → Photos.
+    nonisolated static var hdrPhotos: Bool { UserDefaults.standard.object(forKey: "cc_hdrPhotos") as? Bool ?? true }
+
     /// Develop a DNG keeping what the processed photo clips: CIRAWFilter's
     /// extended dynamic range (highlights above 1.0) brought back into the
     /// photo with Apple's HDR tone mapper, so skies and lamps roll off instead
@@ -3017,6 +3021,16 @@ import CoreLocation
                         .cropped(to: CGRect(x: 0, y: 0, width: e.width, height: e.height))
                 }
             }
+            // HDR photos: the camera's own HDR version (its gain map, expanded),
+            // in the same geometry, when the photo has one and nothing above
+            // replaced the pixels (RAW develop, multi-frame merge).
+            var hdrSource: CIImage?
+            if Self.hdrPhotos, frames == nil, raw == nil, redEyeStr == 0,
+               var h = CIImage(data: imageData, options: [.expandToHDR: true]), h.contentHeadroom > 1.05 {
+                h = h.oriented(forExifOrientation: Int32(h.properties[kCGImagePropertyOrientation as String] as? UInt32 ?? 1))
+                h = applyPhotoZoomCrop(h)
+                if abs(h.extent.width - ciImage.extent.width) < 2 { hdrSource = h }
+            }
             let base = ciImage                                  // framed, un-graded original
             let isDoubleExposure = firstExposureCIImage != nil  // composites can't be re-graded
             pendingSceneISO = Self.captureISO(originalMetadata)      // context-aware grain
@@ -3028,8 +3042,15 @@ import CoreLocation
             if rawID != nil, raw == nil {
                 DispatchQueue.main.async { self.saveErrorMessage = "The RAW didn't arrive, saved the photo only" }
             }
+            var hdr: (rendered: CIImage, base: CIImage)?
+            if let h = hdrSource, !isDoubleExposure, let k = CameraManager.filmKernel("hdrLift") {
+                let head = h.contentHeadroom
+                if let lifted = k.apply(extent: processed.extent, arguments: [processed, h, base, head]) {
+                    hdr = (lifted.settingContentHeadroom(head), h)
+                }
+            }
             renderAndSave(ciImage: processed, metadata: originalMetadata,
-                          base: isDoubleExposure ? nil : base, recipe: recipe, raw: raw)
+                          base: isDoubleExposure ? nil : base, recipe: recipe, raw: raw, hdr: hdr)
         }
     }
 
@@ -3461,13 +3482,20 @@ import CoreLocation
 
     /// Crop to the chosen aspect, rotate to the capture-time device angle,
     /// render in Display P3 and encode with the original EXIF (+ GPS).
-    nonisolated private func encodeFramed(_ image: CIImage, metadata: [String: Any],
-                                          utType: CFString, location: CLLocation?) -> Data? {
+    /// Crop to the chosen aspect and turn to the capture-time device angle.
+    nonisolated private func framed(_ image: CIImage) -> CIImage {
         var cropped = image.cropped(to: cropRect(for: image.extent))
-        // Rotate image to match device orientation at capture time
         if pendingDeviceAngle == -90 { cropped = cropped.oriented(.right) }       // landscape right → 90° CW
         else if pendingDeviceAngle == 90 { cropped = cropped.oriented(.left) }    // landscape left → 90° CCW
         else if pendingDeviceAngle == 180 { cropped = cropped.oriented(.down) }   // upside down
+        return cropped
+    }
+
+    /// - hdr: the same picture with HDR highlights (above 1.0, with a content
+    ///   headroom); saved as a gain map alongside the SDR image.
+    nonisolated private func encodeFramed(_ image: CIImage, metadata: [String: Any],
+                                          utType: CFString, location: CLLocation?, hdr: CIImage? = nil) -> Data? {
+        let cropped = framed(image)
 
         let p3 = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         // Render straight into an opaque (noneSkipLast) bitmap so the encoder
@@ -3525,6 +3553,19 @@ import CoreLocation
         }
         if utType == ("public.jpeg" as CFString) { meta[kCGImageDestinationLossyCompressionQuality as String] = 1.0 }
 
+        // HDR: Core Image writes the SDR image plus a gain map from the HDR one.
+        if let hdr {
+            var h = framed(hdr)
+            h = h.transformed(by: CGAffineTransform(translationX: bounds.minX - h.extent.minX, y: bounds.minY - h.extent.minY))
+            let primary = CIImage(cgImage: opaque).settingProperties(meta)
+            let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
+            let opts: [CIImageRepresentationOption: Any] = [.hdrImage: h, quality: 1.0]
+            let data = utType == ("public.jpeg" as CFString)
+                ? photoContext.jpegRepresentation(of: primary, colorSpace: p3, options: opts)
+                : photoContext.heifRepresentation(of: primary, format: .RGBA8, colorSpace: p3, options: opts)
+            if let data { return data }
+        }
+
         let out = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(out, utType, 1, nil)
                 ?? CGImageDestinationCreateWithData(out, "public.jpeg" as CFString, 1, nil) else { return nil }
@@ -3538,11 +3579,23 @@ import CoreLocation
     ///   non-destructively: base = original resource, look = Photos edit with
     ///   the recipe attached → revertible and re-gradable in cam cam.
     nonisolated func renderAndSave(ciImage: CIImage, metadata: [String: Any] = [:],
-                                   base: CIImage? = nil, recipe: ShotRecipe? = nil, raw: Data? = nil) {
+                                   base: CIImage? = nil, recipe: ShotRecipe? = nil, raw: Data? = nil,
+                                   hdr: (rendered: CIImage, base: CIImage)? = nil) {
         #if DEBUG
         if PipelineAudit.tag != nil {
             PipelineAudit.log("\(PipelineAudit.tag!) recipe \(recipe?.displayName ?? "none") raw \(raw.map { "\($0.count / 1_000_000)MB" } ?? "no")")
             PipelineAudit.dump(base: base, rendered: ciImage, ctx: photoContext)
+            if let hdr, let d = encodeFramed(ciImage, metadata: metadata, utType: "public.jpeg" as CFString, location: nil, hdr: hdr.rendered) {
+                let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("pipeline/\(PipelineAudit.tag!)-hdr.jpg")
+                try? d.write(to: url)
+                let src = CGImageSourceCreateWithData(d as CFData, nil)
+                let iso = src.flatMap { CGImageSourceCopyAuxiliaryDataInfoAtIndex($0, 0, kCGImageAuxiliaryDataTypeISOGainMap) } != nil
+                let apple = src.flatMap { CGImageSourceCopyAuxiliaryDataInfoAtIndex($0, 0, kCGImageAuxiliaryDataTypeHDRGainMap) } != nil
+                PipelineAudit.log("\(PipelineAudit.tag!) HDR jpeg \(d.count / 1_000_000)MB gain map iso \(iso) apple \(apple) headroom \(hdr.rendered.contentHeadroom)")
+            } else {
+                PipelineAudit.log("\(PipelineAudit.tag!) no HDR")
+            }
             return
         }
         #endif
@@ -3554,12 +3607,13 @@ import CoreLocation
 
         if let base, let recipe, !recipe.isIdentity {
             // Encode one at a time so only one full-res bitmap is alive at once.
-            guard let b = encodeFramed(base, metadata: metadata, utType: heic, location: location) else { return }
+            guard let b = encodeFramed(base, metadata: metadata, utType: heic, location: location, hdr: hdr?.base) else { return }
             original = b
-            rendered = encodeFramed(ciImage, metadata: metadata, utType: "public.jpeg" as CFString, location: location)
+            rendered = encodeFramed(ciImage, metadata: metadata, utType: "public.jpeg" as CFString, location: location,
+                                    hdr: hdr?.rendered)
             savedRecipe = rendered == nil ? nil : recipe
         } else {
-            guard let d = encodeFramed(ciImage, metadata: metadata, utType: heic, location: location) else { return }
+            guard let d = encodeFramed(ciImage, metadata: metadata, utType: heic, location: location, hdr: hdr?.rendered) else { return }
             original = d
         }
 

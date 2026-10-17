@@ -298,6 +298,7 @@ struct CamSettingsSheet: View {
     @AppStorage("cc_filmSuggest") private var filmSuggest = true
     @AppStorage("cc_multiFrameZoom") private var multiFrameZoom = true
     @AppStorage("cc_multiFrameRAW") private var multiFrameRAW = true
+    @AppStorage("cc_hdrPhotos") private var hdrPhotos = true
 
     var body: some View {
         NavigationStack {
@@ -327,6 +328,9 @@ struct CamSettingsSheet: View {
                         Text("48MP ProRAW developed in cam cam, without Apple's processing (no HDR tone mapping, light noise reduction): more natural texture under the film, a little more noise.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
+                    Toggle("HDR photos", isOn: $hdrPhotos)
+                    Text("Keeps the camera's HDR highlights with the film look: they glow on HDR screens, and the photo looks normal everywhere else.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     Toggle("RAW + film", isOn: $camera.rawEnabled)
                     if camera.rawEnabled {
                         Picker("RAW files", selection: $rawSeparate) {
